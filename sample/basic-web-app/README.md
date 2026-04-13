@@ -9,10 +9,10 @@ automatically in arrival order — with no client-side refresh required.
 
 ## Prerequisites
 
-| Tool | Minimum version |
-|---|---|
-| Go | 1.22 |
-| git | any |
+| Tool | Minimum version | Install |
+|---|---|---|
+| Go | 1.22 | https://go.dev/dl |
+| Apache Bench | any | `apt install apache2-utils` / `brew install httpd` |
 
 ---
 
@@ -32,304 +32,320 @@ go get github.com/gin-gonic/gin
 
 ---
 
-## Step 2 — Create `main.go` with a plain Gin server
+## Step 2 — Why `gin.New()` instead of `gin.Default()`
 
-Start with the simplest possible Gin application — four routes, no waiting
-room yet:
+`gin.Default()` installs gin's own `Logger` middleware, which buffers each
+log line and prints it **after** the handler returns. During a load test that
+means you see nothing until the request is already complete — room events
+and request logs appear out of order and the queue activity is invisible.
+
+`gin.New()` gives you a blank engine. We install two middlewares manually:
 
 ```go
-package main
-
-import (
-    "net/http"
-
-    "github.com/gin-gonic/gin"
-)
-
-func main() {
-    r := gin.Default()
-
-    r.GET("/",        func(c *gin.Context) { c.String(http.StatusOK, "Home")    })
-    r.GET("/about",   func(c *gin.Context) { c.String(http.StatusOK, "About")   })
-    r.GET("/pricing", func(c *gin.Context) { c.String(http.StatusOK, "Pricing") })
-    r.GET("/contact", func(c *gin.Context) { c.String(http.StatusOK, "Contact") })
-
-    r.Run(":8080")
-}
+r := gin.New()
+r.Use(gin.Recovery())  // keep the panic recovery middleware
+r.Use(requestLogger()) // our logger — prints on entry AND exit
 ```
 
-Run it and confirm all four pages respond:
-
-```bash
-go run main.go &
-curl http://localhost:8080/
-curl http://localhost:8080/about
-curl http://localhost:8080/pricing
-curl http://localhost:8080/contact
-```
+The custom `requestLogger` middleware in this sample prints a line the moment
+a request arrives (`-->`) and another when it completes (`<--`). That means
+you can see which requests are being held by the waiting room versus which
+are executing their handler, in real time, as the load test runs.
 
 ---
 
-## Step 3 — Declare a package-level WaitingRoom
-
-Add a package-level variable. Keeping the `*room.WaitingRoom` at package
-scope means you can call `wr.SetCap` or `wr.On` from a config-reload
-handler later without restarting the server.
-
-```go
-import "github.com/andreimerlescu/room"
-
-var wr *room.WaitingRoom
-```
-
----
-
-## Step 4 — Initialise the WaitingRoom
-
-Inside `main()`, before creating any routes, initialise the WaitingRoom with
-your chosen capacity. The capacity is the maximum number of requests that are
-**actively being served** at any one moment. Requests beyond that limit see
-the waiting room page.
+## Step 3 — Initialise the WaitingRoom with a small capacity
 
 ```go
 wr = &room.WaitingRoom{}
-if err := wr.Init(10); err != nil {
+if err := wr.Init(5); err != nil {
     log.Fatalf("room.Init: %v", err)
 }
-defer wr.Stop() // stops the background reaper goroutine on exit
+defer wr.Stop()
 ```
 
-> **Choosing a capacity.** Start with the number of goroutines your slowest
-> handler can tolerate simultaneously without degrading latency — typically
-> the size of your database connection pool or your downstream service's
-> rate limit. You can change it at runtime with `wr.SetCap`.
+A cap of **5** is deliberately small so that `ab -c 100` fills the room
+immediately and you can watch the queue build and drain in the terminal.
+In production you would set this to match your actual concurrency budget
+— typically the size of your database connection pool or the rate limit of
+your slowest downstream dependency.
 
 ---
 
-## Step 5 — Configure the WaitingRoom (optional but recommended)
+## Step 4 — Add simulated latency to every handler
 
-### 5a — Cookie security
-
-By default the waiting-room session cookie is issued **without** the `Secure`
-flag so that `http://localhost` works during development. In any deployment
-that sits behind a TLS-terminating proxy (Cloudflare, nginx, AWS ALB) the Go
-process receives plain HTTP even though users are on HTTPS, so you must opt
-in explicitly:
+This is the most important step for making the waiting room visible during
+a load test. Without it, handlers return in microseconds and the room never
+fills up even at `-c 100` because requests complete faster than they arrive.
 
 ```go
-wr.SetSecureCookie(true)
-```
+const simulatedLatency = 500 * time.Millisecond
 
-Leave this line out during local development. Add it before deploying to
-any environment reachable over HTTPS.
-
-### 5b — Reaper interval
-
-The reaper is a background goroutine that evicts tokens from clients that
-disappeared mid-queue (closed the tab, lost their connection). The default
-interval is 5 minutes. For high-traffic events where ghost tickets could
-stall the queue, tighten it:
-
-```go
-if err := wr.SetReaperInterval(30 * time.Second); err != nil {
-    log.Fatalf("room.SetReaperInterval: %v", err)
+func aboutPage(c *gin.Context) {
+    time.Sleep(simulatedLatency) // holds the semaphore slot for 500 ms
+    c.Data(http.StatusOK, "text/html; charset=utf-8", page("About", body))
 }
 ```
 
+With `cap=5` and each request taking 500 ms, the server can process at most
+10 requests per second. At `ab -c 100` you are sending 100 concurrent
+requests, so roughly 95 of them will be queued immediately and admitted one
+by one as slots open.
+
 ---
 
-## Step 6 — Register lifecycle callbacks (optional)
+## Step 5 — Register lifecycle callbacks
 
-Callbacks let your application react to capacity events in real time. They
-run asynchronously in their own goroutines, so a slow callback never stalls
-the request path.
-
-Register them **before** calling `RegisterRoutes`:
+Callbacks are what you will actually see in the terminal during the load
+test. They fire asynchronously in their own goroutines — a slow callback
+never stalls the request path.
 
 ```go
-// Fired when every slot is occupied — good time to scale out.
 wr.On(room.EventFull, func(s room.Snapshot) {
-    log.Printf("[room] FULL  occupancy=%d/%d queue=%d",
-        s.Occupancy, s.Capacity, s.QueueDepth)
+    roomLog("FULL   ", fmt.Sprintf(
+        "capacity reached  occupancy=%d/%d  queue=%d  util=%.0f%%",
+        s.Occupancy, s.Capacity, s.QueueDepth,
+        pct(s.Occupancy, s.Capacity),
+    ))
 })
 
-// Fired when the room drops from full back to having a free slot.
 wr.On(room.EventDrain, func(s room.Snapshot) {
-    log.Printf("[room] DRAIN occupancy=%d/%d", s.Occupancy, s.Capacity)
+    roomLog("DRAIN  ", fmt.Sprintf(
+        "room no longer full  occupancy=%d/%d  queue=%d",
+        s.Occupancy, s.Capacity, s.QueueDepth,
+    ))
 })
 
-// Fired every time a request joins the queue.
 wr.On(room.EventQueue, func(s room.Snapshot) {
-    log.Printf("[room] QUEUE depth=%d utilization=%.0f%%",
-        s.QueueDepth, float64(s.Occupancy)/float64(s.Capacity)*100)
+    roomLog("QUEUE  ", fmt.Sprintf(
+        "request queued  depth=%d  occupancy=%d/%d  util=%.0f%%",
+        s.QueueDepth, s.Occupancy, s.Capacity,
+        pct(s.Occupancy, s.Capacity),
+    ))
 })
 
-// Fired every time a request is admitted into active service.
 wr.On(room.EventEnter, func(s room.Snapshot) {
-    log.Printf("[room] ENTER occupancy=%d/%d", s.Occupancy, s.Capacity)
+    roomLog("ENTER  ", fmt.Sprintf(
+        "slot acquired  occupancy=%d/%d  queue=%d  util=%.0f%%",
+        s.Occupancy, s.Capacity, s.QueueDepth,
+        pct(s.Occupancy, s.Capacity),
+    ))
 })
 
-// Fired every time a request completes and releases its slot.
 wr.On(room.EventExit, func(s room.Snapshot) {
-    log.Printf("[room] EXIT  occupancy=%d/%d", s.Occupancy, s.Capacity)
+    roomLog("EXIT   ", fmt.Sprintf(
+        "slot released  occupancy=%d/%d  queue=%d  util=%.0f%%",
+        s.Occupancy, s.Capacity, s.QueueDepth,
+        pct(s.Occupancy, s.Capacity),
+    ))
 })
 
-// Fired when the reaper removes an abandoned token.
 wr.On(room.EventEvict, func(s room.Snapshot) {
-    log.Printf("[room] EVICT queue=%d", s.QueueDepth)
+    roomLog("EVICT  ", fmt.Sprintf(
+        "ghost ticket removed  queue=%d  occupancy=%d/%d",
+        s.QueueDepth, s.Occupancy, s.Capacity,
+    ))
 })
 
-// Fired when a queued request's context is cancelled before admission.
 wr.On(room.EventTimeout, func(s room.Snapshot) {
-    log.Printf("[room] TIMEOUT occupancy=%d/%d", s.Occupancy, s.Capacity)
+    roomLog("TIMEOUT", fmt.Sprintf(
+        "context cancelled before admission  occupancy=%d/%d  queue=%d",
+        s.Occupancy, s.Capacity, s.QueueDepth,
+    ))
 })
 ```
 
-The `room.Snapshot` delivered to every callback is a point-in-time copy of
-the room's state — safe to read after the callback returns.
+The `roomLog` helper prefixes every line with a fixed-width tag so you can
+filter the output with `grep`:
+
+```bash
+go run main.go 2>&1 | grep '\[QUEUE\]'   # only queuing events
+go run main.go 2>&1 | grep '\[FULL\]'    # only full-capacity events
+go run main.go 2>&1 | grep -v '\[REQ\]'  # room events only, no request logs
+```
 
 ---
 
-## Step 7 — Register the WaitingRoom routes
-
-This is the single most important ordering constraint in the whole setup:
-call `wr.RegisterRoutes(r)` **after** any routes that must bypass the gate
-(health checks, metrics, etc.) and **before** any routes that should be
-protected by it.
+## Step 6 — Register routes in the correct order
 
 ```go
-// Routes registered before this line bypass the waiting room entirely.
-// Example: r.GET("/healthz", healthHandler)
+// Routes registered before RegisterRoutes bypass the waiting room.
+// Use this for health checks and readiness probes that must always succeed.
+// r.GET("/healthz", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 wr.RegisterRoutes(r)
 
-// Routes registered after this line are protected by the waiting room.
+// Routes registered after RegisterRoutes are gated by the waiting room.
 r.GET("/",        homePage)
 r.GET("/about",   aboutPage)
 r.GET("/pricing", pricingPage)
 r.GET("/contact", contactPage)
 ```
 
-`RegisterRoutes` does three things internally, in this order:
+---
 
-| Step | What it registers | Why |
-|---|---|---|
-| 1 | `OPTIONS /queue/status` | Handles CORS preflight from the polling `fetch()` |
-| 2 | `GET /queue/status` | The JSON endpoint the waiting-room page polls every 3 s |
-| 3 | `r.Use(wr.Middleware())` | Gates every route registered after this call |
+## Step 7 — Run the server
 
-> **Do not** call `r.Use(wr.Middleware())` manually if you are using
-> `RegisterRoutes`. The two are mutually exclusive — `RegisterRoutes` calls
-> `r.Use` for you, in the correct position relative to `/queue/status`.
+**Terminal 1:**
+
+```bash
+go run main.go
+```
+
+You should see:
+
+```
+[ INFO  ] listening on http://localhost:8080  cap=5
+```
 
 ---
 
-## Step 8 — Add graceful shutdown
+## Step 8 — Run the load test
 
-When the process receives `SIGINT` or `SIGTERM`, give active requests time
-to finish before the server closes. This pairs naturally with the waiting
-room because in-flight requests that are admitted through the gate must be
-allowed to complete cleanly.
+**Terminal 2:**
+
+```bash
+ab -t 60 -n 1000 -c 100 http://localhost:8080/about
+```
+
+| Flag | Meaning |
+|---|---|
+| `-t 60` | run for 60 seconds |
+| `-n 1000` | send at most 1000 total requests |
+| `-c 100` | maintain 100 concurrent connections |
+
+---
+
+## Step 9 — Read the logs
+
+Switch back to Terminal 1. You will see output like this:
+
+```
+[ INFO  ] listening on http://localhost:8080  cap=5
+[ REQ   ] --> GET /about  remote=127.0.0.1
+[ REQ   ] --> GET /about  remote=127.0.0.1
+[ REQ   ] --> GET /about  remote=127.0.0.1
+[ REQ   ] --> GET /about  remote=127.0.0.1
+[ REQ   ] --> GET /about  remote=127.0.0.1
+[ ENTER   ] slot acquired  occupancy=1/5  queue=0  util=20%
+[ ENTER   ] slot acquired  occupancy=2/5  queue=0  util=40%
+[ ENTER   ] slot acquired  occupancy=3/5  queue=0  util=60%
+[ ENTER   ] slot acquired  occupancy=4/5  queue=0  util=80%
+[ ENTER   ] slot acquired  occupancy=5/5  queue=0  util=100%
+[ FULL    ] capacity reached  occupancy=5/5  queue=0  util=100%
+[ QUEUE   ] request queued  depth=1   occupancy=5/5  util=100%
+[ QUEUE   ] request queued  depth=2   occupancy=5/5  util=100%
+[ QUEUE   ] request queued  depth=3   occupancy=5/5  util=100%
+...
+[ EXIT    ] slot released  occupancy=4/5  queue=95  util=80%
+[ DRAIN   ] room no longer full  occupancy=4/5  queue=95
+[ ENTER   ] slot acquired  occupancy=5/5  queue=94  util=100%
+[ FULL    ] capacity reached  occupancy=5/5  queue=94  util=100%
+[ REQ   ] <-- GET /about  status=200  latency=500ms
+[ REQ   ] --> GET /about  remote=127.0.0.1
+[ EXIT    ] slot released  occupancy=4/5  queue=93  util=80%
+...
+```
+
+Here is what each tag means in the context of this load test:
+
+| Tag | What you are seeing |
+|---|---|
+| `[ REQ   ] -->` | A new HTTP connection arrived at the server |
+| `[ ENTER   ]` | The request passed through the waiting room and is now running its handler |
+| `[ FULL    ]` | All 5 slots are occupied — the next request will queue |
+| `[ QUEUE   ]` | A request landed in the waiting room; `depth=N` is its position |
+| `[ EXIT    ]` | A handler finished and released its slot |
+| `[ DRAIN   ]` | The room dropped below full capacity — queued requests can now enter |
+| `[ REQ   ] <--` | The HTTP response was sent; `latency` includes waiting room time |
+| `[ EVICT   ]` | The reaper cleaned up a ghost ticket (ab closed a connection mid-wait) |
+| `[ TIMEOUT ]` | A queued request's context was cancelled before it was admitted |
+
+### What the queue depth column tells you
+
+The `queue=N` value in `QUEUE` events shows how many requests are waiting
+behind the one that just joined. Watch it climb during the flood and fall
+as handlers complete and admit the next waiter. When `queue=0` appears in
+`EXIT` events, the backlog has cleared.
+
+### What a healthy load test looks like
+
+- `FULL` fires once at the start and only fires again after a `DRAIN`.
+- `DRAIN` fires every time the occupancy drops below 5 and a queued request
+  enters.
+- `QUEUE` depth climbs quickly at the start then stays roughly stable or
+  trends downward as ab's concurrency saturates.
+- `TIMEOUT` events appear only if ab's connection timeout is shorter than
+  the time a request spends waiting in the queue. Increase `-t` on ab or
+  add `-s 60` (socket timeout) to reduce spurious timeouts.
+- `EVICT` events appear only after the reaper runs (every 10 s in this
+  sample). Each eviction means a client disappeared mid-queue — normal
+  during ab runs since ab recycles connections aggressively.
+
+---
+
+## Step 10 — Read the ab report
+
+When ab finishes it prints a summary. With `cap=5` and 500 ms handlers the
+numbers will look roughly like this:
+
+```
+Concurrency Level:      100
+Time taken for tests:   60.012 seconds
+Complete requests:      1000
+Failed requests:        0
+Requests per second:    16.66 [#/sec] (mean)
+Time per request:       6001.2 [ms] (mean)
+Time per request:       60.01 [ms] (mean, across all concurrent requests)
+```
+
+The mean time per request of ~6 s reflects queuing time: a request that
+arrives when the queue is 10 deep waits 10 × 500 ms before its handler
+runs. That is the waiting room working as designed — absorbing burst traffic
+instead of dropping it or crashing the downstream.
+
+To increase throughput, call `wr.SetCap` with a higher value and re-run ab:
+
+```bash
+# in a third terminal while the server is running
+curl -s http://localhost:8080/  # confirm server is up, then edit main.go
+# or wire up an admin endpoint as shown in the runtime-adjustment section
+```
+
+---
+
+## Grepping the logs for specific events
+
+```bash
+# Room events only — filter out per-request noise
+go run main.go 2>&1 | grep -v '\[ REQ'
+
+# Only queueing events — see the queue depth grow
+go run main.go 2>&1 | grep '\[ QUEUE'
+
+# Only full-capacity moments
+go run main.go 2>&1 | grep '\[ FULL'
+
+# Count how many requests were queued
+go run main.go 2>&1 | grep -c '\[ QUEUE'
+
+# Watch the queue depth trend
+go run main.go 2>&1 | grep '\[ QUEUE' | awk '{print $6}'
+```
+
+---
+
+## Runtime capacity adjustment
+
+Because `wr` is a package-level variable you can change capacity without
+restarting the server. Wire up an admin endpoint:
 
 ```go
-import (
-    "context"
-    "net/http"
-    "os"
-    "os/signal"
-    "syscall"
-    "time"
-)
-
-srv := &http.Server{
-    Addr:    ":8080",
-    Handler: r,
-}
-
-quit := make(chan os.Signal, 1)
-signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-go func() {
-    log.Println("listening on http://localhost:8080")
-    if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-        log.Fatalf("ListenAndServe: %v", err)
+// Register this BEFORE wr.RegisterRoutes so it bypasses the waiting room.
+r.POST("/admin/cap", func(c *gin.Context) {
+    var body struct {
+        Cap int32 `json:"cap"`
     }
-}()
-
-<-quit
-log.Println("shutdown signal received — draining in-flight requests...")
-
-shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-defer cancel()
-
-if err := srv.Shutdown(shutdownCtx); err != nil {
-    log.Printf("server forced to shut down: %v", err)
-}
-log.Println("server exited cleanly")
-```
-
-The `defer wr.Stop()` from Step 4 runs after `srv.Shutdown` returns, which
-stops the reaper goroutine and leaves nothing running after `main` exits.
-
----
-
-## Step 9 — Run it
-
-```bash
-go run main.go
-```
-
-Open `http://localhost:8080` in your browser. You will see the home page.
-
-### Simulating the waiting room
-
-The easiest way to trigger the waiting room locally is to temporarily lower
-the capacity and flood the server with slow requests.
-
-**Terminal 1 — start the server with cap=2:**
-
-Edit `wr.Init(10)` → `wr.Init(2)`, then:
-
-```bash
-go run main.go
-```
-
-**Terminal 2 — send 10 slow concurrent requests:**
-
-```bash
-# requires: go install github.com/rakyll/hey@latest
-hey -n 10 -c 10 -q 1 http://localhost:8080/
-```
-
-Or with plain `curl` in a loop:
-
-```bash
-for i in $(seq 1 10); do
-  curl -s http://localhost:8080/ &
-done
-wait
-```
-
-**Terminal 3 — watch the server logs:**
-
-You will see `[room] FULL` when both slots are occupied, `[room] QUEUE`
-for each request that lands in the waiting room, and `[room] DRAIN` when
-the last active slot is released.
-
-Open `http://localhost:8080/` in a browser tab while the flood is running
-and you will see the waiting-room page counting down your position.
-
----
-
-## Step 10 — Runtime capacity adjustment
-
-You can change the capacity without restarting the server. Because `wr` is
-a package-level variable, any handler or goroutine can call `wr.SetCap`:
-
-```go
-// In a config-reload handler or an admin endpoint:
-func adminSetCap(c *gin.Context) {
-    var body struct{ Cap int32 `json:"cap"` }
     if err := c.ShouldBindJSON(&body); err != nil {
         c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
         return
@@ -338,110 +354,101 @@ func adminSetCap(c *gin.Context) {
         c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
         return
     }
-    c.JSON(http.StatusOK, gin.H{"cap": wr.Cap()})
-}
+    c.JSON(http.StatusOK, gin.H{
+        "cap":         wr.Cap(),
+        "occupancy":   wr.Len(),
+        "queue_depth": wr.QueueDepth(),
+        "utilization": fmt.Sprintf("%.0f%%", wr.Utilization()*100),
+    })
+})
 ```
 
-Expanding capacity immediately admits waiting clients. Shrinking capacity
-drains the semaphore down to the new limit — existing in-flight requests
-complete normally.
+While ab is running in Terminal 2, change the cap in Terminal 3:
 
----
+```bash
+# Double capacity — queued requests will immediately start being admitted
+curl -s -X POST http://localhost:8080/admin/cap \
+     -H 'Content-Type: application/json' \
+     -d '{"cap": 10}' | jq
 
-## Complete file layout
-
-```
-sample/basic-web-app/
-├── main.go      ← the result of this tutorial
-├── README.md    ← this file
-└── go.mod       ← created by go mod init
-```
-
-`go.sum` is generated automatically the first time you run `go mod tidy` or
-`go run main.go`.
-
----
-
-## What the waiting room does, in plain terms
-
-```
-Browser                  room middleware              Your handler
-   │                          │                            │
-   │── GET /pricing ──────────▶                            │
-   │                    slot available?                    │
-   │                    yes → acquire slot ────────────────▶
-   │                                              handler runs
-   │                                              slot released ◀──────────┐
-   │◀─────────────────────────────── 200 OK ──────────────│               │
-   │                                                                       │
-   │── GET /pricing ──────────▶                            │               │
-   │                    slot available?                    │               │
-   │                    no → issue token                   │               │
-   │◀── 200 waiting-room HTML ─│                           │               │
-   │                           │                           │               │
-   │── GET /queue/status ──────▶ position=3, ready=false   │               │
-   │◀── {ready:false,pos:3} ───│                           │               │
-   │      ... 3 s ...          │                           │               │
-   │── GET /queue/status ──────▶ slot opened ──────────────────────────────┘
-   │◀── {ready:true} ──────────│
-   │      reload               │
-   │── GET /pricing ──────────▶ acquire slot ──────────────▶
-   │◀─────────────────────────────── 200 OK ───────────────│
+# Halve it again
+curl -s -X POST http://localhost:8080/admin/cap \
+     -H 'Content-Type: application/json' \
+     -d '{"cap": 5}' | jq
 ```
 
-Key properties:
-
-- **FIFO**: requests are admitted in ticket order — first in, first out.
-- **No server-side goroutines**: the middleware is stateless per request
-  beyond the token store lookup; there are no goroutines blocking on behalf
-  of waiting clients.
-- **Automatic admission**: the browser reloads automatically when its
-  ticket becomes ready — the user sees the page appear without pressing F5.
-- **Ghost cleanup**: if a waiting client closes their tab, the reaper evicts
-  their ticket after the TTL, advancing the queue for everyone behind them.
+Watch the server logs — you will see a burst of `ENTER` events as queued
+requests rush into the newly opened slots when you expand, and then `FULL`
+almost immediately as the new capacity fills.
 
 ---
 
 ## Common mistakes
 
-### Registering routes before `RegisterRoutes`
+### Handlers return too fast — the room never fills up
 
 ```go
-// ✗ Wrong — /about is not gated
-r.GET("/about", aboutPage)
-wr.RegisterRoutes(r)
-r.GET("/", homePage) // ✓ gated
+// ✗ Wrong — returns in microseconds, room stays at occupancy=1
+func aboutPage(c *gin.Context) {
+    c.String(http.StatusOK, "About")
+}
+
+// ✓ Correct for testing — holds the slot long enough to observe queuing
+func aboutPage(c *gin.Context) {
+    time.Sleep(500 * time.Millisecond)
+    c.String(http.StatusOK, "About")
+}
 ```
 
+In production you do not need `time.Sleep` — real database queries,
+template rendering, and downstream API calls provide the natural latency
+that holds slots open.
+
+### Using `gin.Default()` — room events are buried in buffered output
+
 ```go
-// ✓ Correct — all four pages are gated
-wr.RegisterRoutes(r)
-r.GET("/", homePage)
+// ✗ gin's Logger buffers and only prints after the handler returns.
+//   Room events appear out of order; the queue activity is invisible.
+r := gin.Default()
+
+// ✓ Build the logger yourself so it prints on arrival, not completion.
+r := gin.New()
+r.Use(gin.Recovery())
+r.Use(requestLogger())
+```
+
+### Registering application routes before `RegisterRoutes`
+
+```go
+// ✗ /about is not gated — it bypasses the waiting room entirely
 r.GET("/about", aboutPage)
-r.GET("/pricing", pricingPage)
-r.GET("/contact", contactPage)
+wr.RegisterRoutes(r)
+
+// ✓ All four pages are protected
+wr.RegisterRoutes(r)
+r.GET("/about", aboutPage)
 ```
 
 ### Forgetting `defer wr.Stop()`
 
-Without `wr.Stop()`, the reaper goroutine outlives the `http.Server`. In a
-long-running process this is harmless (it exits when `main` returns), but in
-tests that construct and discard `WaitingRoom` instances it will leak
-goroutines and trigger the race detector.
+Without it the reaper goroutine outlives the `http.Server`. In tests that
+construct and discard `WaitingRoom` instances it leaks goroutines and
+triggers the race detector.
 
-### Setting `Secure: true` cookies on plain HTTP
+---
 
-If you call `wr.SetSecureCookie(true)` and run the server on plain
-`http://localhost`, browsers will silently drop the cookie. The waiting-room
-page will be served but the client will never re-present the token, so it
-will get a new ticket on every reload and appear to never be admitted.
+## File layout
 
-Only call `wr.SetSecureCookie(true)` in environments where every request
-reaches the Go process via HTTPS — or via a proxy that terminates TLS and
-forwards over HTTP on a private network.
+```
+sample/basic-web-app/
+├── main.go      ← the result of this tutorial
+├── README.md    ← this file
+└── go.mod
+```
 
 ---
 
 ## License
 
 Apache 2.0 — see the root [`LICENSE`](../../LICENSE) file.
+```
