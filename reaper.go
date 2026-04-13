@@ -76,8 +76,9 @@ func (wr *WaitingRoom) startReaper(ctx context.Context) {
 	}()
 }
 
-// reap performs a full eviction cycle over the token store. It loops over
-// batch-sized scans until all expired tokens have been removed.
+// reap performs a full eviction cycle over the token store and the pass
+// store. It loops over batch-sized scans until all expired tokens have
+// been removed, then sweeps the pass store for expired VIP passes.
 //
 // Only tokens whose ticket number is OUTSIDE the current serving window
 // (i.e. ticket > nowServing + cap) are counted toward nowServing advances.
@@ -94,9 +95,14 @@ func (wr *WaitingRoom) reap() {
 	for {
 		evictedCount := wr.reapBatch()
 		if evictedCount < reaperBatchSize {
-			return
+			break
 		}
 	}
+
+	// Sweep expired VIP passes. This is cheap — passes are typically
+	// few (one per paying customer) and the sweep is a single lock
+	// acquisition with a linear scan.
+	wr.passes.reap()
 }
 
 // reapBatch performs a single bounded eviction pass. It returns the number

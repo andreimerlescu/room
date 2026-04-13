@@ -54,6 +54,29 @@ func main() {
 		log.Fatalf("room.SetReaperInterval: %v", err)
 	}
 
+	// ── 3a. Configure skip-the-line pricing ──────────────────────────────
+	//
+	// SetRateFunc defines the per-position cost. Here we use a flat rate
+	// of $2.50 per position. In production you might use surge pricing:
+	//
+	//   wr.SetRateFunc(func(depth int64) float64 {
+	//       return 1.00 + float64(depth)*0.05  // base $1 + 5¢ per queued request
+	//   })
+	//
+	// SetSkipURL tells the waiting room page where the "Pay to skip"
+	// button should navigate. This must be registered BEFORE
+	// RegisterRoutes so it bypasses the waiting room.
+	//
+	// SetPassDuration configures how long a paid skip-the-line pass
+	// remains valid. During this window, if the client is evicted,
+	// times out, or refreshes, they are auto-promoted to the front
+	// without paying again. Set to 0 to disable (single-use promotions).
+	wr.SetRateFunc(func(depth int64) float64 { return 2.50 })
+	wr.SetSkipURL("/queue/purchase")
+	if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+		log.Fatalf("room.SetPassDuration: %v", err)
+	}
+
 	// ── 4. Lifecycle callbacks ────────────────────────────────────────────
 	//
 	// These callbacks are what you will see in the terminal during ab.
@@ -66,6 +89,7 @@ func main() {
 	//   grep '\[DRAIN\]'  — moments the room dropped below capacity
 	//   grep '\[EVICT\]'  — abandoned ghost tickets removed by the reaper
 	//   grep '\[TIMEOUT\]'— requests whose context was cancelled mid-queue
+	//   grep '\[PROMOTE\]'— a queued client paid to skip the line
 
 	wr.On(room.EventFull, func(s room.Snapshot) {
 		roomLog("FULL   ", fmt.Sprintf(
@@ -120,23 +144,50 @@ func main() {
 		))
 	})
 
-	// ── 5. Register the WaitingRoom routes ───────────────────────────────
+	wr.On(room.EventPromote, func(s room.Snapshot) {
+		roomLog("PROMOTE", fmt.Sprintf(
+			"client promoted to front  occupancy=%d/%d  queue=%d",
+			s.Occupancy, s.Capacity, s.QueueDepth,
+		))
+	})
+
+	// ── 5. Register skip-the-line routes BEFORE the waiting room ─────────
 	//
-	// RegisterRoutes must come BEFORE your application routes.
+	// These routes must bypass the waiting room so that queued clients
+	// can access the payment flow. Register them before RegisterRoutes.
+	//
+	// In production you would replace the GET /queue/purchase page with
+	// a handler that creates a Stripe Checkout session and redirects,
+	// and POST /queue/purchase/confirm with a Stripe webhook handler
+	// that verifies the payment event before calling PromoteTokenToFront.
+
+	// GET /queue/purchase — shows the "confirm payment" page.
+	// In production: creates a Stripe Checkout session and redirects.
+	r.GET("/queue/purchase", handlePurchasePage)
+
+	// POST /queue/purchase/confirm — processes the payment and promotes.
+	// In production: this is your Stripe webhook endpoint that verifies
+	// the payment signature before promoting.
+	r.POST("/queue/purchase/confirm", handlePurchaseConfirm)
+
+	// ── 6. Register the WaitingRoom routes ───────────────────────────────
+	//
+	// RegisterRoutes must come AFTER the payment routes (so they bypass
+	// the queue) and BEFORE your application routes (so they are gated).
 	// It installs, in order:
 	//   OPTIONS /queue/status  — CORS preflight
 	//   GET     /queue/status  — polling endpoint for the waiting-room page
 	//   r.Use(wr.Middleware()) — gates every route registered after this
 	wr.RegisterRoutes(r)
 
-	// ── 6. Application routes (all gated by the waiting room) ────────────
+	// ── 7. Application routes (all gated by the waiting room) ────────────
 
 	r.GET("/", homePage)
 	r.GET("/about", aboutPage)
 	r.GET("/pricing", pricingPage)
 	r.GET("/contact", contactPage)
 
-	// ── 7. Graceful shutdown ──────────────────────────────────────────────
+	// ── 8. Graceful shutdown ──────────────────────────────────────────────
 
 	srv := &http.Server{
 		Addr:    ":8080",
@@ -147,7 +198,8 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[ INFO  ] listening on http://localhost:8080  cap=%d", wr.Cap())
+		log.Printf("[ INFO  ] listening on http://localhost:8080  cap=%d  rate=$%.2f/pos  pass=%s",
+			wr.Cap(), 2.50, wr.PassDuration())
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("ListenAndServe: %v", err)
 		}
@@ -163,6 +215,160 @@ func main() {
 		log.Printf("[ ERROR ] server forced to shut down: %v", err)
 	}
 	log.Println("[ INFO  ] server exited cleanly")
+}
+
+// ── Skip-the-line payment handlers ────────────────────────────────────────────
+//
+// These simulate a payment flow for the demo. In production, replace
+// handlePurchasePage with a Stripe Checkout redirect and
+// handlePurchaseConfirm with your Stripe webhook handler.
+
+// handlePurchasePage shows a confirmation page with the current cost.
+// The room_ticket cookie identifies which queued client is paying.
+//
+// Production equivalent: create a Stripe Checkout session with the
+// token as client_reference_id, then redirect to session.URL.
+func handlePurchasePage(c *gin.Context) {
+	cookie, err := c.Request.Cookie("room_ticket")
+	if err != nil || cookie.Value == "" {
+		c.Data(http.StatusBadRequest, "text/html; charset=utf-8", page(
+			"Error",
+			`<h1>No queue ticket found</h1>
+			<p>You need to be in the waiting room to skip the line.</p>
+			<a href="/">← Back to site</a>`,
+		))
+		return
+	}
+
+	token := cookie.Value
+
+	// Check if the client already has a valid pass — no need to pay again.
+	if passCookie, err := c.Request.Cookie("room_pass"); err == nil {
+		if wr.HasValidPass(passCookie.Value) {
+			c.Data(http.StatusOK, "text/html; charset=utf-8", page(
+				"VIP pass active",
+				fmt.Sprintf(
+					`<h1>You already have a VIP pass</h1>
+					<p>Your pass is still active (expires in %s). You'll be
+					automatically moved to the front — no additional payment needed.</p>
+					<p>Head back and you'll be admitted shortly.</p>
+					<a href="/">← Back to site</a>`,
+					wr.PassDuration().Round(time.Minute)),
+			))
+			return
+		}
+	}
+
+	// Get the current cost to jump to position 1.
+	cost, err := wr.QuoteCost(token, 1)
+	if err != nil {
+		var msg string
+		switch err.(type) {
+		case room.ErrTokenNotFound:
+			msg = "Your queue ticket has expired or was already used."
+		case room.ErrAlreadyAdmitted:
+			msg = "You're already being admitted — no need to pay!"
+		case room.ErrPromotionDisabled:
+			msg = "Skip-the-line is not available right now."
+		default:
+			msg = "Something went wrong: " + err.Error()
+		}
+		c.Data(http.StatusOK, "text/html; charset=utf-8", page("Skip the line", fmt.Sprintf(
+			`<h1>Skip the line</h1>
+			<p>%s</p>
+			<a href="/">← Back to site</a>`, msg,
+		)))
+		return
+	}
+
+	if cost <= 0 {
+		c.Data(http.StatusOK, "text/html; charset=utf-8", page("Skip the line",
+			`<h1>You're next!</h1>
+			<p>You're already at the front of the line — no payment needed.</p>
+			<p>Head back and you'll be admitted momentarily.</p>
+			<a href="/">← Back to site</a>`,
+		))
+		return
+	}
+
+	// Render the payment confirmation page.
+	// In production this would be a Stripe Checkout redirect instead.
+	c.Data(http.StatusOK, "text/html; charset=utf-8", purchasePage(cost, wr.PassDuration()))
+}
+
+// handlePurchaseConfirm processes the "payment" and promotes the token.
+//
+// Production equivalent: this is your Stripe webhook handler. It would:
+//  1. Verify the Stripe signature (stripe.ConstructEvent)
+//  2. Extract client_reference_id from the checkout session
+//  3. Call wr.PromoteTokenToFront(token)
+//  4. Set the room_pass cookie from result.PassToken
+//  5. Return 200 to Stripe
+//
+// For this demo we skip signature verification and just promote.
+func handlePurchaseConfirm(c *gin.Context) {
+	cookie, err := c.Request.Cookie("room_ticket")
+	if err != nil || cookie.Value == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no room_ticket cookie"})
+		return
+	}
+
+	token := cookie.Value
+
+	result, err := wr.PromoteTokenToFront(token)
+	if err != nil {
+		log.Printf("[ SKIP  ] promotion failed for token=%.8s...: %v", token, err)
+		c.Data(http.StatusOK, "text/html; charset=utf-8", page("Payment failed", fmt.Sprintf(
+			`<h1>Something went wrong</h1>
+			<p>%s</p>
+			<p>You haven't been charged. Head back to the waiting room and try again.</p>
+			<a href="/">← Back to site</a>`, err.Error(),
+		)))
+		return
+	}
+
+	log.Printf("[ SKIP  ] token=%.8s... promoted to front  cost=$%.2f  pass=%v",
+		token, result.Cost, result.PassToken != "")
+
+	// Set the VIP pass cookie if a pass was issued. This cookie
+	// persists across queue entries so the client is auto-promoted
+	// for the configured pass duration without paying again.
+	if result.PassToken != "" {
+		secure := wr.SkipURL() != "" // crude; in production use wr.SetSecureCookie logic
+		http.SetCookie(c.Writer, &http.Cookie{
+			Name:     "room_pass",
+			Value:    result.PassToken,
+			Path:     wr.CookiePath(),
+			Domain:   wr.CookieDomain(),
+			MaxAge:   int(wr.PassDuration().Seconds()),
+			HttpOnly: true,
+			Secure:   secure,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
+
+	// Redirect back to the site. The next poll (or page load) will
+	// see ready=true and admit the client immediately.
+	passMsg := ""
+	if result.PassToken != "" {
+		passMsg = fmt.Sprintf(
+			`<p>Your VIP pass is valid for <strong>%s</strong> — if you
+			re-enter the queue during that time, you'll be automatically
+			moved to the front at no extra cost.</p>`,
+			wr.PassDuration().Round(time.Minute))
+	}
+
+	c.Data(http.StatusOK, "text/html; charset=utf-8", page("Payment confirmed",
+		fmt.Sprintf(
+			`<h1>Payment confirmed — $%.2f</h1>
+			<p>You've been moved to the front of the line!</p>
+			%s
+			<p>Redirecting you now...</p>
+			<script>setTimeout(function(){ window.location.href = "/"; }, 2000);</script>
+			<noscript><a href="/">← Click here to continue</a></noscript>`,
+			result.Cost, passMsg,
+		),
+	))
 }
 
 // ── Page handlers ─────────────────────────────────────────────────────────────
@@ -184,6 +390,12 @@ func homePage(c *gin.Context) {
 		  Run <code>ab -t 60 -n 1000 -c 100 http://localhost:8080/about</code>
 		  in a second terminal and watch this terminal for room events.
 		</p>
+		<p>
+		  When you land in the waiting room, you'll see a
+		  <strong>"Skip the line"</strong> option — click it to test the
+		  payment flow at <strong>$2.50/position</strong>. Your VIP pass
+		  lasts <strong>90 minutes</strong>.
+		</p>
 		<nav>
 		  <a href="/about">About</a> ·
 		  <a href="/pricing">Pricing</a> ·
@@ -203,6 +415,11 @@ func aboutPage(c *gin.Context) {
 		  Instead of dropping excess requests with a 429, callers wait their
 		  turn and are admitted in the order they arrived.
 		</p>
+		<p>
+		  High-priority customers can <strong>skip the line</strong> by paying
+		  a per-position fee. The VIP pass lasts 90 minutes — re-enter the
+		  queue anytime during that window and you'll be auto-promoted for free.
+		</p>
 		<a href="/">← Home</a>`,
 	))
 }
@@ -215,8 +432,9 @@ func pricingPage(c *gin.Context) {
 		<table>
 		  <thead><tr><th>Tier</th><th>Requests / day</th><th>Queue priority</th></tr></thead>
 		  <tbody>
-		    <tr><td>Free</td><td>100</td><td>Standard</td></tr>
-		    <tr><td>Pro</td><td>Unlimited</td><td>Standard</td></tr>
+		    <tr><td>Free</td><td>100</td><td>Standard (FIFO)</td></tr>
+		    <tr><td>Pro</td><td>Unlimited</td><td>Standard (FIFO)</td></tr>
+		    <tr><td>Skip the line</td><td>—</td><td>$2.50/pos + 90 min VIP pass</td></tr>
 		  </tbody>
 		</table>
 		<a href="/">← Home</a>`,
@@ -303,4 +521,164 @@ func page(title, body string) []byte {
 </head>
 <body>` + body + `</body>
 </html>`)
+}
+
+// purchasePage renders the skip-the-line payment confirmation page.
+// This is the demo equivalent of a Stripe Checkout page. It shows the
+// cost and a "Confirm payment" button that POSTs to /queue/purchase/confirm.
+func purchasePage(cost float64, passDur time.Duration) []byte {
+	passNote := ""
+	if passDur > 0 {
+		passNote = fmt.Sprintf(
+			`<div class="price-detail" style="margin-top: 0.5rem;">
+			Includes a <strong>%s VIP pass</strong> — re-enter the queue
+			anytime during that window and skip for free.</div>`,
+			passDur.Round(time.Minute))
+	}
+
+	return []byte(fmt.Sprintf(`<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Skip the line — Basic Web App</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: system-ui, sans-serif;
+      min-height: 100vh;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0f1117;
+      color: #e2e8f0;
+      padding: 1.5rem;
+    }
+    .card {
+      background: #1a1d27;
+      border: 1px solid #2a2d3a;
+      border-radius: 12px;
+      padding: 2.5rem 3rem;
+      max-width: 420px;
+      width: 100%%;
+      text-align: center;
+    }
+    .icon { font-size: 2.5rem; margin-bottom: 1.25rem; }
+    h1 {
+      font-size: 1.4rem;
+      font-weight: 600;
+      margin-bottom: 0.5rem;
+      background: linear-gradient(135deg, #6c8ef5, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .subtitle {
+      color: #64748b;
+      font-size: 0.9rem;
+      margin-bottom: 2rem;
+      line-height: 1.5;
+    }
+    .price-block {
+      background: #0f1117;
+      border: 1px solid #2a2d3a;
+      border-radius: 12px;
+      padding: 1.25rem;
+      margin-bottom: 2rem;
+    }
+    .price-label {
+      font-size: 0.75rem;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      color: #64748b;
+      margin-bottom: 0.4rem;
+    }
+    .price-amount {
+      font-size: 2.5rem;
+      font-weight: 700;
+      line-height: 1;
+      background: linear-gradient(135deg, #6c8ef5, #a78bfa);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+    .price-detail {
+      font-size: 0.8rem;
+      color: #64748b;
+      margin-top: 0.3rem;
+    }
+    .price-detail strong {
+      color: #34d399;
+    }
+    .btn-pay {
+      background: linear-gradient(135deg, #6c8ef5, #a78bfa);
+      color: #fff;
+      border: none;
+      border-radius: 8px;
+      padding: 0.75rem 2rem;
+      font-size: 1rem;
+      font-weight: 600;
+      cursor: pointer;
+      width: 100%%;
+      margin-bottom: 1rem;
+      transition: opacity 0.2s;
+    }
+    .btn-pay:hover { opacity: 0.9; }
+    .btn-pay:active { opacity: 0.8; transform: scale(0.99); }
+    .btn-pay:disabled { opacity: 0.5; cursor: not-allowed; }
+    .back-link {
+      display: block;
+      color: #64748b;
+      font-size: 0.8rem;
+      text-decoration: none;
+    }
+    .back-link:hover { color: #e2e8f0; }
+    .disclaimer {
+      font-size: 0.7rem;
+      color: #475569;
+      margin-top: 1.5rem;
+      line-height: 1.4;
+    }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <div class="icon">⚡</div>
+    <h1>Skip the line</h1>
+    <p class="subtitle">
+      Jump to the front of the queue instantly.<br>
+      You'll be admitted on your next page load.
+    </p>
+
+    <div class="price-block">
+      <div class="price-label">Total cost</div>
+      <div class="price-amount">$%.2f</div>
+      <div class="price-detail">$2.50 per position · one-time payment</div>
+      %s
+    </div>
+
+    <form method="POST" action="/queue/purchase/confirm" id="pay-form">
+      <button type="submit" class="btn-pay" id="pay-btn">
+        Confirm payment — $%.2f
+      </button>
+    </form>
+
+    <a href="/" class="back-link">← Back to the waiting room</a>
+
+    <p class="disclaimer">
+      Demo mode — no real payment is processed.<br>
+      In production this page would be a Stripe Checkout session.
+    </p>
+  </div>
+
+  <script>
+    var form = document.getElementById("pay-form");
+    var btn = document.getElementById("pay-btn");
+    form.addEventListener("submit", function() {
+      btn.disabled = true;
+      btn.textContent = "Processing...";
+    });
+  </script>
+</body>
+</html>`, cost, passNote, cost))
 }

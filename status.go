@@ -28,6 +28,10 @@ import (
 // faster than statusPollMinInterval. Polls arriving too quickly receive
 // a Retry-After header and a 429 status.
 //
+// When a RateFunc is configured via SetRateFunc, the response includes
+// skip_cost (cost to jump to position 1) and rate_per_pos (current
+// per-position rate) so the waiting room page can display pricing.
+//
 // Related: WaitingRoom.Middleware, WaitingRoom.RegisterRoutes
 func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -84,11 +88,31 @@ func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 		// that the reaper does not evict tokens from polling clients.
 		wr.tokens.touchIssuedAt(cookie.Value)
 
-		c.JSON(http.StatusOK, statusResponse{
+		// Check if the client has a valid VIP pass.
+		hasPass := false
+		if passCookie, err := c.Request.Cookie(passCookieName); err == nil {
+			hasPass = wr.HasValidPass(passCookie.Value)
+		}
+
+		// Build the response with optional pricing information.
+		resp := statusResponse{
 			Ready:       false,
 			Position:    position,
 			Utilization: wr.sem.UtilizationSmoothed(),
-		})
+			HasPass:     hasPass,
+		}
+
+		// Only show pricing if the client does NOT already have a pass.
+		if !hasPass {
+			if fn := wr.rateFuncLoad(); fn != nil {
+				resp.RatePerPos = fn(wr.QueueDepth())
+				if position > 1 {
+					resp.SkipCost = float64(position-1) * resp.RatePerPos
+				}
+			}
+		}
+
+		c.JSON(http.StatusOK, resp)
 	}
 }
 

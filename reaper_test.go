@@ -434,3 +434,215 @@ func TestTokenStore_TouchLastPoll(t *testing.T) {
 		t.Errorf("previous lastPoll too old: %v", prev2)
 	}
 }
+
+// ── passStore — basic operations ─────────────────────────────────────────────
+
+func TestPassStore_SetAndGet(t *testing.T) {
+	ps := newPassStore()
+
+	ps.set("pass-1", passEntry{expiresAt: time.Now().Add(10 * time.Minute)})
+
+	entry, ok := ps.get("pass-1")
+	if !ok {
+		t.Fatal("expected pass-1 to exist")
+	}
+	if entry.expiresAt.IsZero() {
+		t.Error("expiresAt should not be zero")
+	}
+}
+
+func TestPassStore_GetMissing(t *testing.T) {
+	ps := newPassStore()
+
+	_, ok := ps.get("nonexistent")
+	if ok {
+		t.Error("expected ok=false for missing pass")
+	}
+}
+
+func TestPassStore_GetExpired_LazyEviction(t *testing.T) {
+	ps := newPassStore()
+
+	ps.set("expired", passEntry{expiresAt: time.Now().Add(-time.Minute)})
+
+	_, ok := ps.get("expired")
+	if ok {
+		t.Error("expected expired pass to return ok=false")
+	}
+
+	// Verify lazy deletion removed it.
+	if ps.len() != 0 {
+		t.Errorf("expected expired pass to be lazily deleted, got len=%d", ps.len())
+	}
+}
+
+func TestPassStore_GetLive(t *testing.T) {
+	ps := newPassStore()
+
+	ps.set("live", passEntry{expiresAt: time.Now().Add(10 * time.Minute)})
+
+	_, ok := ps.get("live")
+	if !ok {
+		t.Error("expected live pass to return ok=true")
+	}
+	if ps.len() != 1 {
+		t.Errorf("expected len=1, got %d", ps.len())
+	}
+}
+
+func TestPassStore_Delete(t *testing.T) {
+	ps := newPassStore()
+
+	ps.set("tok", passEntry{expiresAt: time.Now().Add(10 * time.Minute)})
+	ps.delete("tok")
+
+	_, ok := ps.get("tok")
+	if ok {
+		t.Error("expected deleted pass to return ok=false")
+	}
+}
+
+func TestPassStore_Len(t *testing.T) {
+	ps := newPassStore()
+
+	if ps.len() != 0 {
+		t.Errorf("expected len 0, got %d", ps.len())
+	}
+
+	ps.set("a", passEntry{expiresAt: time.Now().Add(10 * time.Minute)})
+	ps.set("b", passEntry{expiresAt: time.Now().Add(10 * time.Minute)})
+
+	if ps.len() != 2 {
+		t.Errorf("expected len 2, got %d", ps.len())
+	}
+}
+
+// ── passStore.reap() ─────────────────────────────────────────────────────────
+
+func TestPassStore_Reap_RemovesExpired(t *testing.T) {
+	ps := newPassStore()
+
+	ps.set("expired-1", passEntry{expiresAt: time.Now().Add(-5 * time.Minute)})
+	ps.set("expired-2", passEntry{expiresAt: time.Now().Add(-1 * time.Minute)})
+	ps.set("live-1", passEntry{expiresAt: time.Now().Add(30 * time.Minute)})
+
+	ps.reap()
+
+	if _, ok := ps.get("expired-1"); ok {
+		t.Error("expired-1 should have been reaped")
+	}
+	if _, ok := ps.get("expired-2"); ok {
+		t.Error("expired-2 should have been reaped")
+	}
+	if _, ok := ps.get("live-1"); !ok {
+		t.Error("live-1 should have survived reap")
+	}
+}
+
+func TestPassStore_Reap_EmptyStore(t *testing.T) {
+	ps := newPassStore()
+	// Must not panic.
+	ps.reap()
+}
+
+func TestPassStore_Reap_AllLive(t *testing.T) {
+	ps := newPassStore()
+
+	for i := 0; i < 5; i++ {
+		ps.set(fmt.Sprintf("live-%d", i), passEntry{
+			expiresAt: time.Now().Add(time.Hour),
+		})
+	}
+
+	ps.reap()
+
+	if ps.len() != 5 {
+		t.Errorf("expected 5 live passes after reap, got %d", ps.len())
+	}
+}
+
+func TestPassStore_Reap_AllExpired(t *testing.T) {
+	ps := newPassStore()
+
+	for i := 0; i < 5; i++ {
+		ps.set(fmt.Sprintf("exp-%d", i), passEntry{
+			expiresAt: time.Now().Add(-time.Hour),
+		})
+	}
+
+	ps.reap()
+
+	if ps.len() != 0 {
+		t.Errorf("expected 0 passes after reap, got %d", ps.len())
+	}
+}
+
+// ── reap() sweeps pass store alongside token store ───────────────────────────
+
+func TestReap_AlsoSweepsPassStore(t *testing.T) {
+	wr := newTestWR(t, 5)
+
+	wr.passes.set("expired-pass", passEntry{
+		expiresAt: time.Now().Add(-10 * time.Minute),
+	})
+	wr.passes.set("live-pass", passEntry{
+		expiresAt: time.Now().Add(30 * time.Minute),
+	})
+
+	wr.reap()
+
+	if _, ok := wr.passes.get("expired-pass"); ok {
+		t.Error("expired pass should have been swept by reap")
+	}
+	if _, ok := wr.passes.get("live-pass"); !ok {
+		t.Error("live pass should have survived reap")
+	}
+}
+
+func TestReap_PassSweepConcurrentWithTokenReap(t *testing.T) {
+	wr := newTestWR(t, 5)
+	expired := time.Now().Add(-(cookieTTL + time.Minute))
+
+	// Expired tokens.
+	for i := 0; i < 50; i++ {
+		wr.tokens.set(fmt.Sprintf("ghost-%d", i), ticketEntry{
+			ticket:   int64(100 + i),
+			issuedAt: expired,
+		})
+	}
+
+	// Mix of expired and live passes.
+	for i := 0; i < 20; i++ {
+		exp := time.Now().Add(time.Hour)
+		if i%2 == 0 {
+			exp = time.Now().Add(-time.Hour)
+		}
+		wr.passes.set(fmt.Sprintf("pass-%d", i), passEntry{expiresAt: exp})
+	}
+
+	var wg sync.WaitGroup
+	for range 5 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			wr.reap()
+		}()
+	}
+	wg.Wait()
+
+	// All ghost tokens should be gone.
+	if wr.tokens.len() != 0 {
+		t.Errorf("expected 0 tokens, got %d", wr.tokens.len())
+	}
+
+	// Only odd-indexed (live) passes should survive.
+	for i := 0; i < 20; i++ {
+		_, ok := wr.passes.get(fmt.Sprintf("pass-%d", i))
+		if i%2 == 0 && ok {
+			t.Errorf("pass-%d (expired) should have been reaped", i)
+		}
+		if i%2 == 1 && !ok {
+			t.Errorf("pass-%d (live) should have survived", i)
+		}
+	}
+}
