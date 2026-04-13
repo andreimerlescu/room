@@ -36,11 +36,11 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 				if wr.ticketReady(entry.ticket) {
 					// Client's ticket is now within the serving window.
 					// Acquire a slot and let them through.
-					wr.tokens.delete(cookie.Value)
 					if err := wr.sem.AcquireWith(c.Request.Context()); err != nil {
 						c.AbortWithStatus(http.StatusServiceUnavailable)
 						return
 					}
+					wr.tokens.delete(cookie.Value)
 					defer wr.release("")
 					c.Next()
 					return
