@@ -90,6 +90,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			Path:     "/",
 			MaxAge:   int(cookieTTL.Seconds()),
 			HttpOnly: true,
+			Secure:   c.Request.TLS != nil,
 			SameSite: http.SameSiteLaxMode,
 		})
 
