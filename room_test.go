@@ -73,7 +73,9 @@ func serveWithCookie(r *gin.Engine, cookie string) (*httptest.ResponseRecorder, 
 }
 
 // pollStatus calls GET /queue/status with the given token cookie and
-// returns the decoded statusResponse.
+// returns the decoded statusResponse. If the server returns 429 (rate
+// limited), the response is treated as not-ready so callers retry after
+// respecting the poll interval.
 func pollStatus(r *gin.Engine, token string) statusResponse {
 	req := httptest.NewRequest(http.MethodGet, "/queue/status", nil)
 	if token != "" {
@@ -81,6 +83,13 @@ func pollStatus(r *gin.Engine, token string) statusResponse {
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
+
+	// If rate-limited, return a synthetic not-ready response so callers
+	// back off and retry rather than seeing a decode artifact.
+	if w.Code == http.StatusTooManyRequests {
+		return statusResponse{Ready: false}
+	}
+
 	var resp statusResponse
 	json.NewDecoder(w.Body).Decode(&resp)
 	return resp
@@ -99,9 +108,13 @@ func pollStatusRaw(r *gin.Engine, token string) *httptest.ResponseRecorder {
 }
 
 // waitForStatus polls /queue/status until ready=true or deadline passes.
+// The poll interval is set to statusPollMinInterval + a small margin so
+// that the per-token rate limiter in StatusHandler does not reject polls.
 func waitForStatus(t *testing.T, r *gin.Engine, token string, deadline time.Duration) {
 	t.Helper()
 	timeout := time.After(deadline)
+	// Poll at slightly more than the rate limit interval to avoid 429s.
+	pollInterval := statusPollMinInterval + 50*time.Millisecond
 	for {
 		select {
 		case <-timeout:
@@ -110,7 +123,7 @@ func waitForStatus(t *testing.T, r *gin.Engine, token string, deadline time.Dura
 			if pollStatus(r, token).Ready {
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(pollInterval)
 		}
 	}
 }
@@ -402,11 +415,13 @@ func TestFIFO_RequestsAdmittedInOrder(t *testing.T) {
 	}
 
 	// Release each slot in sequence and verify the next waiter is admitted.
+	// The deadline is longer here because each waitForStatus poll sleeps
+	// for statusPollMinInterval + margin to avoid 429 rate limiting.
 	for i := 0; i < total; i++ {
 		close(gates[i])
 		if i+1 < total {
 			// Poll until the next token is ready then re-request.
-			waitForStatus(t, r, tokens[i+1], 2*time.Second)
+			waitForStatus(t, r, tokens[i+1], 10*time.Second)
 			go func(idx int, tok string) {
 				req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/req/%d", idx), nil)
 				req.AddCookie(&http.Cookie{Name: cookieName, Value: tok})
@@ -502,7 +517,9 @@ func TestStatusEndpoint_ReturnsReadyAfterSlotOpens(t *testing.T) {
 	close(release)
 
 	// Status should eventually return ready=true.
-	waitForStatus(t, r, token, 2*time.Second)
+	// The deadline is generous to accommodate the per-token rate limiter
+	// which requires ~1s between polls.
+	waitForStatus(t, r, token, 5*time.Second)
 }
 
 // TestStatusEndpoint_RateLimitRejectsFastPolling verifies that polling
@@ -738,7 +755,7 @@ func TestSetCap_ExpandAdmitsWaiters(t *testing.T) {
 		tok := tok
 		go func() {
 			defer wg.Done()
-			waitForStatus(t, r, tok, 2*time.Second)
+			waitForStatus(t, r, tok, 10*time.Second)
 		}()
 	}
 
@@ -750,7 +767,7 @@ func TestSetCap_ExpandAdmitsWaiters(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("timed out waiting for waiters to become ready after SetCap")
 	}
 

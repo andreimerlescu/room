@@ -448,6 +448,90 @@ sample/basic-web-app/
 
 ---
 
+## Testing It Yourself
+
+This allows you to connect to [localhost:8080](http://localhost:8080/about) and see 
+yourself in the waiting room, then get entered. Hit refresh, you're back in the room.
+
+It's easy to do: 
+
+```bash
+chmod +x test.sh
+./test.sh
+```
+
+Then [connect to localhost](https://localhost:8080/about) and see it for yourself!
+
+```log
+╭─andrei@Andreis-Mac-Studio ~/work/personal/room/sample/basic-web-app ‹main› 
+╰─$ ./test.sh             
+
+╔══════════════════════════════════════════════════╗
+║   room — Waiting Room Load Test                 ║
+╚══════════════════════════════════════════════════╝
+
+  target:       http://localhost:8080/about
+  concurrency:  30 simultaneous clients
+  duration:     30s
+  ramp delay:   50ms between client launches
+
+Building server...
+Starting server...
+✓ Server is up at http://localhost:8080 (PID 68079)
+
+──────────────────────────────────────────────────────────────────────
+  Open http://localhost:8080/ in your browser to see the waiting room.
+──────────────────────────────────────────────────────────────────────
+
+  Server log: tail -f /var/folders/0m/y8d29v892039ldkgqkxbfvvh0000gn/T/tmp.9v9lhtoiY9/server.log
+
+▶ Starting load test...
+
+  [ 29s] sent:191  served:61   queued:125  err:0   active:130 ~2 req/s [wave 7]   
+
+⏳ Draining in-flight requests (up to 30s)...
+
+  [ 59s] sent:191  served:131  queued:55   err:0   active:60  ~2 req/s [draining]   
+
+Server lifecycle events:
+──────────────────────────────────────────────────────────────────────
+2026/04/13 15:24:05 [ ENTER   ] slot acquired  occupancy=1/5  queue=0  util=20%
+2026/04/13 15:24:05 [ EXIT    ] slot released  occupancy=0/5  queue=0  util=0%
+2026/04/13 15:24:07 [ ENTER   ] slot acquired  occupancy=1/5  queue=0  util=20%
+2026/04/13 15:24:08 [ ENTER   ] slot acquired  occupancy=2/5  queue=0  util=40%
+2026/04/13 15:24:08 [ ENTER   ] slot acquired  occupancy=3/5  queue=0  util=60%
+2026/04/13 15:24:08 [ ENTER   ] slot acquired  occupancy=4/5  queue=0  util=80%
+2026/04/13 15:24:08 [ FULL    ] capacity reached  occupancy=5/5  queue=0  util=100%
+2026/04/13 15:24:08 [ ENTER   ] slot acquired  occupancy=5/5  queue=0  util=100%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=1  occupancy=5/5  util=100%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=2  occupancy=5/5  util=100%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=3  occupancy=5/5  util=100%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=4  occupancy=5/5  util=100%
+2026/04/13 15:24:08 [ EXIT    ] slot released  occupancy=4/5  queue=3  util=80%
+2026/04/13 15:24:08 [ DRAIN   ] room no longer full  occupancy=4/5  queue=3
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=4  occupancy=4/5  util=80%
+2026/04/13 15:24:08 [ EXIT    ] slot released  occupancy=3/5  queue=3  util=60%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=4  occupancy=3/5  util=60%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=5  occupancy=3/5  util=60%
+2026/04/13 15:24:08 [ EXIT    ] slot released  occupancy=2/5  queue=4  util=40%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=5  occupancy=2/5  util=40%
+2026/04/13 15:24:08 [ EXIT    ] slot released  occupancy=1/5  queue=4  util=20%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=5  occupancy=1/5  util=20%
+2026/04/13 15:24:08 [ EXIT    ] slot released  occupancy=0/5  queue=4  util=0%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=5  occupancy=0/5  util=0%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=6  occupancy=0/5  util=0%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=7  occupancy=0/5  util=0%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=8  occupancy=0/5  util=0%
+2026/04/13 15:24:08 [ QUEUE   ] request queued  depth=9  occupancy=0/5  util=0%
+2026/04/13 15:24:09 [ QUEUE   ] request queued  depth=10  occupancy=0/5  util=0%
+2026/04/13 15:24:09 [ QUEUE   ] request queued  depth=11  occupancy=0/5  util=0%
+  (no lifecycle events captured)
+^C
+Stopping server (PID 68079)...
+```
+
+---
+
 ## License
 
 Apache 2.0 — see the root [`LICENSE`](../../LICENSE) file.
