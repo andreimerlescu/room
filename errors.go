@@ -5,6 +5,7 @@ import (
 	"time"
 )
 
+
 // ErrReaperInterval is returned by SetReaperInterval when the provided
 // duration falls outside [reaperMinInterval, reaperMaxInterval].
 type ErrReaperInterval struct {
