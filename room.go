@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"embed"
+	_ "embed"
 	"encoding/hex"
 	"fmt"
 	"net/http"
@@ -14,7 +14,7 @@ import (
 )
 
 //go:embed waiting_room.html
-var defaultWaitingRoomHTML embed.FS
+var defaultWaitingRoomBytes []byte
 
 // Middleware returns the gin.HandlerFunc that enforces the waiting room.
 //
@@ -133,11 +133,7 @@ func (wr *WaitingRoom) resolveHTML() []byte {
 	if wr.html != nil {
 		return wr.html
 	}
-	b, err := defaultWaitingRoomHTML.ReadFile("waiting_room.html")
-	if err != nil {
-		return []byte("<html><body><h1>Please wait...</h1></body></html>")
-	}
-	return b
+	return defaultWaitingRoomBytes
 }
 
 // injectPosition substitutes {{.Position}} in the HTML bytes with the
