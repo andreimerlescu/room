@@ -5,7 +5,6 @@ import (
 	"time"
 )
 
-
 // ErrReaperInterval is returned by SetReaperInterval when the provided
 // duration falls outside [reaperMinInterval, reaperMaxInterval].
 type ErrReaperInterval struct {
@@ -36,4 +35,14 @@ type ErrNotInitialised struct{}
 
 func (e ErrNotInitialised) Error() string {
 	return "room: WaitingRoom not initialised — call Init before use"
+}
+
+// ErrInvalidMaxQueueDepth is returned by SetMaxQueueDepth when the
+// value is negative.
+type ErrInvalidMaxQueueDepth struct {
+	Given int64
+}
+
+func (e ErrInvalidMaxQueueDepth) Error() string {
+	return fmt.Sprintf("room: invalid max queue depth %d: must be >= 0", e.Given)
 }

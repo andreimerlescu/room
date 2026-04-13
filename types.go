@@ -20,6 +20,15 @@ import (
 // The zero value is not usable. Always construct via NewWaitingRoom or
 // initialise manually with Init.
 //
+// # Cookie security
+//
+// By default the waiting-room session cookie is issued WITHOUT the Secure
+// flag so that plain-HTTP local development works without configuration.
+// Call SetSecureCookie(true) before traffic arrives in any deployment that
+// serves the application over HTTPS (directly or via a TLS-terminating
+// proxy such as Cloudflare, nginx, or an AWS ALB). Alternatively, use
+// SetSecureCookieFromRequest to derive the flag from each incoming request.
+//
 // Related: NewWaitingRoom, Init, Middleware, RegisterRoutes
 type WaitingRoom struct {
 	sem            sema.Semaphore
@@ -27,19 +36,24 @@ type WaitingRoom struct {
 	nextTicket     atomic.Int64
 	nowServing     atomic.Int64
 	mu             sync.Mutex
-	cond           *sync.Cond
 	html           []byte
 	tokens         *tokenStore
 	stopReaper     context.CancelFunc
 	reaperInterval atomic.Int64
 	reaperRestart  chan struct{}
 	initialised    atomic.Bool
+	callbacks      *callbackRegistry
+	secureCookie   atomic.Bool
+	maxQueueDepth  atomic.Int64
+	cookiePath     atomic.Value // string
+	cookieDomain   atomic.Value // string
 }
 
 // ticketEntry holds the state for a single queued client.
 type ticketEntry struct {
 	ticket   int64
 	issuedAt time.Time
+	lastPoll time.Time
 }
 
 // tokenStore maps random token strings to ticketEntry values.
@@ -71,6 +85,70 @@ func (ts *tokenStore) delete(token string) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	delete(ts.entries, token)
+}
+
+// deleteIfExpired atomically checks expiry and deletes the token under a
+// single write lock. Returns true if the token existed and was expired.
+// This eliminates the TOCTOU window between separate isExpired + delete calls.
+func (ts *tokenStore) deleteIfExpired(token string) bool {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	entry, ok := ts.entries[token]
+	if !ok {
+		return false
+	}
+	if time.Since(entry.issuedAt) > cookieTTL {
+		delete(ts.entries, token)
+		return true
+	}
+	return false
+}
+
+// touchIssuedAt resets the issuedAt timestamp for a token to now,
+// preventing the reaper from evicting a client that is actively polling.
+func (ts *tokenStore) touchIssuedAt(token string) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	entry, ok := ts.entries[token]
+	if !ok {
+		return
+	}
+	entry.issuedAt = time.Now()
+	ts.entries[token] = entry
+}
+
+// touchLastPoll updates the lastPoll timestamp and returns the previous
+// value. Callers use this to enforce per-token poll rate limits.
+func (ts *tokenStore) touchLastPoll(token string) (previous time.Time, ok bool) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	entry, exists := ts.entries[token]
+	if !exists {
+		return time.Time{}, false
+	}
+	previous = entry.lastPoll
+	entry.lastPoll = time.Now()
+	ts.entries[token] = entry
+	return previous, true
+}
+
+// len returns the number of entries in the token store.
+func (ts *tokenStore) len() int {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return len(ts.entries)
+}
+
+// isExpired reports whether the token exists and has exceeded cookieTTL.
+// Deprecated: prefer deleteIfExpired to avoid the TOCTOU window.
+func (ts *tokenStore) isExpired(token string) bool {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	entry, ok := ts.entries[token]
+	if !ok {
+		return true
+	}
+	return time.Since(entry.issuedAt) > cookieTTL
 }
 
 // statusResponse is the JSON payload served by StatusHandler.

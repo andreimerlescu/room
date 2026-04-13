@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -34,6 +35,26 @@ func newTestRouter(wr *WaitingRoom, serving chan struct{}, release chan struct{}
 	return r
 }
 
+// newTestRouterWithGates builds a gin engine where each handler blocks on
+// its own gate channel. This allows tests to release individual slots in
+// a controlled order.
+func newTestRouterWithGates(wr *WaitingRoom, serving chan struct{}, gates []chan struct{}) *gin.Engine {
+	var idx atomic.Int32
+	r := gin.New()
+	wr.RegisterRoutes(r)
+	r.GET("/", func(c *gin.Context) {
+		i := int(idx.Add(1)) - 1
+		if serving != nil {
+			serving <- struct{}{}
+		}
+		if i < len(gates) {
+			<-gates[i]
+		}
+		c.Status(http.StatusOK)
+	})
+	return r
+}
+
 // serveWithCookie performs a GET / with an optional cookie and returns
 // the recorder and any Set-Cookie header value for cookieName.
 func serveWithCookie(r *gin.Engine, cookie string) (*httptest.ResponseRecorder, string) {
@@ -52,7 +73,9 @@ func serveWithCookie(r *gin.Engine, cookie string) (*httptest.ResponseRecorder, 
 }
 
 // pollStatus calls GET /queue/status with the given token cookie and
-// returns the decoded statusResponse.
+// returns the decoded statusResponse. If the server returns 429 (rate
+// limited), the response is treated as not-ready so callers retry after
+// respecting the poll interval.
 func pollStatus(r *gin.Engine, token string) statusResponse {
 	req := httptest.NewRequest(http.MethodGet, "/queue/status", nil)
 	if token != "" {
@@ -60,15 +83,38 @@ func pollStatus(r *gin.Engine, token string) statusResponse {
 	}
 	w := httptest.NewRecorder()
 	r.ServeHTTP(w, req)
+
+	// If rate-limited, return a synthetic not-ready response so callers
+	// back off and retry rather than seeing a decode artifact.
+	if w.Code == http.StatusTooManyRequests {
+		return statusResponse{Ready: false}
+	}
+
 	var resp statusResponse
 	json.NewDecoder(w.Body).Decode(&resp)
 	return resp
 }
 
+// pollStatusRaw calls GET /queue/status and returns the raw recorder
+// so callers can inspect status codes and headers.
+func pollStatusRaw(r *gin.Engine, token string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/queue/status", nil)
+	if token != "" {
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	return w
+}
+
 // waitForStatus polls /queue/status until ready=true or deadline passes.
+// The poll interval is set to statusPollMinInterval + a small margin so
+// that the per-token rate limiter in StatusHandler does not reject polls.
 func waitForStatus(t *testing.T, r *gin.Engine, token string, deadline time.Duration) {
 	t.Helper()
 	timeout := time.After(deadline)
+	// Poll at slightly more than the rate limit interval to avoid 429s.
+	pollInterval := statusPollMinInterval + 50*time.Millisecond
 	for {
 		select {
 		case <-timeout:
@@ -77,7 +123,7 @@ func waitForStatus(t *testing.T, r *gin.Engine, token string, deadline time.Dura
 			if pollStatus(r, token).Ready {
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
+			time.Sleep(pollInterval)
 		}
 	}
 }
@@ -261,7 +307,7 @@ func TestSlowPath_PositionInjectedInHTML(t *testing.T) {
 	w, _ := serveWithCookie(r, "")
 	body := w.Body.String()
 	// {{.Position}} should have been replaced with a number.
-	if contains(body, "{{.Position}}") {
+	if strings.Contains(body, "{{.Position}}") {
 		t.Error("expected {{.Position}} to be replaced in HTML")
 	}
 
@@ -369,11 +415,13 @@ func TestFIFO_RequestsAdmittedInOrder(t *testing.T) {
 	}
 
 	// Release each slot in sequence and verify the next waiter is admitted.
+	// The deadline is longer here because each waitForStatus poll sleeps
+	// for statusPollMinInterval + margin to avoid 429 rate limiting.
 	for i := 0; i < total; i++ {
 		close(gates[i])
 		if i+1 < total {
 			// Poll until the next token is ready then re-request.
-			waitForStatus(t, r, tokens[i+1], 2*time.Second)
+			waitForStatus(t, r, tokens[i+1], 10*time.Second)
 			go func(idx int, tok string) {
 				req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/req/%d", idx), nil)
 				req.AddCookie(&http.Cookie{Name: cookieName, Value: tok})
@@ -469,7 +517,203 @@ func TestStatusEndpoint_ReturnsReadyAfterSlotOpens(t *testing.T) {
 	close(release)
 
 	// Status should eventually return ready=true.
-	waitForStatus(t, r, token, 2*time.Second)
+	// The deadline is generous to accommodate the per-token rate limiter
+	// which requires ~1s between polls.
+	waitForStatus(t, r, token, 5*time.Second)
+}
+
+// TestStatusEndpoint_RateLimitRejectsFastPolling verifies that polling
+// /queue/status faster than statusPollMinInterval returns 429.
+func TestStatusEndpoint_RateLimitRejectsFastPolling(t *testing.T) {
+	const cap = 1
+	wr := &WaitingRoom{}
+	if err := wr.Init(cap); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	_, token := serveWithCookie(r, "")
+	if token == "" {
+		t.Fatal("no token issued")
+	}
+
+	// First poll — should succeed.
+	w1 := pollStatusRaw(r, token)
+	if w1.Code != http.StatusOK {
+		t.Errorf("first poll: expected 200, got %d", w1.Code)
+	}
+
+	// Immediate second poll — should be rate limited.
+	w2 := pollStatusRaw(r, token)
+	if w2.Code != http.StatusTooManyRequests {
+		t.Errorf("rapid second poll: expected 429, got %d", w2.Code)
+	}
+	if ra := w2.Header().Get("Retry-After"); ra != "1" {
+		t.Errorf("expected Retry-After: 1, got %q", ra)
+	}
+
+	close(release)
+}
+
+// ── MaxQueueDepth tests ──────────────────────────────────────────────────────
+
+func TestMaxQueueDepth_RejectsWhenFull(t *testing.T) {
+	const cap = 1
+	wr := &WaitingRoom{}
+	if err := wr.Init(cap); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	if err := wr.SetMaxQueueDepth(2); err != nil {
+		t.Fatal(err)
+	}
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	// Fill the slot.
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	// Queue 2 requests (the max).
+	for i := 0; i < 2; i++ {
+		serveWithCookie(r, "")
+	}
+
+	// Third queued request should be rejected.
+	w, _ := serveWithCookie(r, "")
+	if w.Code != http.StatusServiceUnavailable {
+		t.Errorf("expected 503 when queue is full, got %d", w.Code)
+	}
+
+	close(release)
+}
+
+func TestMaxQueueDepth_ZeroMeansUnlimited(t *testing.T) {
+	const cap = 1
+	wr := &WaitingRoom{}
+	if err := wr.Init(cap); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	// Default is 0 (unlimited).
+	if wr.MaxQueueDepth() != 0 {
+		t.Errorf("expected default max queue depth 0, got %d", wr.MaxQueueDepth())
+	}
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	// Queue many requests — none should be rejected.
+	for i := 0; i < 50; i++ {
+		w, _ := serveWithCookie(r, "")
+		if w.Code == http.StatusServiceUnavailable {
+			t.Fatalf("request %d rejected with unlimited queue depth", i)
+		}
+	}
+
+	close(release)
+}
+
+func TestMaxQueueDepth_NegativeRejected(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(5); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	err := wr.SetMaxQueueDepth(-1)
+	if err == nil {
+		t.Error("expected error for negative max queue depth")
+	}
+	if _, ok := err.(ErrInvalidMaxQueueDepth); !ok {
+		t.Errorf("expected ErrInvalidMaxQueueDepth, got %T", err)
+	}
+}
+
+// ── Cookie configuration tests ───────────────────────────────────────────────
+
+func TestCookiePath_DefaultIsSlash(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(5); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	if wr.CookiePath() != "/" {
+		t.Errorf("expected default cookie path '/', got %q", wr.CookiePath())
+	}
+}
+
+func TestCookiePath_CustomPathUsed(t *testing.T) {
+	const cap = 1
+	wr := &WaitingRoom{}
+	if err := wr.Init(cap); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+	wr.SetCookiePath("/app")
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	for _, c := range w.Result().Cookies() {
+		if c.Name == cookieName {
+			if c.Path != "/app" {
+				t.Errorf("expected cookie path '/app', got %q", c.Path)
+			}
+			close(release)
+			return
+		}
+	}
+	// Cookie might not be set if room wasn't full — skip.
+	close(release)
+}
+
+func TestCookieDomain_DefaultIsEmpty(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(5); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	if wr.CookieDomain() != "" {
+		t.Errorf("expected default cookie domain '', got %q", wr.CookieDomain())
+	}
 }
 
 // ── SetCap tests ─────────────────────────────────────────────────────────────
@@ -511,7 +755,7 @@ func TestSetCap_ExpandAdmitsWaiters(t *testing.T) {
 		tok := tok
 		go func() {
 			defer wg.Done()
-			waitForStatus(t, r, tok, 2*time.Second)
+			waitForStatus(t, r, tok, 10*time.Second)
 		}()
 	}
 
@@ -523,7 +767,7 @@ func TestSetCap_ExpandAdmitsWaiters(t *testing.T) {
 
 	select {
 	case <-done:
-	case <-time.After(3 * time.Second):
+	case <-time.After(15 * time.Second):
 		t.Fatal("timed out waiting for waiters to become ready after SetCap")
 	}
 
@@ -592,6 +836,8 @@ func TestSetHTML_NilRevertsToDefault(t *testing.T) {
 }
 
 // ── Reaper tests ─────────────────────────────────────────────────────────────
+// Basic reaper correctness is tested here. Full reaper coverage is in
+// reaper_test.go.
 
 func TestReaper_EvictsExpiredTokens(t *testing.T) {
 	wr := &WaitingRoom{}
@@ -633,20 +879,52 @@ func TestReaper_PreservesLiveTokens(t *testing.T) {
 
 func TestReaper_AdvancesNowServingOnEviction(t *testing.T) {
 	wr := &WaitingRoom{}
+	if err := wr.Init(1); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	if ns := wr.nowServing.Load(); ns != 0 {
+		t.Fatalf("expected nowServing=0 initially, got %d", ns)
+	}
+
+	wr.tokens.set("ghost", ticketEntry{
+		ticket:   10,
+		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
+	})
+
+	before := wr.nowServing.Load()
+	wr.reap()
+
+	if wr.nowServing.Load() != before+1 {
+		t.Errorf("expected nowServing to advance by 1 after evicting an out-of-window ghost, got %d (before=%d)",
+			wr.nowServing.Load(), before)
+	}
+}
+
+func TestReaper_DoesNotAdvanceNowServingForWindowTicket(t *testing.T) {
+	wr := &WaitingRoom{}
 	if err := wr.Init(5); err != nil {
 		t.Fatal(err)
 	}
 	defer wr.Stop()
 
-	before := wr.nowServing.Load()
-	wr.tokens.set("ghost", ticketEntry{
+	wr.tokens.set("window-ghost", ticketEntry{
 		ticket:   1,
 		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
 	})
+
+	before := wr.nowServing.Load()
 	wr.reap()
 
-	if wr.nowServing.Load() != before+1 {
-		t.Errorf("expected nowServing to advance by 1 after eviction, got %d", wr.nowServing.Load())
+	if _, ok := wr.tokens.get("window-ghost"); ok {
+		t.Error("expected window-ghost token to be evicted")
+	}
+
+	if wr.nowServing.Load() != before {
+		t.Errorf("nowServing advanced for a within-window ghost: before=%d after=%d (cap=5) — "+
+			"this would inflate capacity beyond configured limit",
+			before, wr.nowServing.Load())
 	}
 }
 
@@ -695,6 +973,83 @@ func TestSetReaperInterval_InvalidRange(t *testing.T) {
 			t.Errorf("expected ErrReaperInterval for %s, got %T", d, err)
 		}
 	}
+}
+
+// ── SetSecureCookie tests ────────────────────────────────────────────────────
+
+func TestSetSecureCookie_DefaultIsFalse(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(1); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	var found bool
+	for _, c := range w.Result().Cookies() {
+		if c.Name == cookieName {
+			found = true
+			if c.Secure {
+				t.Error("expected Secure=false on cookie for plain-HTTP request with default secureCookieDefault=false")
+			}
+		}
+	}
+	if !found {
+		t.Skip("no room_ticket cookie issued — room may not have been full; skipping Secure flag check")
+	}
+
+	close(release)
+}
+
+func TestSetSecureCookie_TrueSetsCookieSecure(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(1); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+	wr.SetSecureCookie(true)
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	var found bool
+	for _, c := range w.Result().Cookies() {
+		if c.Name == cookieName {
+			found = true
+			if !c.Secure {
+				t.Error("expected Secure=true on cookie after SetSecureCookie(true)")
+			}
+		}
+	}
+	if !found {
+		t.Skip("no room_ticket cookie issued — room may not have been full; skipping Secure flag check")
+	}
+
+	close(release)
 }
 
 // ── Introspection tests ──────────────────────────────────────────────────────
@@ -905,20 +1260,4 @@ func FuzzWaitingRoom(f *testing.F) {
 			t.Errorf("invariant violated: Len=%d", l)
 		}
 	})
-}
-
-// ── Helpers ──────────────────────────────────────────────────────────────────
-
-func contains(s, substr string) bool {
-	return len(s) >= len(substr) && (s == substr ||
-		len(s) > 0 && containsRune(s, substr))
-}
-
-func containsRune(s, substr string) bool {
-	for i := range s {
-		if i+len(substr) <= len(s) && s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
 }

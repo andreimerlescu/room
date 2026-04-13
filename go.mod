@@ -1,6 +1,6 @@
 module github.com/andreimerlescu/room
 
-go 1.21
+go 1.22
 
 require (
 	github.com/andreimerlescu/sema v1.1.0
