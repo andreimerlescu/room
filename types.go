@@ -9,12 +9,13 @@ import (
 	"github.com/andreimerlescu/sema"
 )
 
-// WaitingRoom is a FIFO-ordered capacity gate for gin HTTP handlers.
+// WaitingRoom is a ticket-ordered capacity gate for gin HTTP handlers.
 //
 // It combines a semaphore (capacity management via sema) with a ticket
-// queue (arrival ordering) to ensure that when your application is at
-// capacity, excess requests are held in strict arrival order and admitted
-// one-by-one as slots open.
+// queue (arrival tracking) so that when your application is at capacity,
+// excess requests wait for capacity to become available and are served in
+// ticket order as slots open, without guaranteeing strict one-by-one FIFO
+// admission among clients that become eligible at the same time.
 //
 // The zero value is not usable. Always construct via NewWaitingRoom or
 // initialise manually with Init.
