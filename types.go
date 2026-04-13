@@ -22,7 +22,7 @@ import (
 // Related: NewWaitingRoom, Init, Middleware, RegisterRoutes
 type WaitingRoom struct {
 	sem            sema.Semaphore
-	cap            int32
+	cap            atomic.Int32
 	nextTicket     atomic.Int64
 	nowServing     atomic.Int64
 	mu             sync.Mutex
