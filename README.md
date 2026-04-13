@@ -142,6 +142,8 @@ required.
 
 ## What your users see
 
+<img src="/waiting_room.jpg" alt="waiting_room.html preview" width="369px" />
+
 When a request can't be served immediately, `room` responds with a
 self-contained HTML page that polls `/queue/status` every 3 seconds and
 updates the position in place:
