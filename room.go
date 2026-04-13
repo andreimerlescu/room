@@ -2,7 +2,6 @@ package room
 
 import (
 	"bytes"
-	"context"
 	"crypto/rand"
 	_ "embed"
 	"encoding/hex"
