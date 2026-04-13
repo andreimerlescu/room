@@ -81,6 +81,12 @@ func (wr *WaitingRoom) startReaper(ctx context.Context) {
 // deleted under the token store write lock. nowServing is advanced and
 // cond is broadcast under wr.mu so waiters cannot miss the wakeup.
 //
+// NOTE: evicted tickets may not be contiguous. Advancing nowServing
+// by the total eviction count can admit later tickets slightly out
+// of strict FIFO order when ghost tickets are non-adjacent. This is
+// an accepted trade-off documented in the WaitingRoom type comment;
+// a gap-tracking structure could tighten this in a future release.
+//
 // Related: WaitingRoom.startReaper, WaitingRoom.SetReaperInterval
 func (wr *WaitingRoom) reap() {
 	now := time.Now()
@@ -108,7 +114,8 @@ func (wr *WaitingRoom) reap() {
 	wr.tokens.mu.Lock()
 	for _, token := range expired {
 		if entry, ok := wr.tokens.entries[token]; ok {
-			// double check due to duplicates in map cause eviction
+			// Re-check under write lock: the entry may have been
+			// deleted or updated between the read-lock scan and now.
 			if now.Sub(entry.issuedAt) > cookieTTL {
 				delete(wr.tokens.entries, token)
 				evicted++

@@ -178,7 +178,7 @@
         You'll be admitted automatically — no need to refresh.
     </p>
 
-    <div class="position-block">
+    <div class="position-block" aria-live="polite" aria-atomic="true">
         <div class="position-label">Your position</div>
         <div class="position-number" id="position">{{.Position}}</div>
         <div class="position-suffix">in line</div>
@@ -193,7 +193,7 @@
         <span>Last checked <strong id="last-checked">just now</strong></span>
     </div>
 
-    <div class="status">
+    <div class="status" role="status">
         <span class="dot"></span>
         <span id="status-text">Waiting for a slot to open...</span>
     </div>

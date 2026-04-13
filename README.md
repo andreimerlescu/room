@@ -17,9 +17,10 @@ through a proper waiting room with FIFO ordering, position awareness,
 and a live status page.
 
 `room` does the third. It sits in front of your gin handlers as middleware,
-issues every arriving request a ticket, and admits them strictly in order
-as slots open. Clients that must wait see a clean waiting room page that
-updates their position automatically — no refresh required.
+issues every arriving request a ticket and admits them in ticket order as 
+slots open, though clients that become eligible simultaneously may be served 
+in any order among themselves. Clients that must wait see a clean waiting 
+room page that updates their position automatically — no refresh required.
 
 ---
 

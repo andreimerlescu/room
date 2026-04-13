@@ -119,7 +119,7 @@ func TestNewWaitingRoom_Panics(t *testing.T) {
 			t.Fatal("expected panic from NewWaitingRoom(0)")
 		}
 	}()
-	NewWaitingRoom(0)
+	NewWaitingRoom(gin.New(), 0)
 }
 
 // ── Fast path tests ──────────────────────────────────────────────────────────

@@ -1,4 +1,6 @@
-.PHONY: test test-race test-fuzz lint clean
+.PHONY: test all test-race test-fuzz lint clean
+
+all: lint clean test test-race test-fuzz bench
 
 test:
 	go test -count=1 -v ./...

@@ -26,11 +26,12 @@ import (
 // initialisation, use NewWaitingRoomFromStruct instead.
 //
 // Related: NewWaitingRoomFromStruct, WaitingRoom.Middleware
-func NewWaitingRoom(cap int32) gin.HandlerFunc {
+func NewWaitingRoom(r *gin.Engine, cap int32) gin.HandlerFunc {
 	wr := &WaitingRoom{}
 	if err := wr.Init(cap); err != nil {
 		panic(fmt.Sprintf("room.NewWaitingRoom: %v", err))
 	}
+	r.GET("/queue/status", wr.StatusHandler())
 	return wr.Middleware()
 }
 
@@ -49,6 +50,9 @@ func NewWaitingRoom(cap int32) gin.HandlerFunc {
 //
 // Related: NewWaitingRoom, WaitingRoom.RegisterRoutes
 func NewWaitingRoomFromStruct(wr *WaitingRoom) gin.HandlerFunc {
+	if wr == nil {
+		panic("room.NewWaitingRoomFromStruct: nil WaitingRoom")
+	}
 	return wr.Middleware()
 }
 

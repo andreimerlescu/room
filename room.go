@@ -112,7 +112,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			Path:     "/",
 			MaxAge:   int(cookieTTL.Seconds()),
 			HttpOnly: true,
-			Secure:   c.Request.TLS != nil,
+			Secure:   true, // default to true since proxies like cloudflare can terminate due to c.Request.TLS being nil when served over HTTPS
 			SameSite: http.SameSiteLaxMode,
 		})
 
