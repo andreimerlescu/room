@@ -2,7 +2,6 @@ package room
 
 import (
 	"context"
-	"fmt"
 	"time"
 )
 
