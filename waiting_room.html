@@ -1,0 +1,279 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Please Wait</title>
+    <style>
+        *, *::before, *::after {
+            box-sizing: border-box;
+            margin: 0;
+            padding: 0;
+        }
+
+        :root {
+            --bg:        #0f1117;
+            --surface:   #1a1d27;
+            --border:    #2a2d3a;
+            --accent:    #6c8ef5;
+            --accent2:   #a78bfa;
+            --text:      #e2e8f0;
+            --muted:     #64748b;
+            --success:   #34d399;
+            --radius:    12px;
+        }
+
+        body {
+            background: var(--bg);
+            color: var(--text);
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 1.5rem;
+        }
+
+        .card {
+            background: var(--surface);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 2.5rem 3rem;
+            max-width: 480px;
+            width: 100%;
+            text-align: center;
+        }
+
+        .icon {
+            font-size: 2.5rem;
+            margin-bottom: 1.25rem;
+            animation: pulse 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50%       { opacity: 0.6; transform: scale(0.95); }
+        }
+
+        h1 {
+            font-size: 1.4rem;
+            font-weight: 600;
+            margin-bottom: 0.5rem;
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .subtitle {
+            color: var(--muted);
+            font-size: 0.9rem;
+            margin-bottom: 2rem;
+            line-height: 1.5;
+        }
+
+        .position-block {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: var(--radius);
+            padding: 1.25rem;
+            margin-bottom: 2rem;
+        }
+
+        .position-label {
+            font-size: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+            color: var(--muted);
+            margin-bottom: 0.4rem;
+        }
+
+        .position-number {
+            font-size: 3rem;
+            font-weight: 700;
+            line-height: 1;
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .position-suffix {
+            font-size: 0.8rem;
+            color: var(--muted);
+            margin-top: 0.3rem;
+        }
+
+        .bar-wrap {
+            background: var(--bg);
+            border: 1px solid var(--border);
+            border-radius: 999px;
+            height: 6px;
+            overflow: hidden;
+            margin-bottom: 2rem;
+        }
+
+        .bar-fill {
+            height: 100%;
+            border-radius: 999px;
+            background: linear-gradient(90deg, var(--accent), var(--accent2));
+            animation: shimmer 2s linear infinite;
+            background-size: 200% 100%;
+        }
+
+        @keyframes shimmer {
+            0%   { background-position: 200% center; }
+            100% { background-position: -200% center; }
+        }
+
+        .meta {
+            display: flex;
+            justify-content: space-between;
+            font-size: 0.78rem;
+            color: var(--muted);
+            margin-bottom: 2rem;
+        }
+
+        .meta span strong {
+            color: var(--text);
+            font-weight: 500;
+        }
+
+        .status {
+            font-size: 0.8rem;
+            color: var(--muted);
+        }
+
+        .status .dot {
+            display: inline-block;
+            width: 7px;
+            height: 7px;
+            border-radius: 50%;
+            background: var(--accent);
+            margin-right: 6px;
+            animation: blink 1.4s ease-in-out infinite;
+            vertical-align: middle;
+        }
+
+        @keyframes blink {
+            0%, 100% { opacity: 1; }
+            50%       { opacity: 0.2; }
+        }
+
+        .admitted {
+            color: var(--success);
+            font-weight: 600;
+            font-size: 1rem;
+            display: none;
+        }
+    </style>
+</head>
+<body>
+<div class="card">
+    <div class="icon">⏳</div>
+
+    <h1>You're in the queue</h1>
+    <p class="subtitle">
+        The application is at capacity right now.<br>
+        You'll be admitted automatically — no need to refresh.
+    </p>
+
+    <div class="position-block">
+        <div class="position-label">Your position</div>
+        <div class="position-number" id="position">{{.Position}}</div>
+        <div class="position-suffix">in line</div>
+    </div>
+
+    <div class="bar-wrap">
+        <div class="bar-fill" id="bar" style="width: 100%"></div>
+    </div>
+
+    <div class="meta">
+        <span>Checking every <strong id="interval">3s</strong></span>
+        <span>Last checked <strong id="last-checked">just now</strong></span>
+    </div>
+
+    <div class="status">
+        <span class="dot"></span>
+        <span id="status-text">Waiting for a slot to open...</span>
+    </div>
+
+    <div class="admitted" id="admitted">
+        ✓ You're being admitted now...
+    </div>
+</div>
+
+<script>
+    const POLL_INTERVAL_MS   = 3000;
+    const JITTER_MS          = 500;
+    const STATUS_ENDPOINT    = "/queue/status";
+
+    let currentPosition = parseInt(
+        document.getElementById("position").textContent, 10
+    ) || 0;
+
+    function ordinal(n) {
+        const s = ["th","st","nd","rd"];
+        const v = n % 100;
+        return n + (s[(v - 20) % 10] || s[v] || s[0]);
+    }
+
+    function updateLastChecked() {
+        document.getElementById("last-checked").textContent = "just now";
+    }
+
+    function setStatus(text) {
+        document.getElementById("status-text").textContent = text;
+    }
+
+    function admit() {
+        document.getElementById("admitted").style.display = "block";
+        document.querySelector(".status").style.display   = "none";
+        document.querySelector(".icon").textContent       = "✅";
+        setStatus("");
+        setTimeout(() => window.location.reload(), 800);
+    }
+
+    async function poll() {
+        try {
+            const res  = await fetch(STATUS_ENDPOINT, { cache: "no-store" });
+            if (!res.ok) { scheduleNext(); return; }
+
+            const data = await res.json();
+
+            // Server signals this client is ready to enter.
+            if (data.ready === true) {
+                admit();
+                return;
+            }
+
+            if (typeof data.position === "number") {
+                currentPosition = data.position;
+                document.getElementById("position").textContent =
+                    currentPosition <= 0 ? "1" : String(currentPosition);
+            }
+
+            setStatus(
+                currentPosition <= 1
+                    ? "Almost there — next in line..."
+                    : `${ordinal(currentPosition)} in line`
+            );
+
+            updateLastChecked();
+        } catch (_) {
+            setStatus("Checking...");
+        }
+
+        scheduleNext();
+    }
+
+    function scheduleNext() {
+        const jitter = Math.random() * JITTER_MS;
+        setTimeout(poll, POLL_INTERVAL_MS + jitter);
+    }
+
+    // Kick off the first poll after one interval.
+    scheduleNext();
+</script>
+</body>
+</html>
