@@ -108,6 +108,7 @@ func (wr *WaitingRoom) reap() {
 	wr.tokens.mu.Lock()
 	for _, token := range expired {
 		if entry, ok := wr.tokens.entries[token]; ok {
+			// double check due to duplicates in map cause eviction
 			if now.Sub(entry.issuedAt) > cookieTTL {
 				delete(wr.tokens.entries, token)
 				evicted++

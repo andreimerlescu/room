@@ -33,7 +33,7 @@ type WaitingRoom struct {
 	stopReaper     context.CancelFunc
 	reaperInterval atomic.Int64
 	reaperRestart  chan struct{}
-	initialised    bool
+	initialised    atomic.Bool
 }
 
 // ticketEntry holds the state for a single queued client.

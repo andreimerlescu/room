@@ -64,7 +64,11 @@ func (wr *WaitingRoom) Init(cap int32) error {
 		return ErrInvalidCap{Given: cap}
 	}
 
-	wr.cap = cap
+	if wr.stopReaper != nil {
+		wr.stopReaper()
+	}
+
+	wr.cap.Store(cap)
 	wr.sem = sema.Must(int(cap))
 	wr.cond = sync.NewCond(&wr.mu)
 	wr.tokens = newTokenStore()
@@ -72,7 +76,7 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.nowServing.Store(0)
 	wr.nextTicket.Store(0)
 	wr.reaperInterval.Store(int64(reaperInterval))
-	wr.initialised = true
+	wr.initialised.Store(true)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	wr.stopReaper = cancel
@@ -96,7 +100,7 @@ func (wr *WaitingRoom) Stop() {
 // WaitingRoom has not been initialised. Prevents nil pointer dereferences
 // on zero-value WaitingRoom structs.
 func (wr *WaitingRoom) checkInitialised(c *gin.Context) bool {
-	if !wr.initialised {
+	if !wr.initialised.Load() {
 		c.AbortWithStatus(http.StatusInternalServerError)
 		return false
 	}

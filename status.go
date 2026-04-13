@@ -21,6 +21,10 @@ import (
 // Related: WaitingRoom.Middleware, WaitingRoom.RegisterRoutes
 func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if !wr.checkInitialised(c) {
+			return
+		}
+
 		cookie, err := c.Request.Cookie(cookieName)
 		if err != nil {
 			c.JSON(http.StatusOK, statusResponse{Ready: true})
@@ -33,7 +37,13 @@ func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 			return
 		}
 
-		position := entry.ticket - wr.nowServing.Load() - int64(wr.cap)
+		if wr.tokens.isExpired(cookie.Value) {
+			wr.tokens.delete(cookie.Value)
+			c.JSON(http.StatusOK, statusResponse{Ready: true})
+			return
+		}
+
+		position := wr.positionOf(entry.ticket)
 		if position <= 0 {
 			c.JSON(http.StatusOK, statusResponse{Ready: true})
 			return
@@ -45,6 +55,13 @@ func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 			Utilization: wr.sem.UtilizationSmoothed(),
 		})
 	}
+}
+
+// positionOf returns the raw queue position for a ticket. A value <= 0
+// means the ticket is within the serving window and eligible for admission.
+// Callers that need a display-safe value (minimum 1) should clamp separately.
+func (wr *WaitingRoom) positionOf(ticket int64) int64 {
+	return ticket - wr.nowServing.Load() - int64(wr.cap.Load())
 }
 
 // RegisterRoutes registers GET /queue/status on the given gin.Engine and

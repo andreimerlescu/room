@@ -28,6 +28,9 @@ var defaultWaitingRoomBytes []byte
 // Related: WaitingRoom.RegisterRoutes, WaitingRoom.StatusHandler
 func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		if !wr.checkInitialised(c) {
+			return
+		}
 		// Resume an existing queued position if the client presents a
 		// valid room_ticket cookie. This preserves queue position across
 		// page reloads and polling retries.
@@ -46,7 +49,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 					return
 				}
 				// Still waiting — serve updated position and abort.
-				position := entry.ticket - (wr.nowServing.Load() + int64(wr.cap))
+				position := wr.positionOf(entry.ticket)
 				if position < 1 {
 					position = 1
 				}
@@ -63,6 +66,12 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		// Fast path — ticket is within the serving window.
 		if wr.ticketReady(ticket) {
 			if err := wr.sem.AcquireWith(ctx); err != nil {
+				// Ticket consumed but not served — advance nowServing
+				// so the gap doesn't stall the queue.
+				wr.mu.Lock()
+				wr.nowServing.Add(1)
+				wr.cond.Broadcast()
+				wr.mu.Unlock()
 				c.AbortWithStatus(http.StatusServiceUnavailable)
 				return
 			}
@@ -75,6 +84,10 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		// abort. The client will poll /queue/status and reload when ready.
 		token, err := generateToken()
 		if err != nil {
+			wr.mu.Lock()
+			wr.nowServing.Add(1)
+			wr.cond.Broadcast()
+			wr.mu.Unlock()
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
@@ -94,7 +107,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			SameSite: http.SameSiteLaxMode,
 		})
 
-		position := ticket - (wr.nowServing.Load() + int64(wr.cap))
+		position := ticket - (wr.nowServing.Load() + int64(wr.cap.Load()))
 		if position < 1 {
 			position = 1
 		}
@@ -107,7 +120,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 // ticketReady reports whether the given ticket falls within the current
 // serving window.
 func (wr *WaitingRoom) ticketReady(ticket int64) bool {
-	return ticket <= wr.nowServing.Load()+int64(wr.cap)
+	return ticket <= wr.nowServing.Load()+int64(wr.cap.Load())
 }
 
 // release returns a semaphore slot, optionally removes a session token,
@@ -117,8 +130,11 @@ func (wr *WaitingRoom) release(token string) {
 		wr.tokens.delete(token)
 	}
 	wr.sem.Release()
+
+	wr.mu.Lock()
 	wr.nowServing.Add(1)
 	wr.cond.Broadcast()
+	wr.mu.Unlock()
 }
 
 // resolveHTML returns the HTML bytes to serve. Custom HTML set via SetHTML
@@ -170,7 +186,7 @@ func (wr *WaitingRoom) SetCap(cap int32) error {
 	if err := wr.sem.SetCap(int(cap)); err != nil {
 		return err
 	}
-	wr.cap = cap
+	wr.cap.Store(cap)
 	wr.cond.Broadcast()
 	return nil
 }
@@ -179,9 +195,7 @@ func (wr *WaitingRoom) SetCap(cap int32) error {
 //
 // Related: WaitingRoom.SetCap
 func (wr *WaitingRoom) Cap() int32 {
-	wr.mu.Lock()
-	defer wr.mu.Unlock()
-	return wr.cap
+	return wr.cap.Load()
 }
 
 // Len returns the number of requests currently being actively served.
@@ -195,9 +209,7 @@ func (wr *WaitingRoom) Len() int {
 //
 // Related: WaitingRoom.Len
 func (wr *WaitingRoom) QueueDepth() int64 {
-	wr.mu.Lock()
-	defer wr.mu.Unlock()
-	depth := wr.nextTicket.Load() - (wr.nowServing.Load() + int64(wr.cap))
+	depth := wr.nextTicket.Load() - (wr.nowServing.Load() + int64(wr.cap.Load()))
 	if depth < 0 {
 		return 0
 	}
