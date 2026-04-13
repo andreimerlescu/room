@@ -37,7 +37,15 @@ Requires **Go 1.21+**.
 
 ```go
 r := gin.Default()
-r.Use(room.NewWaitingRoom(500))
+
+wr := &room.WaitingRoom{}
+if err := wr.Init(500); err != nil {
+    log.Fatal(err)
+}
+defer wr.Stop()
+
+// Registers GET /queue/status and attaches the middleware.
+wr.RegisterRoutes(r)
 r.Run(":8080")
 ```
 
