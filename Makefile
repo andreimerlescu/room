@@ -1,0 +1,19 @@
+.PHONY: test test-race test-fuzz lint clean
+
+test:
+	go test -count=1 -v ./...
+
+test-race:
+	go test -race -count=1 -v ./...
+
+test-fuzz:
+	go test -fuzz=FuzzWaitingRoom -fuzztime=30s ./...
+
+bench:
+	go test -bench=. -benchmem ./...
+
+lint:
+	go vet ./...
+
+clean:
+	go clean ./...
