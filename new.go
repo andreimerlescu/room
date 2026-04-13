@@ -81,6 +81,7 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.nextTicket.Store(0)
 	wr.reaperInterval.Store(int64(reaperInterval))
 	wr.initialised.Store(true)
+	wr.callbacks = newCallbackRegistry()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	wr.stopReaper = cancel

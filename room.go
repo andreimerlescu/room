@@ -49,11 +49,16 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 						wr.nowServing.Add(1)
 						wr.cond.Broadcast()
 						wr.mu.Unlock()
+						wr.emit(EventTimeout, wr.snapshot(EventTimeout))
 						c.AbortWithStatus(http.StatusServiceUnavailable)
 						return
 					}
 					wr.tokens.delete(cookie.Value)
 					defer wr.release("")
+					wr.emit(EventEnter, wr.snapshot(EventEnter))
+					if wr.Len() >= int(wr.Cap()) {
+						wr.emit(EventFull, wr.snapshot(EventFull))
+					}
 					c.Next()
 					return
 				}
@@ -81,10 +86,15 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 				wr.nowServing.Add(1)
 				wr.cond.Broadcast()
 				wr.mu.Unlock()
+				wr.emit(EventTimeout, wr.snapshot(EventTimeout))
 				c.AbortWithStatus(http.StatusServiceUnavailable)
 				return
 			}
 			defer wr.release("")
+			wr.emit(EventEnter, wr.snapshot(EventEnter))
+			if wr.Len() >= int(wr.Cap()) {
+				wr.emit(EventFull, wr.snapshot(EventFull))
+			}
 			c.Next()
 			return
 		}
@@ -105,6 +115,8 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			ticket:   ticket,
 			issuedAt: time.Now(),
 		})
+
+		wr.emit(EventQueue, wr.snapshot(EventQueue))
 
 		http.SetCookie(c.Writer, &http.Cookie{
 			Name:     cookieName,
@@ -139,11 +151,16 @@ func (wr *WaitingRoom) release(token string) {
 		wr.tokens.delete(token)
 	}
 	wr.sem.Release()
-
 	wr.mu.Lock()
 	wr.nowServing.Add(1)
 	wr.cond.Broadcast()
 	wr.mu.Unlock()
+
+	snap := wr.snapshot(EventExit)
+	wr.emit(EventExit, snap)
+	if snap.Empty() {
+		wr.emit(EventDrain, wr.snapshot(EventDrain))
+	}
 }
 
 // resolveHTML returns the HTML bytes to serve. Custom HTML set via SetHTML

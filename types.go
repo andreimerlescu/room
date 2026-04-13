@@ -34,6 +34,7 @@ type WaitingRoom struct {
 	reaperInterval atomic.Int64
 	reaperRestart  chan struct{}
 	initialised    atomic.Bool
+	callbacks      *callbackRegistry
 }
 
 // ticketEntry holds the state for a single queued client.
