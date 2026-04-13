@@ -40,6 +40,15 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 					// Client's ticket is now within the serving window.
 					// Acquire a slot and let them through.
 					if err := wr.sem.AcquireWith(c.Request.Context()); err != nil {
+						// Acquire failed (client disconnected, context
+						// cancelled). Clean up the dead token and advance
+						// nowServing so the queue doesn't stall waiting
+						// for the reaper to evict this ticket.
+						wr.tokens.delete(cookie.Value)
+						wr.mu.Lock()
+						wr.nowServing.Add(1)
+						wr.cond.Broadcast()
+						wr.mu.Unlock()
 						c.AbortWithStatus(http.StatusServiceUnavailable)
 						return
 					}
