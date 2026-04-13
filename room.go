@@ -22,6 +22,11 @@ var defaultWaitingRoomBytes []byte
 // until admitted — at which point the browser reloads and the request
 // re-enters on the fast path.
 //
+// If the client presents a valid room_pass cookie (issued after a
+// skip-the-line payment), the middleware auto-promotes their ticket to
+// the front of the queue. This happens transparently — the client sees
+// the waiting room briefly and is admitted on the next poll cycle.
+//
 // This design avoids writing two responses to the same ResponseWriter by
 // never calling c.Next() on a request that was served the waiting room page.
 //
@@ -40,6 +45,12 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		}
 
 		secure := wr.secureCookie.Load() || c.Request.TLS != nil
+
+		// Check if the client has a valid VIP pass for auto-promotion.
+		hasPass := false
+		if passCookie, err := c.Request.Cookie(passCookieName); err == nil {
+			hasPass = wr.HasValidPass(passCookie.Value)
+		}
 
 		// Resume an existing queued position if the client presents a
 		// valid room_ticket cookie. This preserves queue position across
@@ -78,6 +89,14 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 					c.Next()
 					return
 				}
+
+				// Client has a valid pass but their ticket isn't ready
+				// yet — auto-promote them to the front so they get
+				// admitted on the next poll cycle.
+				if hasPass && !entry.promoted {
+					wr.autoPromote(cookie.Value)
+				}
+
 				// Touch the token's issuedAt so active pollers do not
 				// get reaped during normal operation.
 				wr.tokens.touchIssuedAt(cookie.Value)
@@ -155,6 +174,12 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			SameSite: http.SameSiteLaxMode,
 		})
 
+		// If the client has a valid pass, auto-promote the freshly
+		// issued ticket immediately so they jump to the front.
+		if hasPass {
+			wr.autoPromote(token)
+		}
+
 		position := wr.positionOf(ticket)
 		if position < 1 {
 			position = 1
@@ -163,6 +188,37 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectTemplateVars(html, position))
 		c.Abort()
 	}
+}
+
+// autoPromote silently promotes a token to the front of the queue.
+// This is used when a client with a valid VIP pass re-enters the queue.
+// Unlike PromoteToken, it does not require a RateFunc and does not
+// compute cost — the pass was already paid for.
+func (wr *WaitingRoom) autoPromote(token string) {
+	wr.promoteMu.Lock()
+	defer wr.promoteMu.Unlock()
+
+	entry, ok := wr.tokens.get(token)
+	if !ok {
+		return
+	}
+
+	if wr.positionOf(entry.ticket) <= 0 {
+		return // already in serving window
+	}
+
+	ceiling := wr.nowServing.Load() + int64(wr.cap.Load()) + 1
+	insert := wr.promoteInsert.Load()
+	if ceiling < insert {
+		insert = ceiling
+	}
+
+	entry.ticket = insert
+	entry.promoted = true
+	wr.promoteInsert.Store(insert - 1)
+	wr.tokens.set(token, entry)
+
+	wr.emit(EventPromote, wr.snapshot(EventPromote))
 }
 
 // ticketReady reports whether the given ticket falls within the current

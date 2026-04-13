@@ -6,6 +6,12 @@ const (
 	// cookieName is the HTTP-only session cookie issued to queued clients.
 	cookieName = "room_ticket"
 
+	// passCookieName is the HTTP-only cookie that holds the VIP pass
+	// token. This cookie outlives individual queue tickets — it persists
+	// for the configured pass duration so that clients who paid to skip
+	// are auto-promoted on re-entry without paying again.
+	passCookieName = "room_pass"
+
 	// cookieTTL is how long a queued client's token remains valid.
 	// If a client disappears before being admitted, their token is
 	// evicted by the reaper after this duration.
@@ -46,4 +52,15 @@ const (
 	// /queue/status polls for a single token. Polls arriving faster
 	// than this receive a cached response with a Retry-After header.
 	statusPollMinInterval = 1 * time.Second
+
+	// defaultPassDuration is the default lifetime of a VIP pass issued
+	// by PromoteTokenToFront / GrantPass. Zero means passes are disabled
+	// (single-use promotion only). Call SetPassDuration to enable.
+	defaultPassDuration = 0
+
+	// passMinDuration is the minimum value accepted by SetPassDuration.
+	passMinDuration = 1 * time.Minute
+
+	// passMaxDuration is the maximum value accepted by SetPassDuration.
+	passMaxDuration = 24 * time.Hour
 )

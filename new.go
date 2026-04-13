@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"net/http"
+	"time"
 
 	"github.com/andreimerlescu/sema"
 	"github.com/gin-gonic/gin"
@@ -85,6 +86,7 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.cap.Store(cap)
 	wr.sem = sema.Must(int(cap))
 	wr.tokens = newTokenStore()
+	wr.passes = newPassStore()
 	wr.reaperRestart = make(chan struct{}, 1)
 	wr.nowServing.Store(0)
 	wr.nextTicket.Store(0)
@@ -96,6 +98,7 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.rateFunc.Store((*rateFuncHolder)(nil))
 	wr.promoteInsert.Store(math.MaxInt64)
 	wr.skipURL.Store("")
+	wr.passDuration.Store(int64(defaultPassDuration))
 	wr.initialised.Store(true)
 	wr.callbacks = newCallbackRegistry()
 
@@ -205,6 +208,95 @@ func (wr *WaitingRoom) SetSkipURL(url string) {
 // SkipURL returns the current skip-the-line payment URL.
 func (wr *WaitingRoom) SkipURL() string {
 	return wr.skipURL.Load().(string)
+}
+
+// SetPassDuration sets the lifetime of VIP passes issued by GrantPass.
+// After a client pays to skip the line, they receive a pass that
+// auto-promotes them for this duration on any subsequent queue entry,
+// without requiring another payment.
+//
+// A value of 0 disables passes (the default). When disabled, promotions
+// are single-use: the client is promoted once and must pay again if they
+// re-enter the queue.
+//
+// Valid range when non-zero: 1m – 24h. Values outside this range return
+// ErrPassDuration.
+//
+// Safe to call at any time.
+//
+// Related: GrantPass, HasValidPass, PassDuration
+func (wr *WaitingRoom) SetPassDuration(d time.Duration) error {
+	if d == 0 {
+		wr.passDuration.Store(0)
+		return nil
+	}
+	if d < passMinDuration || d > passMaxDuration {
+		return ErrPassDuration{Given: d, Min: passMinDuration, Max: passMaxDuration}
+	}
+	wr.passDuration.Store(int64(d))
+	return nil
+}
+
+// PassDuration returns the current VIP pass lifetime. Zero means passes
+// are disabled (single-use promotions only).
+func (wr *WaitingRoom) PassDuration() time.Duration {
+	return time.Duration(wr.passDuration.Load())
+}
+
+// GrantPass creates a time-limited VIP pass and returns the pass token.
+// The caller is responsible for setting the room_pass cookie on the
+// HTTP response with this token value.
+//
+// The pass expires after PassDuration from now. If PassDuration is 0
+// (passes disabled), GrantPass returns an empty string and no pass is
+// created.
+//
+// Typical usage in your payment confirmation handler:
+//
+//	cost, err := wr.PromoteTokenToFront(ticketToken)
+//	if err != nil { ... }
+//	passToken := wr.GrantPass()
+//	if passToken != "" {
+//	    http.SetCookie(w, &http.Cookie{
+//	        Name:     "room_pass",
+//	        Value:    passToken,
+//	        Path:     wr.CookiePath(),
+//	        MaxAge:   int(wr.PassDuration().Seconds()),
+//	        HttpOnly: true,
+//	        Secure:   true,
+//	    })
+//	}
+//
+// Related: SetPassDuration, HasValidPass, PromoteTokenToFront
+func (wr *WaitingRoom) GrantPass() string {
+	d := wr.PassDuration()
+	if d == 0 {
+		return ""
+	}
+
+	token, err := generateToken()
+	if err != nil {
+		return ""
+	}
+
+	wr.passes.set(token, passEntry{
+		expiresAt: time.Now().Add(d),
+	})
+
+	return token
+}
+
+// HasValidPass reports whether the given pass token exists and has not
+// expired. Use this in your middleware or handlers to check if a client
+// should be auto-promoted.
+//
+// Related: GrantPass, SetPassDuration
+func (wr *WaitingRoom) HasValidPass(passToken string) bool {
+	if passToken == "" {
+		return false
+	}
+	_, ok := wr.passes.get(passToken)
+	return ok
 }
 
 // checkInitialised aborts the request with 500 and returns false if the

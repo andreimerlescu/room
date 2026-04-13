@@ -183,6 +183,37 @@
             transform: scale(0.99);
         }
 
+        /* ── VIP pass badge ──────────────────────────────────── */
+
+        .pass-badge {
+            display: none;
+            background: linear-gradient(
+                    135deg,
+                    rgba(52, 211, 153, 0.08),
+                    rgba(52, 211, 153, 0.15)
+            );
+            border: 1px solid rgba(52, 211, 153, 0.3);
+            border-radius: var(--radius);
+            padding: 0.75rem 1.25rem;
+            margin-bottom: 2rem;
+        }
+
+        .pass-badge.visible {
+            display: block;
+        }
+
+        .pass-badge-text {
+            font-size: 0.85rem;
+            color: var(--success);
+            font-weight: 500;
+        }
+
+        .pass-badge-detail {
+            font-size: 0.7rem;
+            color: var(--muted);
+            margin-top: 0.25rem;
+        }
+
         /* ── Progress bar ────────────────────────────────────── */
 
         .bar-wrap {
@@ -265,10 +296,16 @@
         <div class="position-suffix">in line</div>
     </div>
 
+    <!-- VIP pass badge: shown when the client has an active pass.
+         They're being auto-promoted and will be admitted shortly. -->
+    <div class="pass-badge" id="pass-badge" role="status">
+        <div class="pass-badge-text">⚡ VIP pass active</div>
+        <div class="pass-badge-detail">You're being fast-tracked to the front automatically.</div>
+    </div>
+
     <!-- Skip-the-line offer: hidden by default, shown only when the
-         server returns skip_cost > 0 and a SkipURL was configured.
-         The price updates on every poll so it tracks queue movement
-         in real time. -->
+         server returns skip_cost > 0, a SkipURL was configured, and
+         the client does NOT already have a valid pass. -->
     <div class="skip-offer" id="skip-offer" role="complementary"
          aria-label="Skip the line offer">
         <div class="skip-header">
@@ -325,6 +362,7 @@
     const skipCostEl   = document.getElementById("skip-cost");
     const skipRateEl   = document.getElementById("skip-rate");
     const skipBtnEl    = document.getElementById("skip-btn");
+    const passBadgeEl  = document.getElementById("pass-badge");
     const statusTextEl = document.getElementById("status-text");
     const lastChecked  = document.getElementById("last-checked");
     const admittedEl   = document.getElementById("admitted");
@@ -351,10 +389,20 @@
         statusTextEl.textContent = text;
     }
 
-    // ── Skip-the-line ───────────────────────────────────────────
+    // ── Skip-the-line / VIP pass ────────────────────────────────
 
     function updateSkipOffer(data) {
-        // Show the offer only when:
+        // If the client has a valid VIP pass, show the pass badge
+        // instead of the purchase offer.
+        if (data.has_pass) {
+            passBadgeEl.classList.add("visible");
+            skipOfferEl.classList.remove("visible");
+            return;
+        }
+
+        passBadgeEl.classList.remove("visible");
+
+        // Show the purchase offer only when:
         //  1. The server sent a positive skip_cost (RateFunc is set)
         //  2. The application configured a SkipURL
         //  3. The client is at position > 1 (position 1 = next in,
@@ -385,6 +433,7 @@
         statusEl.style.display   = "none";
         iconEl.textContent       = "✅";
         skipOfferEl.classList.remove("visible");
+        passBadgeEl.classList.remove("visible");
         setStatus("");
         setTimeout(function () { window.location.reload(); }, 800);
     }
@@ -411,7 +460,7 @@
                     currentPosition <= 0 ? "1" : String(currentPosition);
             }
 
-            // Update skip-the-line pricing (no-ops if not configured).
+            // Update skip-the-line pricing or VIP pass badge.
             updateSkipOffer(data);
 
             setStatus(

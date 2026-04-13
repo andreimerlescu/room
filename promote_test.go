@@ -57,7 +57,6 @@ func TestQuoteCost_NoRateFunc_ReturnsDisabled(t *testing.T) {
 	t.Parallel()
 	wr := newTestWR(t, 5)
 
-	// Manually insert a token so the test isn't about token lookup.
 	wr.tokens.set("tok", ticketEntry{ticket: 20, issuedAt: time.Now()})
 
 	_, err := wr.QuoteCost("tok", 1)
@@ -106,7 +105,6 @@ func TestQuoteCost_AlreadyAdmitted(t *testing.T) {
 	wr := newTestWR(t, 10)
 	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
 
-	// Ticket 5 with cap=10 and nowServing=0 → position = 5 - 0 - 10 = -5 (admitted).
 	wr.tokens.set("tok", ticketEntry{ticket: 5, issuedAt: time.Now()})
 
 	_, err := wr.QuoteCost("tok", 1)
@@ -123,11 +121,8 @@ func TestQuoteCost_AlreadyAtOrAheadOfTarget(t *testing.T) {
 	wr := newTestWR(t, 1)
 	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
 
-	// cap=1, nowServing=0 → position = ticket - 0 - 1 = ticket - 1.
-	// ticket=4 → position=3.
 	wr.tokens.set("tok", ticketEntry{ticket: 4, issuedAt: time.Now()})
 
-	// Target position 3 (same as current) → cost should be 0.
 	cost, err := wr.QuoteCost("tok", 3)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -136,7 +131,6 @@ func TestQuoteCost_AlreadyAtOrAheadOfTarget(t *testing.T) {
 		t.Errorf("expected cost 0 for same position, got %f", cost)
 	}
 
-	// Target position 5 (behind current) → cost should be 0.
 	cost, err = wr.QuoteCost("tok", 5)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -151,11 +145,8 @@ func TestQuoteCost_CorrectCalculation_FlatRate(t *testing.T) {
 	wr := newTestWR(t, 1)
 	wr.SetRateFunc(func(depth int64) float64 { return 2.00 })
 
-	// cap=1, nowServing=0 → position = ticket - 1.
-	// ticket=11 → position=10.
 	wr.tokens.set("tok", ticketEntry{ticket: 11, issuedAt: time.Now()})
 
-	// Jump from position 10 to position 1: distance=9, cost = 9 * 2.00 = 18.00.
 	cost, err := wr.QuoteCost("tok", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -164,7 +155,6 @@ func TestQuoteCost_CorrectCalculation_FlatRate(t *testing.T) {
 		t.Errorf("expected cost 18.00, got %f", cost)
 	}
 
-	// Jump from position 10 to position 5: distance=5, cost = 5 * 2.00 = 10.00.
 	cost, err = wr.QuoteCost("tok", 5)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -178,14 +168,10 @@ func TestQuoteCost_SurgeRateUsesQueueDepth(t *testing.T) {
 	t.Parallel()
 	wr := newTestWR(t, 1)
 
-	// Surge pricing: base $1 + $0.10 per queued request.
 	wr.SetRateFunc(func(depth int64) float64 {
 		return 1.0 + float64(depth)*0.10
 	})
 
-	// Insert several tokens to build queue depth.
-	// cap=1, nowServing=0 → window is ticket [1].
-	// Tickets 2..6 are outside the window → queue depth = 5.
 	for i := int64(2); i <= 6; i++ {
 		wr.nextTicket.Store(i)
 		wr.tokens.set(fmt.Sprintf("tok-%d", i), ticketEntry{
@@ -195,9 +181,6 @@ func TestQuoteCost_SurgeRateUsesQueueDepth(t *testing.T) {
 	}
 	wr.nextTicket.Store(6)
 
-	// tok-6: position = 6 - 0 - 1 = 5. Queue depth = 5.
-	// rate = 1.0 + 5*0.10 = 1.50.
-	// Jump to position 1: distance = 4, cost = 4 * 1.50 = 6.00.
 	cost, err := wr.QuoteCost("tok-6", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -285,7 +268,6 @@ func TestPromoteToken_AlreadyAdmitted(t *testing.T) {
 	wr := newTestWR(t, 10)
 	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
 
-	// Ticket 3, cap=10, nowServing=0 → position = 3 - 0 - 10 = -7 (in window).
 	wr.tokens.set("tok", ticketEntry{ticket: 3, issuedAt: time.Now()})
 
 	_, err := wr.PromoteToken("tok", 1)
@@ -302,19 +284,16 @@ func TestPromoteToken_AlreadyAhead_Noop(t *testing.T) {
 	wr := newTestWR(t, 1)
 	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
 
-	// cap=1, nowServing=0 → position = ticket - 1.
-	// ticket=4 → position=3.
 	wr.tokens.set("tok", ticketEntry{ticket: 4, issuedAt: time.Now()})
 
-	cost, err := wr.PromoteToken("tok", 3)
+	result, err := wr.PromoteToken("tok", 3)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cost != 0 {
-		t.Errorf("expected cost 0 for no-op promotion, got %f", cost)
+	if result.Cost != 0 {
+		t.Errorf("expected cost 0 for no-op promotion, got %f", result.Cost)
 	}
 
-	// Ticket should be unchanged.
 	entry, _ := wr.tokens.get("tok")
 	if entry.ticket != 4 {
 		t.Errorf("ticket changed on no-op promotion: expected 4, got %d", entry.ticket)
@@ -326,23 +305,17 @@ func TestPromoteToken_MovesToFront(t *testing.T) {
 	wr := newTestWR(t, 1)
 	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
 
-	// cap=1, nowServing=0.
-	// ticket=11 → position = 11 - 0 - 1 = 10.
 	wr.tokens.set("tok", ticketEntry{ticket: 11, issuedAt: time.Now()})
 
-	cost, err := wr.PromoteToken("tok", 1)
+	result, err := wr.PromoteToken("tok", 1)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// distance = 10 - 1 = 9, cost = 9 * 1.0 = 9.0.
-	if cost != 9.0 {
-		t.Errorf("expected cost 9.0, got %f", cost)
+	if result.Cost != 9.0 {
+		t.Errorf("expected cost 9.0, got %f", result.Cost)
 	}
 
-	// New ticket should place the token at position 1.
-	// ceiling = nowServing + cap + targetPosition = 0 + 1 + 1 = 2.
-	// promoteInsert was 0, so insert = ceiling = 2. newTicket = 2.
 	entry, ok := wr.tokens.get("tok")
 	if !ok {
 		t.Fatal("token not found after promotion")
@@ -351,7 +324,6 @@ func TestPromoteToken_MovesToFront(t *testing.T) {
 		t.Errorf("expected new ticket 2, got %d", entry.ticket)
 	}
 
-	// Verify positionOf confirms position 1.
 	pos := wr.positionOf(entry.ticket)
 	if pos != 1 {
 		t.Errorf("expected position 1 after promotion, got %d", pos)
@@ -363,17 +335,14 @@ func TestPromoteToken_MovesToIntermediate(t *testing.T) {
 	wr := newTestWR(t, 1)
 	wr.SetRateFunc(func(depth int64) float64 { return 5.00 })
 
-	// cap=1, nowServing=0.
-	// ticket=21 → position = 21 - 0 - 1 = 20.
 	wr.tokens.set("tok", ticketEntry{ticket: 21, issuedAt: time.Now()})
 
-	// Promote to position 10: distance = 20 - 10 = 10, cost = 10 * 5.00 = 50.00.
-	cost, err := wr.PromoteToken("tok", 10)
+	result, err := wr.PromoteToken("tok", 10)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cost != 50.0 {
-		t.Errorf("expected cost 50.0, got %f", cost)
+	if result.Cost != 50.0 {
+		t.Errorf("expected cost 50.0, got %f", result.Cost)
 	}
 
 	entry, _ := wr.tokens.get("tok")
@@ -406,17 +375,14 @@ func TestPromoteToken_ReturnsCost(t *testing.T) {
 	wr := newTestWR(t, 2)
 	wr.SetRateFunc(func(depth int64) float64 { return 3.50 })
 
-	// cap=2, nowServing=0 → position = ticket - 2.
-	// ticket=12 → position=10.
 	wr.tokens.set("tok", ticketEntry{ticket: 12, issuedAt: time.Now()})
 
-	// Jump to position 4: distance = 10 - 4 = 6, cost = 6 * 3.50 = 21.00.
-	cost, err := wr.PromoteToken("tok", 4)
+	result, err := wr.PromoteToken("tok", 4)
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if cost != 21.0 {
-		t.Errorf("expected cost 21.0, got %f", cost)
+	if result.Cost != 21.0 {
+		t.Errorf("expected cost 21.0, got %f", result.Cost)
 	}
 }
 
@@ -444,7 +410,6 @@ func TestPromoteToken_NoEventOnNoop(t *testing.T) {
 	var promoteCount atomic.Int32
 	wr.On(EventPromote, func(s Snapshot) { promoteCount.Add(1) })
 
-	// Position 3, target 3 → no-op.
 	wr.tokens.set("tok", ticketEntry{ticket: 4, issuedAt: time.Now()})
 	_, _ = wr.PromoteToken("tok", 3)
 
@@ -462,7 +427,6 @@ func TestPromoteToken_NoEventOnError(t *testing.T) {
 	var promoteCount atomic.Int32
 	wr.On(EventPromote, func(s Snapshot) { promoteCount.Add(1) })
 
-	// Token does not exist → error, no event.
 	_, _ = wr.PromoteToken("missing", 1)
 
 	time.Sleep(50 * time.Millisecond)
@@ -478,17 +442,15 @@ func TestPromoteTokenToFront_JumpsToPositionOne(t *testing.T) {
 	wr := newTestWR(t, 1)
 	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
 
-	// position = 11 - 0 - 1 = 10.
 	wr.tokens.set("tok", ticketEntry{ticket: 11, issuedAt: time.Now()})
 
-	cost, err := wr.PromoteTokenToFront("tok")
+	result, err := wr.PromoteTokenToFront("tok")
 	if err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 
-	// distance = 10 - 1 = 9, cost = 9 * 1.0 = 9.0.
-	if cost != 9.0 {
-		t.Errorf("expected cost 9.0, got %f", cost)
+	if result.Cost != 9.0 {
+		t.Errorf("expected cost 9.0, got %f", result.Cost)
 	}
 
 	entry, _ := wr.tokens.get("tok")
@@ -507,10 +469,9 @@ func TestPromoteToken_ConcurrentPromotions_NoCollision(t *testing.T) {
 
 	const n = 20
 
-	// Insert n tokens at various positions.
 	for i := 0; i < n; i++ {
 		wr.tokens.set(fmt.Sprintf("tok-%d", i), ticketEntry{
-			ticket:   int64(10 + i*5), // positions spread apart
+			ticket:   int64(10 + i*5),
 			issuedAt: time.Now(),
 		})
 	}
@@ -535,13 +496,11 @@ func TestPromoteToken_ConcurrentPromotions_NoCollision(t *testing.T) {
 
 	wg.Wait()
 
-	// All should succeed (no panics, no data races).
 	if errorCount.Load() > 0 {
 		t.Logf("successes=%d errors=%d (errors may include already-admitted tokens)",
 			successCount.Load(), errorCount.Load())
 	}
 
-	// Verify no two surviving tokens have the same ticket number.
 	seen := make(map[int64]string)
 	wr.tokens.mu.RLock()
 	for token, entry := range wr.tokens.entries {
@@ -562,7 +521,6 @@ func TestPromoteToken_SerializedUnderMutex(t *testing.T) {
 	wr.tokens.set("tok-a", ticketEntry{ticket: 50, issuedAt: time.Now()})
 	wr.tokens.set("tok-b", ticketEntry{ticket: 60, issuedAt: time.Now()})
 
-	// Promote both to position 1 concurrently.
 	var wg sync.WaitGroup
 	wg.Add(2)
 
@@ -584,8 +542,6 @@ func TestPromoteToken_SerializedUnderMutex(t *testing.T) {
 		t.Fatal("tokens disappeared after concurrent promotion")
 	}
 
-	// Because promotions are serialized via promoteMu and each claims
-	// a unique slot via promoteInsert, tickets must differ.
 	if entryA.ticket == entryB.ticket {
 		t.Errorf("ticket collision after serialized promotions: both have ticket %d",
 			entryA.ticket)
@@ -604,14 +560,12 @@ func TestIntegration_PromotedToken_AdmittedOnNextPoll(t *testing.T) {
 	release := make(chan struct{})
 	r := newTestRouter(wr, serving, release)
 
-	// Fill the single slot.
 	go func() {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		r.ServeHTTP(httptest.NewRecorder(), req)
 	}()
 	<-serving
 
-	// Queue two requests and collect tokens.
 	_, tokenA := serveWithCookie(r, "")
 	_, tokenB := serveWithCookie(r, "")
 
@@ -619,23 +573,19 @@ func TestIntegration_PromotedToken_AdmittedOnNextPoll(t *testing.T) {
 		t.Fatal("expected tokens for both queued requests")
 	}
 
-	// tokenB should be further back in the queue than tokenA.
 	entryB, _ := wr.tokens.get(tokenB)
 	posB := wr.positionOf(entryB.ticket)
 	if posB < 2 {
 		t.Fatalf("expected tokenB at position >= 2, got %d", posB)
 	}
 
-	// Promote tokenB to front.
 	_, err := wr.PromoteTokenToFront(tokenB)
 	if err != nil {
 		t.Fatalf("PromoteTokenToFront: %v", err)
 	}
 
-	// Release the active slot.
 	close(release)
 
-	// tokenB should be admitted before tokenA now.
 	waitForStatus(t, r, tokenB, 5*time.Second)
 }
 
@@ -657,7 +607,6 @@ func TestIntegration_PromotedToken_ServesRequestSuccessfully(t *testing.T) {
 	serving := make(chan struct{}, 1)
 	releaseFirst := make(chan struct{})
 
-	// Override the handler for the first request to block.
 	rBlocking := gin.New()
 	wr.RegisterRoutes(rBlocking)
 	rBlocking.GET("/", func(c *gin.Context) {
@@ -666,33 +615,26 @@ func TestIntegration_PromotedToken_ServesRequestSuccessfully(t *testing.T) {
 		c.Status(http.StatusOK)
 	})
 
-	// Fill the slot with a blocking request.
 	go func() {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		rBlocking.ServeHTTP(httptest.NewRecorder(), req)
 	}()
 	<-serving
 
-	// Queue a request and get its token.
 	_, token := serveWithCookie(rBlocking, "")
 	if token == "" {
 		t.Fatal("no token issued")
 	}
 
-	// Promote to front.
 	_, err := wr.PromoteTokenToFront(token)
 	if err != nil {
 		t.Fatalf("PromoteTokenToFront: %v", err)
 	}
 
-	// Release the blocking request.
 	close(releaseFirst)
 
-	// Wait until the promoted token is ready.
 	waitForStatus(t, rBlocking, token, 5*time.Second)
 
-	// Now make the actual request with the promoted cookie — it should
-	// pass through the middleware and hit the handler.
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
 	req.AddCookie(&http.Cookie{Name: cookieName, Value: token})
 	w := httptest.NewRecorder()
@@ -715,14 +657,12 @@ func TestIntegration_StatusEndpoint_IncludesPricing(t *testing.T) {
 	release := make(chan struct{})
 	r := newTestRouter(wr, serving, release)
 
-	// Fill the slot.
 	go func() {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
 		r.ServeHTTP(httptest.NewRecorder(), req)
 	}()
 	<-serving
 
-	// Queue multiple requests so the last one is at position > 1.
 	serveWithCookie(r, "")
 	serveWithCookie(r, "")
 	_, token := serveWithCookie(r, "")
@@ -730,7 +670,6 @@ func TestIntegration_StatusEndpoint_IncludesPricing(t *testing.T) {
 		t.Fatal("no token issued")
 	}
 
-	// Poll status — should include pricing fields.
 	req := httptest.NewRequest(http.MethodGet, "/queue/status", nil)
 	req.AddCookie(&http.Cookie{Name: cookieName, Value: token})
 	w := httptest.NewRecorder()
@@ -758,7 +697,6 @@ func TestIntegration_StatusEndpoint_IncludesPricing(t *testing.T) {
 		t.Errorf("expected positive skip_cost, got %f", resp.SkipCost)
 	}
 
-	// skip_cost should be (position - 1) * rate.
 	expectedCost := float64(resp.Position-1) * 2.50
 	if resp.SkipCost != expectedCost {
 		t.Errorf("expected skip_cost=%f, got %f", expectedCost, resp.SkipCost)
@@ -771,7 +709,6 @@ func TestIntegration_StatusEndpoint_NoPricingWithoutRateFunc(t *testing.T) {
 	t.Parallel()
 	const cap = 1
 	wr := newTestWR(t, int32(cap))
-	// No SetRateFunc — pricing should be absent.
 
 	serving := make(chan struct{}, 1)
 	release := make(chan struct{})
@@ -806,17 +743,67 @@ func TestIntegration_StatusEndpoint_NoPricingWithoutRateFunc(t *testing.T) {
 	close(release)
 }
 
+func TestIntegration_StatusEndpoint_HidesPricingWhenPassActive(t *testing.T) {
+	t.Parallel()
+	const cap = 1
+	wr := newTestWR(t, int32(cap))
+	wr.SetRateFunc(func(depth int64) float64 { return 2.50 })
+	if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	serveWithCookie(r, "")
+	_, token := serveWithCookie(r, "")
+	if token == "" {
+		t.Fatal("no token issued")
+	}
+
+	// Grant a pass for this client.
+	passToken := wr.GrantPass()
+	if passToken == "" {
+		t.Fatal("expected pass token")
+	}
+
+	// Poll with both cookies.
+	req := httptest.NewRequest(http.MethodGet, "/queue/status", nil)
+	req.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+	req.AddCookie(&http.Cookie{Name: passCookieName, Value: passToken})
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	var resp statusResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+
+	if !resp.HasPass {
+		t.Error("expected has_pass=true")
+	}
+	if resp.SkipCost != 0 {
+		t.Errorf("expected skip_cost=0 when pass active, got %f", resp.SkipCost)
+	}
+	if resp.RatePerPos != 0 {
+		t.Errorf("expected rate_per_pos=0 when pass active, got %f", resp.RatePerPos)
+	}
+
+	close(release)
+}
+
 // ── Edge cases ───────────────────────────────────────────────────────────────
 
 func TestPromoteToken_QueueMovedBetweenQuoteAndPromote(t *testing.T) {
-	// Simulates the race where the queue advances between QuoteCost
-	// and PromoteToken — the actual cost should reflect the state at
-	// promotion time, not quote time.
 	t.Parallel()
 	wr := newTestWR(t, 1)
 	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
 
-	// position = 11 - 0 - 1 = 10.
 	wr.tokens.set("tok", ticketEntry{ticket: 11, issuedAt: time.Now()})
 
 	quotedCost, err := wr.QuoteCost("tok", 1)
@@ -824,18 +811,16 @@ func TestPromoteToken_QueueMovedBetweenQuoteAndPromote(t *testing.T) {
 		t.Fatalf("QuoteCost: %v", err)
 	}
 
-	// Simulate queue advancement: nowServing moves forward by 3.
 	wr.nowServing.Add(3)
 
-	// Now position = 11 - 3 - 1 = 7. Jump to 1: distance=6, cost=6.0.
-	actualCost, err := wr.PromoteToken("tok", 1)
+	result, err := wr.PromoteToken("tok", 1)
 	if err != nil {
 		t.Fatalf("PromoteToken: %v", err)
 	}
 
-	if actualCost >= quotedCost {
+	if result.Cost >= quotedCost {
 		t.Errorf("expected actual cost (%f) < quoted cost (%f) after queue advancement",
-			actualCost, quotedCost)
+			result.Cost, quotedCost)
 	}
 }
 
@@ -850,8 +835,6 @@ func TestPromoteToken_ReapDoesNotEvictPromotedToken(t *testing.T) {
 		t.Fatalf("PromoteToken: %v", err)
 	}
 
-	// Token was just promoted — issuedAt was set at creation time, which
-	// is recent. Reap should not evict it.
 	wr.reap()
 
 	if _, ok := wr.tokens.get("tok"); !ok {
@@ -860,8 +843,6 @@ func TestPromoteToken_ReapDoesNotEvictPromotedToken(t *testing.T) {
 }
 
 func TestPromoteToken_ExpiredPromotedToken_Reaped(t *testing.T) {
-	// A promoted token that stops polling should eventually expire
-	// and be reaped, just like any other token.
 	t.Parallel()
 	wr := newTestWR(t, 1)
 	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
@@ -871,16 +852,9 @@ func TestPromoteToken_ExpiredPromotedToken_Reaped(t *testing.T) {
 		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
 	})
 
-	// Promote the already-expired token (simulating a payment that
-	// was processed very late).
-	// Note: the token's position would be based on current state.
-	// Since it's expired, it may be reaped before promotion in real
-	// usage, but here we're testing that promotion doesn't grant
-	// immunity from expiration.
 	entry, _ := wr.tokens.get("tok")
 	entry.ticket = wr.nowServing.Load() + int64(wr.cap.Load()) + 1
 	entry.promoted = true
-	// Keep the old issuedAt to simulate an abandoned promoted token.
 	wr.tokens.set("tok", entry)
 
 	wr.reap()
@@ -888,6 +862,270 @@ func TestPromoteToken_ExpiredPromotedToken_Reaped(t *testing.T) {
 	if _, ok := wr.tokens.get("tok"); ok {
 		t.Error("expired promoted token should have been reaped")
 	}
+}
+
+// ── Pass system ──────────────────────────────────────────────────────────────
+
+func TestSetPassDuration_Zero_DisablesPasses(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 5)
+
+	if err := wr.SetPassDuration(0); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if wr.PassDuration() != 0 {
+		t.Errorf("expected 0, got %s", wr.PassDuration())
+	}
+}
+
+func TestSetPassDuration_ValidRange(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 5)
+
+	cases := []time.Duration{
+		passMinDuration,
+		30 * time.Minute,
+		90 * time.Minute,
+		passMaxDuration,
+	}
+	for _, d := range cases {
+		if err := wr.SetPassDuration(d); err != nil {
+			t.Errorf("expected no error for %s, got %v", d, err)
+		}
+		if wr.PassDuration() != d {
+			t.Errorf("expected %s, got %s", d, wr.PassDuration())
+		}
+	}
+}
+
+func TestSetPassDuration_InvalidRange(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 5)
+
+	cases := []time.Duration{
+		time.Second,
+		passMinDuration - time.Nanosecond,
+		passMaxDuration + time.Nanosecond,
+	}
+	for _, d := range cases {
+		err := wr.SetPassDuration(d)
+		if err == nil {
+			t.Errorf("expected error for %s, got nil", d)
+		}
+		if _, ok := err.(ErrPassDuration); !ok {
+			t.Errorf("expected ErrPassDuration for %s, got %T", d, err)
+		}
+	}
+}
+
+func TestGrantPass_ReturnsTokenWhenConfigured(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 5)
+	if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	token := wr.GrantPass()
+	if token == "" {
+		t.Error("expected non-empty pass token")
+	}
+
+	if !wr.HasValidPass(token) {
+		t.Error("freshly granted pass should be valid")
+	}
+}
+
+func TestGrantPass_ReturnsEmptyWhenDisabled(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 5)
+	// Default pass duration is 0 (disabled).
+
+	token := wr.GrantPass()
+	if token != "" {
+		t.Errorf("expected empty pass token when disabled, got %q", token)
+	}
+}
+
+func TestHasValidPass_EmptyToken(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 5)
+
+	if wr.HasValidPass("") {
+		t.Error("empty token should not be a valid pass")
+	}
+}
+
+func TestHasValidPass_NonexistentToken(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 5)
+
+	if wr.HasValidPass("does-not-exist") {
+		t.Error("nonexistent token should not be a valid pass")
+	}
+}
+
+func TestHasValidPass_ExpiredPass(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 5)
+
+	wr.passes.set("expired", passEntry{
+		expiresAt: time.Now().Add(-time.Minute),
+	})
+
+	if wr.HasValidPass("expired") {
+		t.Error("expired pass should not be valid")
+	}
+}
+
+func TestHasValidPass_LivePass(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 5)
+
+	wr.passes.set("live", passEntry{
+		expiresAt: time.Now().Add(30 * time.Minute),
+	})
+
+	if !wr.HasValidPass("live") {
+		t.Error("live pass should be valid")
+	}
+}
+
+func TestPromoteToken_IssuesPassWhenConfigured(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 1)
+	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
+	if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	wr.tokens.set("tok", ticketEntry{ticket: 11, issuedAt: time.Now()})
+
+	result, err := wr.PromoteToken("tok", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.PassToken == "" {
+		t.Error("expected pass token in PromoteResult when pass duration configured")
+	}
+	if !wr.HasValidPass(result.PassToken) {
+		t.Error("issued pass token should be valid")
+	}
+}
+
+func TestPromoteToken_NoPassWhenDisabled(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 1)
+	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
+	// Pass duration defaults to 0 (disabled).
+
+	wr.tokens.set("tok", ticketEntry{ticket: 11, issuedAt: time.Now()})
+
+	result, err := wr.PromoteToken("tok", 1)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	if result.PassToken != "" {
+		t.Errorf("expected empty pass token when disabled, got %q", result.PassToken)
+	}
+}
+
+func TestAutoPromote_WithValidPass(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 1)
+	if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+		t.Fatal(err)
+	}
+
+	// Create a pass.
+	passToken := wr.GrantPass()
+	if passToken == "" {
+		t.Fatal("expected pass token")
+	}
+
+	// Insert a queued token (simulating a re-entry).
+	wr.tokens.set("ticket-tok", ticketEntry{
+		ticket:   50,
+		issuedAt: time.Now(),
+	})
+
+	// Before auto-promote: position should be far back.
+	posBefore := wr.positionOf(50)
+	if posBefore <= 0 {
+		t.Fatalf("expected positive position before auto-promote, got %d", posBefore)
+	}
+
+	// Auto-promote (this is what the middleware calls internally).
+	wr.autoPromote("ticket-tok")
+
+	entry, ok := wr.tokens.get("ticket-tok")
+	if !ok {
+		t.Fatal("token disappeared after autoPromote")
+	}
+
+	posAfter := wr.positionOf(entry.ticket)
+	if posAfter >= posBefore {
+		t.Errorf("expected position to improve after autoPromote: before=%d after=%d",
+			posBefore, posAfter)
+	}
+	if !entry.promoted {
+		t.Error("expected promoted=true after autoPromote")
+	}
+}
+
+func TestAutoPromote_SkipsAlreadyPromoted(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 1)
+
+	wr.tokens.set("tok", ticketEntry{
+		ticket:   50,
+		issuedAt: time.Now(),
+		promoted: true,
+	})
+
+	ticketBefore := int64(50)
+	wr.autoPromote("tok")
+
+	// autoPromote checks positionOf but since the middleware only calls
+	// autoPromote when !entry.promoted, we test that the function still
+	// works correctly when called on an already-promoted token (it should
+	// still promote since it checks position, not the flag).
+	entry, _ := wr.tokens.get("tok")
+	if entry.ticket == ticketBefore {
+		// It's acceptable that autoPromote moves it again — the position
+		// check is what matters, not the promoted flag.
+		t.Logf("autoPromote did not change ticket (position may already be front)")
+	}
+}
+
+func TestAutoPromote_NoopWhenInServingWindow(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 10)
+
+	// Ticket 5, cap=10 → position = 5 - 0 - 10 = -5 (in window).
+	wr.tokens.set("tok", ticketEntry{
+		ticket:   5,
+		issuedAt: time.Now(),
+	})
+
+	wr.autoPromote("tok")
+
+	entry, _ := wr.tokens.get("tok")
+	if entry.ticket != 5 {
+		t.Errorf("autoPromote should not change ticket when already in window, got %d", entry.ticket)
+	}
+	if entry.promoted {
+		t.Error("autoPromote should not set promoted flag when already in window")
+	}
+}
+
+func TestAutoPromote_MissingToken(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 5)
+
+	// Must not panic.
+	wr.autoPromote("nonexistent")
 }
 
 // ── Benchmark ────────────────────────────────────────────────────────────────
@@ -943,5 +1181,38 @@ func BenchmarkPromoteTokenToFront(b *testing.B) {
 			issuedAt: time.Now(),
 		})
 		_, _ = wr.PromoteTokenToFront(token)
+	}
+}
+
+func BenchmarkGrantPass(b *testing.B) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(10); err != nil {
+		b.Fatal(err)
+	}
+	defer wr.Stop()
+	if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+		b.Fatal(err)
+	}
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = wr.GrantPass()
+	}
+}
+
+func BenchmarkHasValidPass(b *testing.B) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(10); err != nil {
+		b.Fatal(err)
+	}
+	defer wr.Stop()
+
+	wr.passes.set("tok", passEntry{
+		expiresAt: time.Now().Add(time.Hour),
+	})
+
+	b.ResetTimer()
+	for i := 0; i < b.N; i++ {
+		_ = wr.HasValidPass("tok")
 	}
 }

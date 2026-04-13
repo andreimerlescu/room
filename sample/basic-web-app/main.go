@@ -66,8 +66,16 @@ func main() {
 	// SetSkipURL tells the waiting room page where the "Pay to skip"
 	// button should navigate. This must be registered BEFORE
 	// RegisterRoutes so it bypasses the waiting room.
+	//
+	// SetPassDuration configures how long a paid skip-the-line pass
+	// remains valid. During this window, if the client is evicted,
+	// times out, or refreshes, they are auto-promoted to the front
+	// without paying again. Set to 0 to disable (single-use promotions).
 	wr.SetRateFunc(func(depth int64) float64 { return 2.50 })
 	wr.SetSkipURL("/queue/purchase")
+	if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+		log.Fatalf("room.SetPassDuration: %v", err)
+	}
 
 	// ── 4. Lifecycle callbacks ────────────────────────────────────────────
 	//
@@ -138,7 +146,7 @@ func main() {
 
 	wr.On(room.EventPromote, func(s room.Snapshot) {
 		roomLog("PROMOTE", fmt.Sprintf(
-			"client paid to skip  occupancy=%d/%d  queue=%d",
+			"client promoted to front  occupancy=%d/%d  queue=%d",
 			s.Occupancy, s.Capacity, s.QueueDepth,
 		))
 	})
@@ -190,8 +198,8 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[ INFO  ] listening on http://localhost:8080  cap=%d  rate=$%.2f/pos  skip_url=%s",
-			wr.Cap(), 2.50, wr.SkipURL())
+		log.Printf("[ INFO  ] listening on http://localhost:8080  cap=%d  rate=$%.2f/pos  pass=%s",
+			wr.Cap(), 2.50, wr.PassDuration())
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("ListenAndServe: %v", err)
 		}
@@ -234,6 +242,23 @@ func handlePurchasePage(c *gin.Context) {
 
 	token := cookie.Value
 
+	// Check if the client already has a valid pass — no need to pay again.
+	if passCookie, err := c.Request.Cookie("room_pass"); err == nil {
+		if wr.HasValidPass(passCookie.Value) {
+			c.Data(http.StatusOK, "text/html; charset=utf-8", page(
+				"VIP pass active",
+				fmt.Sprintf(
+					`<h1>You already have a VIP pass</h1>
+					<p>Your pass is still active (expires in %s). You'll be
+					automatically moved to the front — no additional payment needed.</p>
+					<p>Head back and you'll be admitted shortly.</p>
+					<a href="/">← Back to site</a>`,
+					wr.PassDuration().Round(time.Minute)),
+			))
+			return
+		}
+	}
+
 	// Get the current cost to jump to position 1.
 	cost, err := wr.QuoteCost(token, 1)
 	if err != nil {
@@ -268,7 +293,7 @@ func handlePurchasePage(c *gin.Context) {
 
 	// Render the payment confirmation page.
 	// In production this would be a Stripe Checkout redirect instead.
-	c.Data(http.StatusOK, "text/html; charset=utf-8", purchasePage(cost))
+	c.Data(http.StatusOK, "text/html; charset=utf-8", purchasePage(cost, wr.PassDuration()))
 }
 
 // handlePurchaseConfirm processes the "payment" and promotes the token.
@@ -277,7 +302,8 @@ func handlePurchasePage(c *gin.Context) {
 //  1. Verify the Stripe signature (stripe.ConstructEvent)
 //  2. Extract client_reference_id from the checkout session
 //  3. Call wr.PromoteTokenToFront(token)
-//  4. Return 200 to Stripe
+//  4. Set the room_pass cookie from result.PassToken
+//  5. Return 200 to Stripe
 //
 // For this demo we skip signature verification and just promote.
 func handlePurchaseConfirm(c *gin.Context) {
@@ -289,7 +315,7 @@ func handlePurchaseConfirm(c *gin.Context) {
 
 	token := cookie.Value
 
-	cost, err := wr.PromoteTokenToFront(token)
+	result, err := wr.PromoteTokenToFront(token)
 	if err != nil {
 		log.Printf("[ SKIP  ] promotion failed for token=%.8s...: %v", token, err)
 		c.Data(http.StatusOK, "text/html; charset=utf-8", page("Payment failed", fmt.Sprintf(
@@ -301,17 +327,46 @@ func handlePurchaseConfirm(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[ SKIP  ] token=%.8s... promoted to front  cost=$%.2f", token, cost)
+	log.Printf("[ SKIP  ] token=%.8s... promoted to front  cost=$%.2f  pass=%v",
+		token, result.Cost, result.PassToken != "")
+
+	// Set the VIP pass cookie if a pass was issued. This cookie
+	// persists across queue entries so the client is auto-promoted
+	// for the configured pass duration without paying again.
+	if result.PassToken != "" {
+		secure := wr.SkipURL() != "" // crude; in production use wr.SetSecureCookie logic
+		http.SetCookie(c.Writer, &http.Cookie{
+			Name:     "room_pass",
+			Value:    result.PassToken,
+			Path:     wr.CookiePath(),
+			Domain:   wr.CookieDomain(),
+			MaxAge:   int(wr.PassDuration().Seconds()),
+			HttpOnly: true,
+			Secure:   secure,
+			SameSite: http.SameSiteLaxMode,
+		})
+	}
 
 	// Redirect back to the site. The next poll (or page load) will
 	// see ready=true and admit the client immediately.
+	passMsg := ""
+	if result.PassToken != "" {
+		passMsg = fmt.Sprintf(
+			`<p>Your VIP pass is valid for <strong>%s</strong> — if you
+			re-enter the queue during that time, you'll be automatically
+			moved to the front at no extra cost.</p>`,
+			wr.PassDuration().Round(time.Minute))
+	}
+
 	c.Data(http.StatusOK, "text/html; charset=utf-8", page("Payment confirmed",
 		fmt.Sprintf(
 			`<h1>Payment confirmed — $%.2f</h1>
 			<p>You've been moved to the front of the line!</p>
+			%s
 			<p>Redirecting you now...</p>
-			<script>setTimeout(function(){ window.location.href = "/"; }, 1500);</script>
-			<noscript><a href="/">← Click here to continue</a></noscript>`, cost,
+			<script>setTimeout(function(){ window.location.href = "/"; }, 2000);</script>
+			<noscript><a href="/">← Click here to continue</a></noscript>`,
+			result.Cost, passMsg,
 		),
 	))
 }
@@ -338,7 +393,8 @@ func homePage(c *gin.Context) {
 		<p>
 		  When you land in the waiting room, you'll see a
 		  <strong>"Skip the line"</strong> option — click it to test the
-		  payment flow at <strong>$2.50/position</strong>.
+		  payment flow at <strong>$2.50/position</strong>. Your VIP pass
+		  lasts <strong>90 minutes</strong>.
 		</p>
 		<nav>
 		  <a href="/about">About</a> ·
@@ -361,7 +417,8 @@ func aboutPage(c *gin.Context) {
 		</p>
 		<p>
 		  High-priority customers can <strong>skip the line</strong> by paying
-		  a per-position fee. The price updates in real time as the queue moves.
+		  a per-position fee. The VIP pass lasts 90 minutes — re-enter the
+		  queue anytime during that window and you'll be auto-promoted for free.
 		</p>
 		<a href="/">← Home</a>`,
 	))
@@ -377,7 +434,7 @@ func pricingPage(c *gin.Context) {
 		  <tbody>
 		    <tr><td>Free</td><td>100</td><td>Standard (FIFO)</td></tr>
 		    <tr><td>Pro</td><td>Unlimited</td><td>Standard (FIFO)</td></tr>
-		    <tr><td>Skip the line</td><td>—</td><td>Pay per position ($2.50/pos)</td></tr>
+		    <tr><td>Skip the line</td><td>—</td><td>$2.50/pos + 90 min VIP pass</td></tr>
 		  </tbody>
 		</table>
 		<a href="/">← Home</a>`,
@@ -469,7 +526,16 @@ func page(title, body string) []byte {
 // purchasePage renders the skip-the-line payment confirmation page.
 // This is the demo equivalent of a Stripe Checkout page. It shows the
 // cost and a "Confirm payment" button that POSTs to /queue/purchase/confirm.
-func purchasePage(cost float64) []byte {
+func purchasePage(cost float64, passDur time.Duration) []byte {
+	passNote := ""
+	if passDur > 0 {
+		passNote = fmt.Sprintf(
+			`<div class="price-detail" style="margin-top: 0.5rem;">
+			Includes a <strong>%s VIP pass</strong> — re-enter the queue
+			anytime during that window and skip for free.</div>`,
+			passDur.Round(time.Minute))
+	}
+
 	return []byte(fmt.Sprintf(`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -541,6 +607,9 @@ func purchasePage(cost float64) []byte {
       color: #64748b;
       margin-top: 0.3rem;
     }
+    .price-detail strong {
+      color: #34d399;
+    }
     .btn-pay {
       background: linear-gradient(135deg, #6c8ef5, #a78bfa);
       color: #fff;
@@ -556,10 +625,7 @@ func purchasePage(cost float64) []byte {
     }
     .btn-pay:hover { opacity: 0.9; }
     .btn-pay:active { opacity: 0.8; transform: scale(0.99); }
-    .btn-pay:disabled {
-      opacity: 0.5;
-      cursor: not-allowed;
-    }
+    .btn-pay:disabled { opacity: 0.5; cursor: not-allowed; }
     .back-link {
       display: block;
       color: #64748b;
@@ -588,6 +654,7 @@ func purchasePage(cost float64) []byte {
       <div class="price-label">Total cost</div>
       <div class="price-amount">$%.2f</div>
       <div class="price-detail">$2.50 per position · one-time payment</div>
+      %s
     </div>
 
     <form method="POST" action="/queue/purchase/confirm" id="pay-form">
@@ -613,5 +680,5 @@ func purchasePage(cost float64) []byte {
     });
   </script>
 </body>
-</html>`, cost, cost))
+</html>`, cost, passNote, cost))
 }

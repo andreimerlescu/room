@@ -88,17 +88,27 @@ func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 		// that the reaper does not evict tokens from polling clients.
 		wr.tokens.touchIssuedAt(cookie.Value)
 
+		// Check if the client has a valid VIP pass.
+		hasPass := false
+		if passCookie, err := c.Request.Cookie(passCookieName); err == nil {
+			hasPass = wr.HasValidPass(passCookie.Value)
+		}
+
 		// Build the response with optional pricing information.
 		resp := statusResponse{
 			Ready:       false,
 			Position:    position,
 			Utilization: wr.sem.UtilizationSmoothed(),
+			HasPass:     hasPass,
 		}
 
-		if fn := wr.rateFuncLoad(); fn != nil {
-			resp.RatePerPos = fn(wr.QueueDepth())
-			if position > 1 {
-				resp.SkipCost = float64(position-1) * resp.RatePerPos
+		// Only show pricing if the client does NOT already have a pass.
+		if !hasPass {
+			if fn := wr.rateFuncLoad(); fn != nil {
+				resp.RatePerPos = fn(wr.QueueDepth())
+				if position > 1 {
+					resp.SkipCost = float64(position-1) * resp.RatePerPos
+				}
 			}
 		}
 

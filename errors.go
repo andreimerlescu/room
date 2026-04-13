@@ -79,3 +79,18 @@ type ErrInvalidTargetPosition struct {
 func (e ErrInvalidTargetPosition) Error() string {
 	return fmt.Sprintf("room: invalid target position %d: must be >= 1", e.Given)
 }
+
+// ErrPassDuration is returned by SetPassDuration when the provided
+// duration falls outside [passMinDuration, passMaxDuration].
+type ErrPassDuration struct {
+	Given time.Duration
+	Min   time.Duration
+	Max   time.Duration
+}
+
+func (e ErrPassDuration) Error() string {
+	return fmt.Sprintf(
+		"room: pass duration %s out of range [%s, %s]",
+		e.Given, e.Min, e.Max,
+	)
+}

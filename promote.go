@@ -48,6 +48,20 @@ func (wr *WaitingRoom) rateFuncLoad() RateFunc {
 	return h.fn
 }
 
+// PromoteResult is returned by PromoteToken and PromoteTokenToFront.
+// It contains the computed cost and, when pass duration is configured,
+// a pass token that should be set as the room_pass cookie on the
+// client's response.
+type PromoteResult struct {
+	// Cost is the price computed at promotion time based on the
+	// current RateFunc and queue position.
+	Cost float64
+
+	// PassToken is the VIP pass token to set as the room_pass cookie.
+	// Empty if SetPassDuration was not called or is 0.
+	PassToken string
+}
+
 // QuoteCost returns the cost for a queued token to jump to targetPosition.
 // targetPosition=1 means next to be admitted. Returns the cost without
 // modifying any state — use this to display pricing on the waiting room page.
@@ -93,9 +107,10 @@ func (wr *WaitingRoom) QuoteCost(token string, targetPosition int64) (float64, e
 // The caller is responsible for payment verification before calling this.
 // PromoteToken does not handle payments — it only reassigns the ticket.
 //
-// Returns the cost that was computed at promotion time. The caller should
-// compare this against the amount actually charged to detect race conditions
-// where the queue moved between QuoteCost and PromoteToken.
+// When SetPassDuration has been configured with a non-zero duration, the
+// returned PromoteResult includes a PassToken. The caller must set this
+// as the room_pass cookie on the HTTP response so that the client is
+// auto-promoted on subsequent queue entries without paying again.
 //
 // Promotion is serialized: only one PromoteToken call executes at a time
 // to prevent two promotions from claiming the same ticket slot. Each
@@ -107,15 +122,15 @@ func (wr *WaitingRoom) QuoteCost(token string, targetPosition int64) (float64, e
 // Returns ErrAlreadyAdmitted if already within the serving window.
 // Returns ErrInvalidTargetPosition if targetPosition < 1.
 //
-// Related: QuoteCost, PromoteTokenToFront, SetRateFunc
-func (wr *WaitingRoom) PromoteToken(token string, targetPosition int64) (float64, error) {
+// Related: QuoteCost, PromoteTokenToFront, SetRateFunc, SetPassDuration
+func (wr *WaitingRoom) PromoteToken(token string, targetPosition int64) (PromoteResult, error) {
 	if targetPosition < 1 {
-		return 0, ErrInvalidTargetPosition{Given: targetPosition}
+		return PromoteResult{}, ErrInvalidTargetPosition{Given: targetPosition}
 	}
 
 	fn := wr.rateFuncLoad()
 	if fn == nil {
-		return 0, ErrPromotionDisabled{}
+		return PromoteResult{}, ErrPromotionDisabled{}
 	}
 
 	// Serialize promotions so two concurrent callers cannot claim
@@ -125,16 +140,16 @@ func (wr *WaitingRoom) PromoteToken(token string, targetPosition int64) (float64
 
 	entry, ok := wr.tokens.get(token)
 	if !ok {
-		return 0, ErrTokenNotFound{}
+		return PromoteResult{}, ErrTokenNotFound{}
 	}
 
 	currentPosition := wr.positionOf(entry.ticket)
 	if currentPosition <= 0 {
-		return 0, ErrAlreadyAdmitted{}
+		return PromoteResult{}, ErrAlreadyAdmitted{}
 	}
 
 	if targetPosition >= currentPosition {
-		return 0, nil // no-op, already ahead
+		return PromoteResult{}, nil // no-op, already ahead
 	}
 
 	distance := currentPosition - targetPosition
@@ -169,13 +184,17 @@ func (wr *WaitingRoom) PromoteToken(token string, targetPosition int64) (float64
 
 	wr.emit(EventPromote, wr.snapshot(EventPromote))
 
-	return cost, nil
+	// Grant a time-limited VIP pass if pass duration is configured.
+	result := PromoteResult{Cost: cost}
+	result.PassToken = wr.GrantPass()
+
+	return result, nil
 }
 
 // PromoteTokenToFront is a convenience wrapper that promotes a token
 // to position 1 (next to be admitted).
 //
 // Related: PromoteToken, QuoteCost
-func (wr *WaitingRoom) PromoteTokenToFront(token string) (float64, error) {
+func (wr *WaitingRoom) PromoteTokenToFront(token string) (PromoteResult, error) {
 	return wr.PromoteToken(token, 1)
 }
