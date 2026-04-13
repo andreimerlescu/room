@@ -77,18 +77,15 @@ func (wr *WaitingRoom) startReaper(ctx context.Context) {
 }
 
 // reap performs a single eviction pass over the token store.
-// Expired tokens are collected under a read lock, then deleted under
-// a write lock. The double-check on TTL inside the write lock guards
-// against a token being legitimately deleted between the two passes.
-//
-// For each evicted token, nowServing is advanced and waiters are
-// broadcast so the FIFO queue does not stall behind a ghost ticket.
+// Expired tokens are collected under the token store read lock, then
+// deleted under the token store write lock. nowServing is advanced and
+// cond is broadcast under wr.mu so waiters cannot miss the wakeup.
 //
 // Related: WaitingRoom.startReaper, WaitingRoom.SetReaperInterval
 func (wr *WaitingRoom) reap() {
 	now := time.Now()
 
-	// Collect expired tokens under read lock.
+	// Collect expired tokens under token store read lock.
 	wr.tokens.mu.RLock()
 	expired := make([]string, 0, min(len(wr.tokens.entries), reaperBatchSize))
 	for token, entry := range wr.tokens.entries {
@@ -105,17 +102,29 @@ func (wr *WaitingRoom) reap() {
 		return
 	}
 
-	// Evict under write lock with double-check.
+	// Evict under token store write lock with double-check.
+	// Count evictions separately so we only take wr.mu once.
+	var evicted int64
 	wr.tokens.mu.Lock()
 	for _, token := range expired {
 		if entry, ok := wr.tokens.entries[token]; ok {
 			if now.Sub(entry.issuedAt) > cookieTTL {
 				delete(wr.tokens.entries, token)
-				wr.nowServing.Add(1)
-				wr.cond.Broadcast()
+				evicted++
 			}
 		}
 	}
 	wr.tokens.mu.Unlock()
-}
 
+	if evicted == 0 {
+		return
+	}
+
+	// Advance nowServing and wake waiters under wr.mu so no wakeup
+	// can be missed between a waiter checking the condition and
+	// calling cond.Wait().
+	wr.mu.Lock()
+	wr.nowServing.Add(evicted)
+	wr.cond.Broadcast()
+	wr.mu.Unlock()
+}

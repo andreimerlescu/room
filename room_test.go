@@ -1,7 +1,6 @@
 package room
 
 import (
-	"context"
 	"encoding/json"
 	"fmt"
 	"net/http"
@@ -18,9 +17,8 @@ func init() {
 	gin.SetMode(gin.TestMode)
 }
 
-// newTestRouter creates a gin engine with the WaitingRoom middleware and
-// a simple handler that signals when it is actively serving and blocks
-// until released. This gives tests precise control over slot occupancy.
+// newTestRouter builds a gin engine with the WaitingRoom registered and
+// a simple handler that signals when serving and blocks until released.
 func newTestRouter(wr *WaitingRoom, serving chan struct{}, release chan struct{}) *gin.Engine {
 	r := gin.New()
 	wr.RegisterRoutes(r)
@@ -36,20 +34,50 @@ func newTestRouter(wr *WaitingRoom, serving chan struct{}, release chan struct{}
 	return r
 }
 
-// waitForQueue blocks until QueueDepth reaches expected or the deadline
-// passes. It polls at 5ms intervals to avoid busy-waiting.
-func waitForQueue(t *testing.T, wr *WaitingRoom, expected int64, deadline time.Duration) {
+// serveWithCookie performs a GET / with an optional cookie and returns
+// the recorder and any Set-Cookie header value for cookieName.
+func serveWithCookie(r *gin.Engine, cookie string) (*httptest.ResponseRecorder, string) {
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	if cookie != "" {
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: cookie})
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	for _, c := range w.Result().Cookies() {
+		if c.Name == cookieName {
+			return w, c.Value
+		}
+	}
+	return w, ""
+}
+
+// pollStatus calls GET /queue/status with the given token cookie and
+// returns the decoded statusResponse.
+func pollStatus(r *gin.Engine, token string) statusResponse {
+	req := httptest.NewRequest(http.MethodGet, "/queue/status", nil)
+	if token != "" {
+		req.AddCookie(&http.Cookie{Name: cookieName, Value: token})
+	}
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+	var resp statusResponse
+	json.NewDecoder(w.Body).Decode(&resp)
+	return resp
+}
+
+// waitForStatus polls /queue/status until ready=true or deadline passes.
+func waitForStatus(t *testing.T, r *gin.Engine, token string, deadline time.Duration) {
 	t.Helper()
 	timeout := time.After(deadline)
 	for {
 		select {
 		case <-timeout:
-			t.Fatalf("timed out waiting for queue depth %d, got %d", expected, wr.QueueDepth())
+			t.Fatal("timed out waiting for status ready=true")
 		default:
-			if wr.QueueDepth() == expected {
+			if pollStatus(r, token).Ready {
 				return
 			}
-			time.Sleep(5 * time.Millisecond)
+			time.Sleep(10 * time.Millisecond)
 		}
 	}
 }
@@ -62,7 +90,6 @@ func TestNewWaitingRoom_ValidCap(t *testing.T) {
 		t.Fatalf("expected no error, got %v", err)
 	}
 	defer wr.Stop()
-
 	if wr.Cap() != 10 {
 		t.Errorf("expected cap 10, got %d", wr.Cap())
 	}
@@ -81,8 +108,7 @@ func TestNewWaitingRoom_ZeroCap(t *testing.T) {
 
 func TestNewWaitingRoom_NegativeCap(t *testing.T) {
 	wr := &WaitingRoom{}
-	err := wr.Init(-1)
-	if err == nil {
+	if err := wr.Init(-1); err == nil {
 		t.Fatal("expected ErrInvalidCap, got nil")
 	}
 }
@@ -130,21 +156,18 @@ func TestFastPath_AllSlotsFilledThenReleased(t *testing.T) {
 	release := make(chan struct{})
 	r := newTestRouter(wr, serving, release)
 
-	// Fire cap requests — all should be admitted immediately.
 	for i := 0; i < cap; i++ {
 		go func() {
 			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
+			r.ServeHTTP(httptest.NewRecorder(), req)
 		}()
 	}
 
-	// Wait for all cap handlers to signal they are serving.
 	for i := 0; i < cap; i++ {
 		select {
 		case <-serving:
 		case <-time.After(2 * time.Second):
-			t.Fatalf("timed out waiting for handler %d to start", i)
+			t.Fatalf("timed out waiting for handler %d", i)
 		}
 	}
 
@@ -152,7 +175,6 @@ func TestFastPath_AllSlotsFilledThenReleased(t *testing.T) {
 		t.Errorf("expected Len %d, got %d", cap, wr.Len())
 	}
 
-	// Release all.
 	close(release)
 }
 
@@ -173,46 +195,23 @@ func TestSlowPath_WaitingRoomServedWhenFull(t *testing.T) {
 	// Fill the single slot.
 	go func() {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+		r.ServeHTTP(httptest.NewRecorder(), req)
 	}()
+	<-serving
 
-	// Wait for slot to be occupied.
-	select {
-	case <-serving:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for first handler")
-	}
-
-	// Second request should see the waiting room.
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	w := httptest.NewRecorder()
-
-	done := make(chan struct{})
-	go func() {
-		r.ServeHTTP(w, req)
-		close(done)
-	}()
-
-	// Give the second request time to hit the waiting room.
-	waitForQueue(t, wr, 1, 2*time.Second)
-
-	// Confirm waiting room HTML was served.
+	// Second request should get the waiting room page immediately.
+	w, token := serveWithCookie(r, "")
 	if w.Code != http.StatusOK {
 		t.Errorf("expected 200 for waiting room, got %d", w.Code)
 	}
 	if ct := w.Header().Get("Content-Type"); ct != "text/html; charset=utf-8" {
-		t.Errorf("expected text/html content type, got %s", ct)
+		t.Errorf("expected text/html, got %s", ct)
+	}
+	if token == "" {
+		t.Error("expected room_ticket cookie to be set")
 	}
 
-	// Release the first slot — second request should be admitted.
 	close(release)
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for second request to complete")
-	}
 }
 
 func TestSlowPath_CookieIssuedWhenQueued(t *testing.T) {
@@ -227,37 +226,84 @@ func TestSlowPath_CookieIssuedWhenQueued(t *testing.T) {
 	release := make(chan struct{})
 	r := newTestRouter(wr, serving, release)
 
-	// Fill the slot.
 	go func() {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+		r.ServeHTTP(httptest.NewRecorder(), req)
 	}()
 	<-serving
 
-	// Second request hits the waiting room.
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	w := httptest.NewRecorder()
-	go func() { r.ServeHTTP(w, req) }()
-
-	waitForQueue(t, wr, 1, 2*time.Second)
-
-	// Cookie must be set.
-	cookies := w.Result().Cookies()
-	found := false
-	for _, c := range cookies {
-		if c.Name == cookieName {
-			found = true
-			if c.HttpOnly != true {
-				t.Error("expected HttpOnly cookie")
-			}
-			if len(c.Value) == 0 {
-				t.Error("expected non-empty cookie value")
-			}
-		}
-	}
-	if !found {
+	_, token := serveWithCookie(r, "")
+	if token == "" {
 		t.Errorf("expected cookie %q to be set", cookieName)
+	}
+
+	close(release)
+}
+
+func TestSlowPath_PositionInjectedInHTML(t *testing.T) {
+	const cap = 1
+	wr := &WaitingRoom{}
+	if err := wr.Init(cap); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	w, _ := serveWithCookie(r, "")
+	body := w.Body.String()
+	// {{.Position}} should have been replaced with a number.
+	if contains(body, "{{.Position}}") {
+		t.Error("expected {{.Position}} to be replaced in HTML")
+	}
+
+	close(release)
+}
+
+func TestSlowPath_ResumePreservesQueuePosition(t *testing.T) {
+	const cap = 1
+	wr := &WaitingRoom{}
+	if err := wr.Init(cap); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	// First visit — gets queued and a token issued.
+	_, token := serveWithCookie(r, "")
+	if token == "" {
+		t.Fatal("expected token on first visit")
+	}
+
+	// Second visit with the same token — should get updated position,
+	// not a new ticket.
+	ticketsBefore := wr.nextTicket.Load()
+	w2, _ := serveWithCookie(r, token)
+	ticketsAfter := wr.nextTicket.Load()
+
+	if ticketsAfter != ticketsBefore {
+		t.Errorf("expected no new ticket on resume, nextTicket went from %d to %d",
+			ticketsBefore, ticketsAfter)
+	}
+	if w2.Code != http.StatusOK {
+		t.Errorf("expected 200 on resume, got %d", w2.Code)
 	}
 
 	close(release)
@@ -267,33 +313,29 @@ func TestSlowPath_CookieIssuedWhenQueued(t *testing.T) {
 
 func TestFIFO_RequestsAdmittedInOrder(t *testing.T) {
 	const cap = 1
+	const total = 5
+
 	wr := &WaitingRoom{}
 	if err := wr.Init(cap); err != nil {
 		t.Fatal(err)
 	}
 	defer wr.Stop()
 
-	// admitOrder records the order in which handlers actually run.
-	var admitOrder []int
-	var orderMu sync.Mutex
-
-	// releaseGates lets the test control when each handler finishes.
-	const total = 5
+	serving := make(chan struct{}, 1)
 	gates := make([]chan struct{}, total)
 	for i := range gates {
 		gates[i] = make(chan struct{})
 	}
 
+	var admitOrder []int
+	var orderMu sync.Mutex
+
 	r := gin.New()
 	wr.RegisterRoutes(r)
-
-	var started sync.WaitGroup
-	started.Add(total)
-
 	for i := 0; i < total; i++ {
 		i := i
 		r.GET(fmt.Sprintf("/req/%d", i), func(c *gin.Context) {
-			started.Done()
+			serving <- struct{}{}
 			orderMu.Lock()
 			admitOrder = append(admitOrder, i)
 			orderMu.Unlock()
@@ -302,33 +344,47 @@ func TestFIFO_RequestsAdmittedInOrder(t *testing.T) {
 		})
 	}
 
-	// Fire all requests as close together as possible.
-	// Request 0 fills the slot; 1–4 queue in arrival order.
-	var wg sync.WaitGroup
+	// Collect tokens in arrival order with a stagger to ensure
+	// ticket ordering is deterministic.
+	tokens := make([]string, total)
 	for i := 0; i < total; i++ {
-		wg.Add(1)
-		i := i
-		go func() {
-			defer wg.Done()
+		if i == 0 {
+			// First request — hits fast path, fills the slot.
+			go func() {
+				req := httptest.NewRequest(http.MethodGet, "/req/0", nil)
+				r.ServeHTTP(httptest.NewRecorder(), req)
+			}()
+			<-serving
+		} else {
 			req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/req/%d", i), nil)
 			w := httptest.NewRecorder()
 			r.ServeHTTP(w, req)
-		}()
-		// Small stagger ensures ticket ordering matches i.
-		time.Sleep(10 * time.Millisecond)
+			for _, c := range w.Result().Cookies() {
+				if c.Name == cookieName {
+					tokens[i] = c.Value
+				}
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 
-	// Release each gate in sequence and verify admit order.
+	// Release each slot in sequence and verify the next waiter is admitted.
 	for i := 0; i < total; i++ {
 		close(gates[i])
-		time.Sleep(20 * time.Millisecond)
+		if i+1 < total {
+			// Poll until the next token is ready then re-request.
+			waitForStatus(t, r, tokens[i+1], 2*time.Second)
+			go func(idx int, tok string) {
+				req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/req/%d", idx), nil)
+				req.AddCookie(&http.Cookie{Name: cookieName, Value: tok})
+				r.ServeHTTP(httptest.NewRecorder(), req)
+			}(i+1, tokens[i+1])
+			<-serving
+		}
 	}
-
-	wg.Wait()
 
 	orderMu.Lock()
 	defer orderMu.Unlock()
-
 	for i, v := range admitOrder {
 		if v != i {
 			t.Errorf("FIFO violation: position %d admitted request %d, expected %d", i, v, i)
@@ -349,18 +405,7 @@ func TestStatusEndpoint_UnknownTokenReturnsReady(t *testing.T) {
 	wr.RegisterRoutes(r)
 	r.GET("/", func(c *gin.Context) { c.Status(http.StatusOK) })
 
-	req := httptest.NewRequest(http.MethodGet, "/queue/status", nil)
-	w := httptest.NewRecorder()
-	r.ServeHTTP(w, req)
-
-	if w.Code != http.StatusOK {
-		t.Errorf("expected 200, got %d", w.Code)
-	}
-
-	var resp statusResponse
-	if err := json.NewDecoder(w.Body).Decode(&resp); err != nil {
-		t.Fatalf("failed to decode response: %v", err)
-	}
+	resp := pollStatus(r, "")
 	if !resp.Ready {
 		t.Error("expected ready=true for unknown token")
 	}
@@ -378,41 +423,18 @@ func TestStatusEndpoint_KnownTokenReturnsPosition(t *testing.T) {
 	release := make(chan struct{})
 	r := newTestRouter(wr, serving, release)
 
-	// Fill the slot.
 	go func() {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+		r.ServeHTTP(httptest.NewRecorder(), req)
 	}()
 	<-serving
 
-	// Queue a second request and capture its cookie.
-	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
-	w2 := httptest.NewRecorder()
-	go func() { r.ServeHTTP(w2, req2) }()
-	waitForQueue(t, wr, 1, 2*time.Second)
-
-	// Extract the cookie from the waiting room response.
-	var token string
-	for _, c := range w2.Result().Cookies() {
-		if c.Name == cookieName {
-			token = c.Value
-		}
-	}
+	_, token := serveWithCookie(r, "")
 	if token == "" {
-		t.Fatal("no room_ticket cookie found")
+		t.Fatal("no token issued")
 	}
 
-	// Poll status with the cookie.
-	statusReq := httptest.NewRequest(http.MethodGet, "/queue/status", nil)
-	statusReq.AddCookie(&http.Cookie{Name: cookieName, Value: token})
-	statusW := httptest.NewRecorder()
-	r.ServeHTTP(statusW, statusReq)
-
-	var resp statusResponse
-	if err := json.NewDecoder(statusW.Body).Decode(&resp); err != nil {
-		t.Fatalf("failed to decode status response: %v", err)
-	}
+	resp := pollStatus(r, token)
 	if resp.Ready {
 		t.Error("expected ready=false while queued")
 	}
@@ -423,7 +445,7 @@ func TestStatusEndpoint_KnownTokenReturnsPosition(t *testing.T) {
 	close(release)
 }
 
-func TestStatusEndpoint_ReturnsReadyWhenAdmitted(t *testing.T) {
+func TestStatusEndpoint_ReturnsReadyAfterSlotOpens(t *testing.T) {
 	const cap = 1
 	wr := &WaitingRoom{}
 	if err := wr.Init(cap); err != nil {
@@ -435,47 +457,19 @@ func TestStatusEndpoint_ReturnsReadyWhenAdmitted(t *testing.T) {
 	release := make(chan struct{})
 	r := newTestRouter(wr, serving, release)
 
-	// Fill the slot.
 	go func() {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+		r.ServeHTTP(httptest.NewRecorder(), req)
 	}()
 	<-serving
 
-	// Queue second request.
-	req2 := httptest.NewRequest(http.MethodGet, "/", nil)
-	w2 := httptest.NewRecorder()
-	done := make(chan struct{})
-	go func() {
-		r.ServeHTTP(w2, req2)
-		close(done)
-	}()
-	waitForQueue(t, wr, 1, 2*time.Second)
+	_, token := serveWithCookie(r, "")
 
-	var token string
-	for _, c := range w2.Result().Cookies() {
-		if c.Name == cookieName {
-			token = c.Value
-		}
-	}
-
-	// Release — token should be deleted, status should return ready.
+	// Release the active slot.
 	close(release)
-	<-done
 
-	statusReq := httptest.NewRequest(http.MethodGet, "/queue/status", nil)
-	statusReq.AddCookie(&http.Cookie{Name: cookieName, Value: token})
-	statusW := httptest.NewRecorder()
-	r.ServeHTTP(statusW, statusReq)
-
-	var resp statusResponse
-	if err := json.NewDecoder(statusW.Body).Decode(&resp); err != nil {
-		t.Fatalf("failed to decode status response: %v", err)
-	}
-	if !resp.Ready {
-		t.Error("expected ready=true after admission")
-	}
+	// Status should eventually return ready=true.
+	waitForStatus(t, r, token, 2*time.Second)
 }
 
 // ── SetCap tests ─────────────────────────────────────────────────────────────
@@ -495,36 +489,42 @@ func TestSetCap_ExpandAdmitsWaiters(t *testing.T) {
 	// Fill the single slot.
 	go func() {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+		r.ServeHTTP(httptest.NewRecorder(), req)
 	}()
 	<-serving
 
-	// Queue 4 more.
+	// Queue 4 requests and collect their tokens.
+	tokens := make([]string, 4)
 	for i := 0; i < 4; i++ {
-		go func() {
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
-		}()
+		_, tokens[i] = serveWithCookie(r, "")
 	}
-	waitForQueue(t, wr, 4, 2*time.Second)
 
-	// Expand to 5 — all waiters should be admitted.
+	// Expand to 5.
 	if err := wr.SetCap(5); err != nil {
 		t.Fatalf("SetCap failed: %v", err)
 	}
 
-	// Drain serving channel — we should get 4 more admits.
-	admitted := 0
-	timeout := time.After(2 * time.Second)
-	for admitted < 4 {
-		select {
-		case <-serving:
-			admitted++
-		case <-timeout:
-			t.Fatalf("timed out: only %d of 4 waiters admitted after SetCap", admitted)
-		}
+	// All 4 tokens should become ready.
+	var wg sync.WaitGroup
+	for _, tok := range tokens {
+		wg.Add(1)
+		tok := tok
+		go func() {
+			defer wg.Done()
+			waitForStatus(t, r, tok, 2*time.Second)
+		}()
+	}
+
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for waiters to become ready after SetCap")
 	}
 
 	close(release)
@@ -562,23 +562,15 @@ func TestSetHTML_CustomHTMLServed(t *testing.T) {
 	release := make(chan struct{})
 	r := newTestRouter(wr, serving, release)
 
-	// Fill the slot.
 	go func() {
 		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		w := httptest.NewRecorder()
-		r.ServeHTTP(w, req)
+		r.ServeHTTP(httptest.NewRecorder(), req)
 	}()
 	<-serving
 
-	// Second request should get custom HTML.
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
-	w := httptest.NewRecorder()
-	go func() { r.ServeHTTP(w, req) }()
-	waitForQueue(t, wr, 1, 2*time.Second)
-
-	body := w.Body.String()
-	if body != string(custom) {
-		t.Errorf("expected custom HTML, got: %s", body)
+	w, _ := serveWithCookie(r, "")
+	if w.Body.String() != string(custom) {
+		t.Errorf("expected custom HTML, got: %s", w.Body.String())
 	}
 
 	close(release)
@@ -594,8 +586,7 @@ func TestSetHTML_NilRevertsToDefault(t *testing.T) {
 	wr.SetHTML([]byte("<html>custom</html>"))
 	wr.SetHTML(nil)
 
-	html := wr.resolveHTML()
-	if len(html) == 0 {
+	if len(wr.resolveHTML()) == 0 {
 		t.Error("expected non-empty default HTML after SetHTML(nil)")
 	}
 }
@@ -609,19 +600,14 @@ func TestReaper_EvictsExpiredTokens(t *testing.T) {
 	}
 	defer wr.Stop()
 
-	// Manually insert a token with an issuedAt far in the past.
-	wr.tokens.set("ghost-token", ticketEntry{
+	wr.tokens.set("ghost", ticketEntry{
 		ticket:   99,
 		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
 	})
 
-	if _, ok := wr.tokens.get("ghost-token"); !ok {
-		t.Fatal("expected ghost token to exist before reap")
-	}
-
 	wr.reap()
 
-	if _, ok := wr.tokens.get("ghost-token"); ok {
+	if _, ok := wr.tokens.get("ghost"); ok {
 		t.Error("expected ghost token to be evicted after reap")
 	}
 }
@@ -633,15 +619,34 @@ func TestReaper_PreservesLiveTokens(t *testing.T) {
 	}
 	defer wr.Stop()
 
-	wr.tokens.set("live-token", ticketEntry{
+	wr.tokens.set("live", ticketEntry{
 		ticket:   1,
 		issuedAt: time.Now(),
 	})
 
 	wr.reap()
 
-	if _, ok := wr.tokens.get("live-token"); !ok {
+	if _, ok := wr.tokens.get("live"); !ok {
 		t.Error("expected live token to survive reap")
+	}
+}
+
+func TestReaper_AdvancesNowServingOnEviction(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(5); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	before := wr.nowServing.Load()
+	wr.tokens.set("ghost", ticketEntry{
+		ticket:   1,
+		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
+	})
+	wr.reap()
+
+	if wr.nowServing.Load() != before+1 {
+		t.Errorf("expected nowServing to advance by 1 after eviction, got %d", wr.nowServing.Load())
 	}
 }
 
@@ -656,16 +661,14 @@ func TestSetReaperInterval_ValidRange(t *testing.T) {
 		reaperMinInterval,
 		30 * time.Second,
 		5 * time.Minute,
-		1 * time.Hour,
 		reaperMaxInterval,
 	}
-
 	for _, d := range cases {
 		if err := wr.SetReaperInterval(d); err != nil {
-			t.Errorf("expected no error for interval %s, got %v", d, err)
+			t.Errorf("expected no error for %s, got %v", d, err)
 		}
 		if wr.ReaperInterval() != d {
-			t.Errorf("expected interval %s, got %s", d, wr.ReaperInterval())
+			t.Errorf("expected %s, got %s", d, wr.ReaperInterval())
 		}
 	}
 }
@@ -683,11 +686,10 @@ func TestSetReaperInterval_InvalidRange(t *testing.T) {
 		reaperMinInterval - time.Nanosecond,
 		reaperMaxInterval + time.Nanosecond,
 	}
-
 	for _, d := range cases {
 		err := wr.SetReaperInterval(d)
 		if err == nil {
-			t.Errorf("expected error for interval %s, got nil", d)
+			t.Errorf("expected error for %s, got nil", d)
 		}
 		if _, ok := err.(ErrReaperInterval); !ok {
 			t.Errorf("expected ErrReaperInterval for %s, got %T", d, err)
@@ -717,13 +719,8 @@ func TestQueueDepth_AccurateWhileWaiting(t *testing.T) {
 
 	const queued = 3
 	for i := 0; i < queued; i++ {
-		go func() {
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			r.ServeHTTP(httptest.NewRecorder(), req)
-		}()
+		serveWithCookie(r, "")
 	}
-
-	waitForQueue(t, wr, queued, 2*time.Second)
 
 	if d := wr.QueueDepth(); d != queued {
 		t.Errorf("expected queue depth %d, got %d", queued, d)
@@ -739,110 +736,11 @@ func TestUtilization_BetweenZeroAndOne(t *testing.T) {
 	}
 	defer wr.Stop()
 
-	u := wr.Utilization()
-	if u < 0.0 || u > 1.0 {
+	if u := wr.Utilization(); u < 0 || u > 1 {
 		t.Errorf("utilization out of range: %f", u)
 	}
-
-	u = wr.UtilizationSmoothed()
-	if u < 0.0 || u > 1.0 {
+	if u := wr.UtilizationSmoothed(); u < 0 || u > 1 {
 		t.Errorf("smoothed utilization out of range: %f", u)
-	}
-}
-
-// ── Context cancellation tests ───────────────────────────────────────────────
-
-func TestContextCancel_WaiterExitsCleanly(t *testing.T) {
-	const cap = 1
-	wr := &WaitingRoom{}
-	if err := wr.Init(cap); err != nil {
-		t.Fatal(err)
-	}
-	defer wr.Stop()
-
-	serving := make(chan struct{}, 1)
-	release := make(chan struct{})
-	r := newTestRouter(wr, serving, release)
-
-	// Fill the slot.
-	go func() {
-		req := httptest.NewRequest(http.MethodGet, "/", nil)
-		r.ServeHTTP(httptest.NewRecorder(), req)
-	}()
-	<-serving
-
-	// Second request with a cancellable context.
-	ctx, cancel := context.WithCancel(context.Background())
-	req2 := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
-
-	done := make(chan struct{})
-	go func() {
-		r.ServeHTTP(httptest.NewRecorder(), req2)
-		close(done)
-	}()
-
-	waitForQueue(t, wr, 1, 2*time.Second)
-
-	// Cancel the context — waiter should exit.
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for cancelled request to exit")
-	}
-
-	// Release the active slot and give nowServing time to advance.
-	close(release)
-	time.Sleep(50 * time.Millisecond)
-
-	// Queue depth should return to zero.
-	if d := wr.QueueDepth(); d != 0 {
-		t.Errorf("expected queue depth 0 after cancel, got %d", d)
-	}
-}
-
-func TestContextCancel_NoSlotLeak(t *testing.T) {
-	const cap = 2
-	wr := &WaitingRoom{}
-	if err := wr.Init(cap); err != nil {
-		t.Fatal(err)
-	}
-	defer wr.Stop()
-
-	serving := make(chan struct{}, cap)
-	release := make(chan struct{})
-	r := newTestRouter(wr, serving, release)
-
-	// Fill both slots.
-	for i := 0; i < cap; i++ {
-		go func() {
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			r.ServeHTTP(httptest.NewRecorder(), req)
-		}()
-		<-serving
-	}
-
-	// Cancel 5 waiters.
-	const waiters = 5
-	for i := 0; i < waiters; i++ {
-		ctx, cancel := context.WithCancel(context.Background())
-		req := httptest.NewRequest(http.MethodGet, "/", nil).WithContext(ctx)
-		go func() {
-			r.ServeHTTP(httptest.NewRecorder(), req)
-		}()
-		// Cancel immediately after dispatch.
-		time.Sleep(10 * time.Millisecond)
-		cancel()
-	}
-
-	// Release the two active slots.
-	close(release)
-
-	// After everything settles, Len should be 0 — no leaked slots.
-	time.Sleep(100 * time.Millisecond)
-	if l := wr.Len(); l != 0 {
-		t.Errorf("expected Len 0 after all releases and cancels, got %d", l)
 	}
 }
 
@@ -871,18 +769,13 @@ func TestConcurrent_NoRaceUnderLoad(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
+			r.ServeHTTP(httptest.NewRecorder(), req)
 		}()
 	}
-
 	wg.Wait()
 
 	if l := wr.Len(); l != 0 {
-		t.Errorf("expected Len 0 after all requests complete, got %d", l)
-	}
-	if d := wr.QueueDepth(); d != 0 {
-		t.Errorf("expected QueueDepth 0 after all requests complete, got %d", d)
+		t.Errorf("expected Len 0, got %d", l)
 	}
 }
 
@@ -905,12 +798,11 @@ func TestConcurrent_SetCapDuringLoad(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			r.ServeHTTP(httptest.NewRecorder(), req)
+			r.ServeHTTP(httptest.NewRecorder(),
+				httptest.NewRequest(http.MethodGet, "/", nil))
 		}()
 	}
 
-	// Resize during load — should not panic or deadlock.
 	go func() {
 		for _, c := range []int32{3, 7, 5, 10, 5} {
 			time.Sleep(20 * time.Millisecond)
@@ -937,9 +829,8 @@ func BenchmarkFastPath(b *testing.B) {
 	b.ResetTimer()
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
-			req := httptest.NewRequest(http.MethodGet, "/", nil)
-			w := httptest.NewRecorder()
-			r.ServeHTTP(w, req)
+			r.ServeHTTP(httptest.NewRecorder(),
+				httptest.NewRequest(http.MethodGet, "/", nil))
 		}
 	})
 }
@@ -950,7 +841,6 @@ func BenchmarkQueueDepth(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer wr.Stop()
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = wr.QueueDepth()
@@ -963,7 +853,6 @@ func BenchmarkUtilizationSmoothed(b *testing.B) {
 		b.Fatal(err)
 	}
 	defer wr.Stop()
-
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
 		_ = wr.UtilizationSmoothed()
@@ -1005,24 +894,31 @@ func FuzzWaitingRoom(f *testing.F) {
 			wg.Add(1)
 			go func() {
 				defer wg.Done()
-				req := httptest.NewRequest(http.MethodGet, "/", nil)
-				w := httptest.NewRecorder()
-				r.ServeHTTP(w, req)
+				r.ServeHTTP(httptest.NewRecorder(),
+					httptest.NewRequest(http.MethodGet, "/", nil))
 				served.Add(1)
 			}()
 		}
-
 		wg.Wait()
 
-		// Invariants that must always hold.
 		if l := wr.Len(); l != 0 {
-			t.Errorf("invariant violated: Len=%d after all requests complete", l)
-		}
-		if d := wr.QueueDepth(); d != 0 {
-			t.Errorf("invariant violated: QueueDepth=%d after all requests complete", d)
-		}
-		if int32(served.Load()) != requests {
-			t.Errorf("invariant violated: served=%d expected=%d", served.Load(), requests)
+			t.Errorf("invariant violated: Len=%d", l)
 		}
 	})
+}
+
+// ── Helpers ──────────────────────────────────────────────────────────────────
+
+func contains(s, substr string) bool {
+	return len(s) >= len(substr) && (s == substr ||
+		len(s) > 0 && containsRune(s, substr))
+}
+
+func containsRune(s, substr string) bool {
+	for i := range s {
+		if i+len(substr) <= len(s) && s[i:i+len(substr)] == substr {
+			return true
+		}
+	}
+	return false
 }

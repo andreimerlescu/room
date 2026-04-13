@@ -3,6 +3,7 @@ package room
 import (
 	"context"
 	"fmt"
+	"net/http"
 	"sync"
 
 	"github.com/andreimerlescu/sema"
@@ -35,8 +36,7 @@ func NewWaitingRoom(cap int32) gin.HandlerFunc {
 
 // NewWaitingRoomFromStruct returns a gin.HandlerFunc from a fully configured
 // WaitingRoom. Use this when you need to retain a handle to the WaitingRoom
-// after initialisation — for example to call SetCap, SetHTML, or
-// SetReaperInterval at runtime, or to register the /queue/status route.
+// after initialisation.
 //
 // Usage:
 //
@@ -58,23 +58,21 @@ func NewWaitingRoomFromStruct(wr *WaitingRoom) gin.HandlerFunc {
 //
 // Returns ErrInvalidCap if cap < 1.
 //
-// NewWaitingRoom and NewWaitingRoomFromStruct call Init for you.
-//
 // Related: WaitingRoom.Stop, WaitingRoom.SetCap
 func (wr *WaitingRoom) Init(cap int32) error {
 	if cap < 1 {
 		return ErrInvalidCap{Given: cap}
 	}
 
-	wr.cap           = cap
-	wr.sem           = sema.Must(int(cap))
-	wr.cond          = sync.NewCond(&wr.mu)
-	wr.tokens        = newTokenStore()
+	wr.cap = cap
+	wr.sem = sema.Must(int(cap))
+	wr.cond = sync.NewCond(&wr.mu)
+	wr.tokens = newTokenStore()
 	wr.reaperRestart = make(chan struct{}, 1)
-
 	wr.nowServing.Store(0)
 	wr.nextTicket.Store(0)
 	wr.reaperInterval.Store(int64(reaperInterval))
+	wr.initialised = true
 
 	ctx, cancel := context.WithCancel(context.Background())
 	wr.stopReaper = cancel
@@ -87,19 +85,20 @@ func (wr *WaitingRoom) Init(cap int32) error {
 // application is shutting down to ensure a clean exit with no leaked
 // goroutines.
 //
-// Stop is safe to call multiple times. After Stop, the WaitingRoom
-// continues to serve requests but expired tokens will no longer be
-// evicted automatically.
-//
-// Usage:
-//
-//	wr := &room.WaitingRoom{}
-//	wr.Init(500)
-//	defer wr.Stop()
-//
 // Related: WaitingRoom.Init, WaitingRoom.startReaper
 func (wr *WaitingRoom) Stop() {
 	if wr.stopReaper != nil {
 		wr.stopReaper()
 	}
+}
+
+// checkInitialised aborts the request with 500 and returns false if the
+// WaitingRoom has not been initialised. Prevents nil pointer dereferences
+// on zero-value WaitingRoom structs.
+func (wr *WaitingRoom) checkInitialised(c *gin.Context) bool {
+	if !wr.initialised {
+		c.AbortWithStatus(http.StatusInternalServerError)
+		return false
+	}
+	return true
 }

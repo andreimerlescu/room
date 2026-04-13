@@ -18,18 +18,47 @@ var defaultWaitingRoomBytes []byte
 // Every request is issued a ticket on arrival. If the ticket falls within
 // the current serving window (nowServing + cap), the request acquires a
 // semaphore slot and proceeds immediately. Otherwise the waiting room HTML
-// is served and the goroutine blocks until its ticket is called or the
-// request context is cancelled.
+// is served, the request is aborted, and the client polls /queue/status
+// until admitted — at which point the browser reloads and the request
+// re-enters on the fast path.
 //
-// On exit the slot is released, nowServing advances, and all waiting
-// goroutines are broadcast so the next ticket can proceed.
+// This design avoids writing two responses to the same ResponseWriter by
+// never calling c.Next() on a request that was served the waiting room page.
 //
 // Related: WaitingRoom.RegisterRoutes, WaitingRoom.StatusHandler
 func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
+		// Resume an existing queued position if the client presents a
+		// valid room_ticket cookie. This preserves queue position across
+		// page reloads and polling retries.
+		if cookie, err := c.Request.Cookie(cookieName); err == nil {
+			if entry, ok := wr.tokens.get(cookie.Value); ok {
+				if wr.ticketReady(entry.ticket) {
+					// Client's ticket is now within the serving window.
+					// Acquire a slot and let them through.
+					wr.tokens.delete(cookie.Value)
+					if err := wr.sem.AcquireWith(c.Request.Context()); err != nil {
+						c.AbortWithStatus(http.StatusServiceUnavailable)
+						return
+					}
+					defer wr.release("")
+					c.Next()
+					return
+				}
+				// Still waiting — serve updated position and abort.
+				position := entry.ticket - (wr.nowServing.Load() + int64(wr.cap))
+				if position < 1 {
+					position = 1
+				}
+				html := wr.resolveHTML()
+				c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectPosition(html, position))
+				c.Abort()
+				return
+			}
+		}
+
 		ticket := wr.nextTicket.Add(1)
 		ctx := c.Request.Context()
-		token := ""
 
 		// Fast path — ticket is within the serving window.
 		if wr.ticketReady(ticket) {
@@ -37,56 +66,40 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 				c.AbortWithStatus(http.StatusServiceUnavailable)
 				return
 			}
-			defer wr.release(token)
+			defer wr.release("")
 			c.Next()
 			return
 		}
 
-		// Slow path — serve waiting room and issue a session token.
-		if err := wr.serveWaitingRoom(c, ticket); err != nil {
+		// Slow path — issue a token, serve the waiting room page, and
+		// abort. The client will poll /queue/status and reload when ready.
+		token, err := generateToken()
+		if err != nil {
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
 
-		if cookie, err := c.Request.Cookie(cookieName); err == nil {
-			token = cookie.Value
-		}
+		wr.tokens.set(token, ticketEntry{
+			ticket:   ticket,
+			issuedAt: time.Now(),
+		})
 
-		// cancelWatcher broadcasts to cond when ctx is cancelled so the
-		// blocked cond.Wait() below wakes up and can check ctx.Done().
-		waitDone := make(chan struct{})
-		go func() {
-			select {
-			case <-ctx.Done():
-				wr.cond.Broadcast()
-			case <-waitDone:
-			}
-		}()
+		http.SetCookie(c.Writer, &http.Cookie{
+			Name:     cookieName,
+			Value:    token,
+			Path:     "/",
+			MaxAge:   int(cookieTTL.Seconds()),
+			HttpOnly: true,
+			SameSite: http.SameSiteLaxMode,
+		})
 
-		// Block until our ticket is called or context is cancelled.
-		wr.mu.Lock()
-		for !wr.ticketReady(ticket) {
-			select {
-			case <-ctx.Done():
-				wr.mu.Unlock()
-				close(waitDone)
-				wr.tokens.delete(token)
-				c.AbortWithStatus(http.StatusServiceUnavailable)
-				return
-			default:
-			}
-			wr.cond.Wait()
+		position := ticket - (wr.nowServing.Load() + int64(wr.cap))
+		if position < 1 {
+			position = 1
 		}
-		wr.mu.Unlock()
-		close(waitDone)
-
-		if err := wr.sem.AcquireWith(ctx); err != nil {
-			wr.tokens.delete(token)
-			c.AbortWithStatus(http.StatusServiceUnavailable)
-			return
-		}
-		defer wr.release(token)
-		c.Next()
+		html := wr.resolveHTML()
+		c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectPosition(html, position))
+		c.Abort()
 	}
 }
 
@@ -96,8 +109,8 @@ func (wr *WaitingRoom) ticketReady(ticket int64) bool {
 	return ticket <= wr.nowServing.Load()+int64(wr.cap)
 }
 
-// release returns a semaphore slot, removes the session token, advances
-// nowServing, and broadcasts to all waiting goroutines.
+// release returns a semaphore slot, optionally removes a session token,
+// advances nowServing, and broadcasts to all waiting goroutines.
 func (wr *WaitingRoom) release(token string) {
 	if token != "" {
 		wr.tokens.delete(token)
@@ -105,34 +118,6 @@ func (wr *WaitingRoom) release(token string) {
 	wr.sem.Release()
 	wr.nowServing.Add(1)
 	wr.cond.Broadcast()
-}
-
-// serveWaitingRoom generates a session token, sets the cookie, and writes
-// the waiting room HTML to the response.
-func (wr *WaitingRoom) serveWaitingRoom(c *gin.Context, ticket int64) error {
-	token, err := generateToken()
-	if err != nil {
-		return err
-	}
-
-	wr.tokens.set(token, ticketEntry{
-		ticket:   ticket,
-		issuedAt: time.Now(),
-	})
-
-	http.SetCookie(c.Writer, &http.Cookie{
-		Name:     cookieName,
-		Value:    token,
-		Path:     "/",
-		MaxAge:   int(cookieTTL.Seconds()),
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
-
-	position := ticket - wr.nowServing.Load()
-	html := wr.resolveHTML()
-	c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectPosition(html, position))
-	return nil
 }
 
 // resolveHTML returns the HTML bytes to serve. Custom HTML set via SetHTML
@@ -179,11 +164,12 @@ func (wr *WaitingRoom) SetCap(cap int32) error {
 	if cap < 1 {
 		return ErrInvalidCap{Given: cap}
 	}
-	wr.cap = cap
+	wr.mu.Lock()
+	defer wr.mu.Unlock()
 	if err := wr.sem.SetCap(int(cap)); err != nil {
 		return err
 	}
-	// Wake all waiters so they recheck ticketReady against the new cap.
+	wr.cap = cap
 	wr.cond.Broadcast()
 	return nil
 }
@@ -192,6 +178,8 @@ func (wr *WaitingRoom) SetCap(cap int32) error {
 //
 // Related: WaitingRoom.SetCap
 func (wr *WaitingRoom) Cap() int32 {
+	wr.mu.Lock()
+	defer wr.mu.Unlock()
 	return wr.cap
 }
 
@@ -206,6 +194,8 @@ func (wr *WaitingRoom) Len() int {
 //
 // Related: WaitingRoom.Len
 func (wr *WaitingRoom) QueueDepth() int64 {
+	wr.mu.Lock()
+	defer wr.mu.Unlock()
 	depth := wr.nextTicket.Load() - (wr.nowServing.Load() + int64(wr.cap))
 	if depth < 0 {
 		return 0
