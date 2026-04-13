@@ -88,7 +88,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 					position = 1
 				}
 				html := wr.resolveHTML()
-				c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectPosition(html, position))
+				c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectTemplateVars(html, position))
 				c.Abort()
 				return
 			}
@@ -160,7 +160,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			position = 1
 		}
 		html := wr.resolveHTML()
-		c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectPosition(html, position))
+		c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectTemplateVars(html, position))
 		c.Abort()
 	}
 }
@@ -212,21 +212,38 @@ func (wr *WaitingRoom) resolveHTML() []byte {
 	return defaultWaitingRoomBytes
 }
 
-// injectPosition substitutes {{.Position}} in the HTML bytes with the
-// caller's numeric queue position.
-func (wr *WaitingRoom) injectPosition(html []byte, position int64) []byte {
-	return bytes.ReplaceAll(
+// injectTemplateVars substitutes all template placeholders in the HTML
+// bytes with their current values:
+//
+//   - {{.Position}} → the caller's numeric queue position
+//   - {{.SkipURL}}  → the payment URL (empty string if not configured)
+//
+// This is the single point of template injection. All placeholders are
+// handled here so they cannot diverge across call sites.
+func (wr *WaitingRoom) injectTemplateVars(html []byte, position int64) []byte {
+	result := bytes.ReplaceAll(
 		html,
 		[]byte("{{.Position}}"),
 		[]byte(fmt.Sprintf("%d", position)),
 	)
+	result = bytes.ReplaceAll(
+		result,
+		[]byte("{{.SkipURL}}"),
+		[]byte(wr.SkipURL()),
+	)
+	return result
 }
 
 // SetHTML replaces the waiting room page served to queued requests.
 // Pass nil to revert to the embedded default waiting_room.html.
 // Safe to call at any time including while requests are in flight.
 //
-// Related: WaitingRoom.resolveHTML
+// Custom HTML may use the following template placeholders:
+//
+//   - {{.Position}} — replaced with the client's queue position (integer)
+//   - {{.SkipURL}}  — replaced with the skip-the-line payment URL (string)
+//
+// Related: WaitingRoom.resolveHTML, WaitingRoom.SetSkipURL
 func (wr *WaitingRoom) SetHTML(html []byte) {
 	wr.mu.Lock()
 	defer wr.mu.Unlock()

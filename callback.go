@@ -43,6 +43,11 @@ const (
 	// EventTimeout fires when a queued request's context is cancelled or
 	// its deadline expires before a slot becomes available.
 	EventTimeout
+
+	// EventPromote fires when a queued token is promoted to a higher
+	// position via PromoteToken. Use this to track revenue events or
+	// log queue jumps for fairness monitoring.
+	EventPromote
 )
 
 // String returns the canonical name of the Event, suitable for logging.
@@ -62,6 +67,8 @@ func (e Event) String() string {
 		return "Evict"
 	case EventTimeout:
 		return "Timeout"
+	case EventPromote:
+		return "Promote"
 	default:
 		return "Unknown"
 	}

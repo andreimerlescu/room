@@ -104,6 +104,87 @@
             margin-top: 0.3rem;
         }
 
+        /* ── Skip-the-line offer ─────────────────────────────── */
+
+        .skip-offer {
+            display: none;
+            background: linear-gradient(
+                    135deg,
+                    rgba(108, 142, 245, 0.08),
+                    rgba(167, 139, 250, 0.08)
+            );
+            border: 1px solid rgba(108, 142, 245, 0.25);
+            border-radius: var(--radius);
+            padding: 1rem 1.25rem;
+            margin-bottom: 2rem;
+            transition: opacity 0.3s ease;
+        }
+
+        .skip-offer.visible {
+            display: block;
+        }
+
+        .skip-header {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            gap: 6px;
+            margin-bottom: 0.5rem;
+        }
+
+        .skip-header-icon {
+            font-size: 14px;
+        }
+
+        .skip-header-text {
+            font-size: 0.85rem;
+            font-weight: 600;
+            color: var(--accent2);
+        }
+
+        .skip-pricing {
+            font-size: 0.78rem;
+            color: #94a3b8;
+            margin-bottom: 0.75rem;
+            line-height: 1.4;
+        }
+
+        .skip-cost-value {
+            color: var(--text);
+            font-weight: 500;
+        }
+
+        .skip-rate-detail {
+            display: block;
+            font-size: 0.7rem;
+            color: var(--muted);
+            margin-top: 0.15rem;
+        }
+
+        .skip-btn {
+            background: linear-gradient(135deg, var(--accent), var(--accent2));
+            color: #fff;
+            border: none;
+            border-radius: 8px;
+            padding: 0.5rem 1.5rem;
+            font-size: 0.8rem;
+            font-weight: 600;
+            cursor: pointer;
+            width: 100%;
+            transition: opacity 0.2s ease;
+        }
+
+        .skip-btn:hover {
+            opacity: 0.9;
+        }
+
+        .skip-btn:active {
+            opacity: 0.8;
+            transform: scale(0.99);
+        }
+
+        /* ── Progress bar ────────────────────────────────────── */
+
         .bar-wrap {
             background: var(--bg);
             border: 1px solid var(--border);
@@ -184,6 +265,26 @@
         <div class="position-suffix">in line</div>
     </div>
 
+    <!-- Skip-the-line offer: hidden by default, shown only when the
+         server returns skip_cost > 0 and a SkipURL was configured.
+         The price updates on every poll so it tracks queue movement
+         in real time. -->
+    <div class="skip-offer" id="skip-offer" role="complementary"
+         aria-label="Skip the line offer">
+        <div class="skip-header">
+            <span class="skip-header-icon" aria-hidden="true">⚡</span>
+            <span class="skip-header-text">Skip the line</span>
+        </div>
+        <p class="skip-pricing">
+            Jump to the front for
+            <span class="skip-cost-value" id="skip-cost">$0.00</span>
+            <span class="skip-rate-detail" id="skip-rate">$0.00/position · updates with queue</span>
+        </p>
+        <button class="skip-btn" id="skip-btn" type="button">
+            Pay to skip →
+        </button>
+    </div>
+
     <div class="bar-wrap">
         <div class="bar-fill" id="bar" style="width: 100%"></div>
     </div>
@@ -208,9 +309,29 @@
     const JITTER_MS          = 500;
     const STATUS_ENDPOINT    = "/queue/status";
 
+    // SkipURL is injected by the server via template substitution.
+    // If the application did not call SetSkipURL, this is empty and
+    // the skip-the-line offer is never shown.
+    const SKIP_URL           = "{{.SkipURL}}";
+
     let currentPosition = parseInt(
         document.getElementById("position").textContent, 10
     ) || 0;
+
+    // ── DOM references ──────────────────────────────────────────
+
+    const positionEl   = document.getElementById("position");
+    const skipOfferEl  = document.getElementById("skip-offer");
+    const skipCostEl   = document.getElementById("skip-cost");
+    const skipRateEl   = document.getElementById("skip-rate");
+    const skipBtnEl    = document.getElementById("skip-btn");
+    const statusTextEl = document.getElementById("status-text");
+    const lastChecked  = document.getElementById("last-checked");
+    const admittedEl   = document.getElementById("admitted");
+    const statusEl     = document.querySelector(".status");
+    const iconEl       = document.querySelector(".icon");
+
+    // ── Helpers ─────────────────────────────────────────────────
 
     function ordinal(n) {
         const s = ["th","st","nd","rd"];
@@ -218,25 +339,61 @@
         return n + (s[(v - 20) % 10] || s[v] || s[0]);
     }
 
+    function formatCurrency(amount) {
+        return "$" + amount.toFixed(2);
+    }
+
     function updateLastChecked() {
-        document.getElementById("last-checked").textContent = "just now";
+        lastChecked.textContent = "just now";
     }
 
     function setStatus(text) {
-        document.getElementById("status-text").textContent = text;
+        statusTextEl.textContent = text;
     }
 
-    function admit() {
-        document.getElementById("admitted").style.display = "block";
-        document.querySelector(".status").style.display   = "none";
-        document.querySelector(".icon").textContent       = "✅";
-        setStatus("");
-        setTimeout(() => window.location.reload(), 800);
+    // ── Skip-the-line ───────────────────────────────────────────
+
+    function updateSkipOffer(data) {
+        // Show the offer only when:
+        //  1. The server sent a positive skip_cost (RateFunc is set)
+        //  2. The application configured a SkipURL
+        //  3. The client is at position > 1 (position 1 = next in,
+        //     nothing to skip)
+        if (SKIP_URL && data.skip_cost > 0 && data.position > 1) {
+            skipCostEl.textContent = formatCurrency(data.skip_cost);
+            skipRateEl.textContent =
+                formatCurrency(data.rate_per_pos) +
+                "/position \u00B7 updates with queue";
+            skipOfferEl.classList.add("visible");
+        } else {
+            skipOfferEl.classList.remove("visible");
+        }
     }
+
+    // Navigate to the payment page when the button is clicked.
+    // The SkipURL handler on the server can read the room_ticket
+    // cookie to identify which token to promote after payment.
+    skipBtnEl.addEventListener("click", function () {
+        if (!SKIP_URL) return;
+        window.location.href = SKIP_URL;
+    });
+
+    // ── Admission ───────────────────────────────────────────────
+
+    function admit() {
+        admittedEl.style.display = "block";
+        statusEl.style.display   = "none";
+        iconEl.textContent       = "✅";
+        skipOfferEl.classList.remove("visible");
+        setStatus("");
+        setTimeout(function () { window.location.reload(); }, 800);
+    }
+
+    // ── Polling ─────────────────────────────────────────────────
 
     async function poll() {
         try {
-            const res  = await fetch(STATUS_ENDPOINT, { cache: "no-store" });
+            const res = await fetch(STATUS_ENDPOINT, { cache: "no-store" });
             if (!res.ok) { scheduleNext(); return; }
 
             const data = await res.json();
@@ -247,16 +404,20 @@
                 return;
             }
 
+            // Update queue position.
             if (typeof data.position === "number") {
                 currentPosition = data.position;
-                document.getElementById("position").textContent =
+                positionEl.textContent =
                     currentPosition <= 0 ? "1" : String(currentPosition);
             }
+
+            // Update skip-the-line pricing (no-ops if not configured).
+            updateSkipOffer(data);
 
             setStatus(
                 currentPosition <= 1
                     ? "Almost there — next in line..."
-                    : `${ordinal(currentPosition)} in line`
+                    : ordinal(currentPosition) + " in line"
             );
 
             updateLastChecked();

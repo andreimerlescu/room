@@ -47,6 +47,10 @@ type WaitingRoom struct {
 	maxQueueDepth  atomic.Int64
 	cookiePath     atomic.Value // string
 	cookieDomain   atomic.Value // string
+	rateFunc       atomic.Value // *rateFuncHolder
+	promoteMu      sync.Mutex   // serializes ticket reassignment in PromoteToken
+	promoteInsert  atomic.Int64 // lowest ticket assigned via promotion; math.MaxInt64 = unused
+	skipURL        atomic.Value // string
 }
 
 // ticketEntry holds the state for a single queued client.
@@ -54,6 +58,7 @@ type ticketEntry struct {
 	ticket   int64
 	issuedAt time.Time
 	lastPoll time.Time
+	promoted bool
 }
 
 // tokenStore maps random token strings to ticketEntry values.
@@ -156,4 +161,6 @@ type statusResponse struct {
 	Ready       bool    `json:"ready"`
 	Position    int64   `json:"position,omitempty"`
 	Utilization float64 `json:"utilization,omitempty"`
+	SkipCost    float64 `json:"skip_cost,omitempty"`
+	RatePerPos  float64 `json:"rate_per_pos,omitempty"`
 }

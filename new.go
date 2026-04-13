@@ -3,6 +3,7 @@ package room
 import (
 	"context"
 	"fmt"
+	"math"
 	"net/http"
 
 	"github.com/andreimerlescu/sema"
@@ -92,6 +93,9 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.maxQueueDepth.Store(defaultMaxQueueDepth)
 	wr.cookiePath.Store("/")
 	wr.cookieDomain.Store("")
+	wr.rateFunc.Store((*rateFuncHolder)(nil))
+	wr.promoteInsert.Store(math.MaxInt64)
+	wr.skipURL.Store("")
 	wr.initialised.Store(true)
 	wr.callbacks = newCallbackRegistry()
 
@@ -177,6 +181,30 @@ func (wr *WaitingRoom) SetCookieDomain(domain string) {
 // CookieDomain returns the current cookie Domain setting.
 func (wr *WaitingRoom) CookieDomain() string {
 	return wr.cookieDomain.Load().(string)
+}
+
+// SetSkipURL sets the URL that the waiting room "Pay to skip" button
+// navigates to. This is typically a payment page (Stripe Checkout,
+// crypto invoice, etc.) that your application hosts.
+//
+// The handler at this URL can read the room_ticket cookie to identify
+// which queued client is paying. After payment verification, call
+// PromoteTokenToFront to move them to the front of the queue.
+//
+// If empty (the default), the skip-the-line offer is never shown on
+// the waiting room page, even if a RateFunc is configured. Both
+// SetRateFunc and SetSkipURL must be set for the offer to appear.
+//
+// Safe to call at any time.
+//
+// Related: SetRateFunc, PromoteToken, PromoteTokenToFront
+func (wr *WaitingRoom) SetSkipURL(url string) {
+	wr.skipURL.Store(url)
+}
+
+// SkipURL returns the current skip-the-line payment URL.
+func (wr *WaitingRoom) SkipURL() string {
+	return wr.skipURL.Load().(string)
 }
 
 // checkInitialised aborts the request with 500 and returns false if the
