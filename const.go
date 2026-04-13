@@ -26,4 +26,10 @@ const (
 
 	// reaperBatchSize is the maximum tokens evicted per reap pass.
 	reaperBatchSize = 1000
+
+	// secureCookieDefault is the default value for the Secure cookie flag.
+	// Set to false so that plain-HTTP local development works out of the box.
+	// Production deployments behind TLS or a TLS-terminating proxy should
+	// call SetSecureCookie(true) or rely on SetSecureCookieFromRequest.
+	secureCookieDefault = false
 )

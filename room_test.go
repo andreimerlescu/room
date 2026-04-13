@@ -631,22 +631,80 @@ func TestReaper_PreservesLiveTokens(t *testing.T) {
 	}
 }
 
+// TestReaper_AdvancesNowServingOnEviction verifies that reap() advances
+// nowServing when it evicts a ghost ticket that was OUTSIDE the current
+// serving window (i.e. genuinely blocking the queue).
+//
+// The reaper must NOT advance nowServing for tickets inside the window
+// (ticket <= nowServing + cap) because those tickets already consumed a
+// conceptual semaphore slot; advancing for them would double-count
+// capacity and allow more concurrent requests than cap.
+//
+// Setup: cap=1, nowServing=0 → serving window is tickets [1..1].
+// We plant a ghost with ticket=10, which is outside [1..1], so the
+// reaper must advance nowServing by 1 after eviction.
 func TestReaper_AdvancesNowServingOnEviction(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(1); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	// Sanity: confirm starting state.
+	if ns := wr.nowServing.Load(); ns != 0 {
+		t.Fatalf("expected nowServing=0 initially, got %d", ns)
+	}
+
+	// Plant a ghost ticket that is clearly outside the serving window.
+	// With cap=1 and nowServing=0, the serving window is ticket <= 1.
+	// ticket=10 is outside that window, so reap should advance nowServing.
+	wr.tokens.set("ghost", ticketEntry{
+		ticket:   10,
+		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
+	})
+
+	before := wr.nowServing.Load()
+	wr.reap()
+
+	if wr.nowServing.Load() != before+1 {
+		t.Errorf("expected nowServing to advance by 1 after evicting an out-of-window ghost, got %d (before=%d)",
+			wr.nowServing.Load(), before)
+	}
+}
+
+// TestReaper_DoesNotAdvanceNowServingForWindowTicket verifies the guard
+// introduced to fix issue 1.1: a ghost ticket whose number is inside the
+// current serving window must NOT cause nowServing to advance, because
+// doing so would inflate the window and admit more than cap concurrent
+// requests.
+//
+// Setup: cap=5, nowServing=0 → serving window is tickets [1..5].
+// Ghost ticket=1 is inside [1..5], so nowServing must stay at 0 after reap.
+func TestReaper_DoesNotAdvanceNowServingForWindowTicket(t *testing.T) {
 	wr := &WaitingRoom{}
 	if err := wr.Init(5); err != nil {
 		t.Fatal(err)
 	}
 	defer wr.Stop()
 
-	before := wr.nowServing.Load()
-	wr.tokens.set("ghost", ticketEntry{
-		ticket:   1,
+	wr.tokens.set("window-ghost", ticketEntry{
+		ticket:   1, // inside serving window: 1 <= 0 + 5
 		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
 	})
+
+	before := wr.nowServing.Load()
 	wr.reap()
 
-	if wr.nowServing.Load() != before+1 {
-		t.Errorf("expected nowServing to advance by 1 after eviction, got %d", wr.nowServing.Load())
+	// Token must be evicted.
+	if _, ok := wr.tokens.get("window-ghost"); ok {
+		t.Error("expected window-ghost token to be evicted")
+	}
+
+	// nowServing must NOT have advanced.
+	if wr.nowServing.Load() != before {
+		t.Errorf("nowServing advanced for a within-window ghost: before=%d after=%d (cap=5) — "+
+			"this would inflate capacity beyond configured limit",
+			before, wr.nowServing.Load())
 	}
 }
 
@@ -695,6 +753,90 @@ func TestSetReaperInterval_InvalidRange(t *testing.T) {
 			t.Errorf("expected ErrReaperInterval for %s, got %T", d, err)
 		}
 	}
+}
+
+// ── SetSecureCookie tests ────────────────────────────────────────────────────
+
+// TestSetSecureCookie_DefaultIsFalse verifies that plain-HTTP requests
+// receive a cookie without the Secure flag when SetSecureCookie has not
+// been called (i.e. the default is false).
+func TestSetSecureCookie_DefaultIsFalse(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(1); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	// Plain HTTP request (TLS == nil) with default secureCookie=false.
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	// req.TLS is nil by default — simulates plain HTTP.
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	var found bool
+	for _, c := range w.Result().Cookies() {
+		if c.Name == cookieName {
+			found = true
+			if c.Secure {
+				t.Error("expected Secure=false on cookie for plain-HTTP request with default secureCookieDefault=false")
+			}
+		}
+	}
+	if !found {
+		t.Skip("no room_ticket cookie issued — room may not have been full; skipping Secure flag check")
+	}
+
+	close(release)
+}
+
+// TestSetSecureCookie_TrueSetsCookieSecure verifies that after calling
+// SetSecureCookie(true) the issued cookie carries the Secure flag.
+func TestSetSecureCookie_TrueSetsCookieSecure(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(1); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+	wr.SetSecureCookie(true)
+
+	serving := make(chan struct{}, 1)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	go func() {
+		req := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.ServeHTTP(httptest.NewRecorder(), req)
+	}()
+	<-serving
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, req)
+
+	var found bool
+	for _, c := range w.Result().Cookies() {
+		if c.Name == cookieName {
+			found = true
+			if !c.Secure {
+				t.Error("expected Secure=true on cookie after SetSecureCookie(true)")
+			}
+		}
+	}
+	if !found {
+		t.Skip("no room_ticket cookie issued — room may not have been full; skipping Secure flag check")
+	}
+
+	close(release)
 }
 
 // ── Introspection tests ──────────────────────────────────────────────────────

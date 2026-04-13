@@ -25,12 +25,22 @@ var defaultWaitingRoomBytes []byte
 // This design avoids writing two responses to the same ResponseWriter by
 // never calling c.Next() on a request that was served the waiting room page.
 //
+// # Admission model
+//
+// Admission is poll-driven: queued clients reload the page after
+// /queue/status reports ready=true. There are no server-side goroutines
+// blocking on behalf of waiting clients; the Middleware is stateless per
+// request beyond the token store lookup.
+//
 // Related: WaitingRoom.RegisterRoutes, WaitingRoom.StatusHandler
 func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !wr.checkInitialised(c) {
 			return
 		}
+
+		secure := wr.secureCookie.Load() || c.Request.TLS != nil
+
 		// Resume an existing queued position if the client presents a
 		// valid room_ticket cookie. This preserves queue position across
 		// page reloads and polling retries.
@@ -45,10 +55,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 						// nowServing so the queue doesn't stall waiting
 						// for the reaper to evict this ticket.
 						wr.tokens.delete(cookie.Value)
-						wr.mu.Lock()
 						wr.nowServing.Add(1)
-						wr.cond.Broadcast()
-						wr.mu.Unlock()
 						wr.emit(EventTimeout, wr.snapshot(EventTimeout))
 						c.AbortWithStatus(http.StatusServiceUnavailable)
 						return
@@ -62,6 +69,10 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 					c.Next()
 					return
 				}
+				// Touch the token's issuedAt so active pollers do not
+				// get reaped during normal operation.
+				wr.tokens.touchIssuedAt(cookie.Value)
+
 				// Still waiting — serve updated position and abort.
 				position := wr.positionOf(entry.ticket)
 				if position < 1 {
@@ -82,10 +93,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			if err := wr.sem.AcquireWith(ctx); err != nil {
 				// Ticket consumed but not served — advance nowServing
 				// so the gap doesn't stall the queue.
-				wr.mu.Lock()
 				wr.nowServing.Add(1)
-				wr.cond.Broadcast()
-				wr.mu.Unlock()
 				wr.emit(EventTimeout, wr.snapshot(EventTimeout))
 				c.AbortWithStatus(http.StatusServiceUnavailable)
 				return
@@ -103,10 +111,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		// abort. The client will poll /queue/status and reload when ready.
 		token, err := generateToken()
 		if err != nil {
-			wr.mu.Lock()
 			wr.nowServing.Add(1)
-			wr.cond.Broadcast()
-			wr.mu.Unlock()
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
@@ -124,11 +129,11 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			Path:     "/",
 			MaxAge:   int(cookieTTL.Seconds()),
 			HttpOnly: true,
-			Secure:   true, // default to true since proxies like cloudflare can terminate due to c.Request.TLS being nil when served over HTTPS
+			Secure:   secure,
 			SameSite: http.SameSiteLaxMode,
 		})
 
-		position := ticket - (wr.nowServing.Load() + int64(wr.cap.Load()))
+		position := wr.positionOf(ticket)
 		if position < 1 {
 			position = 1
 		}
@@ -145,16 +150,18 @@ func (wr *WaitingRoom) ticketReady(ticket int64) bool {
 }
 
 // release returns a semaphore slot, optionally removes a session token,
-// advances nowServing, and broadcasts to all waiting goroutines.
+// advances nowServing, and fires exit/drain lifecycle events.
+//
+// Note: nowServing is advanced here without holding wr.mu because the
+// WaitingRoom uses a poll-driven admission model. There are no goroutines
+// performing cond.Wait(); the advance only needs to be atomic, which
+// atomic.Int64.Add guarantees.
 func (wr *WaitingRoom) release(token string) {
 	if token != "" {
 		wr.tokens.delete(token)
 	}
 	wr.sem.Release()
-	wr.mu.Lock()
 	wr.nowServing.Add(1)
-	wr.cond.Broadcast()
-	wr.mu.Unlock()
 
 	snap := wr.snapshot(EventExit)
 	wr.emit(EventExit, snap)
@@ -196,9 +203,8 @@ func (wr *WaitingRoom) SetHTML(html []byte) {
 }
 
 // SetCap adjusts the number of concurrently active requests at runtime.
-// Expanding capacity immediately admits waiting tickets by broadcasting
-// to all blocked goroutines so they can recheck ticketReady against the
-// new cap value. Shrinking drains in-flight work first.
+// Expanding capacity immediately opens new semaphore slots. Shrinking
+// drains in-flight work via the underlying sema implementation.
 //
 // Returns ErrInvalidCap if cap < 1.
 //
@@ -207,13 +213,13 @@ func (wr *WaitingRoom) SetCap(cap int32) error {
 	if cap < 1 {
 		return ErrInvalidCap{Given: cap}
 	}
-	wr.mu.Lock()
-	defer wr.mu.Unlock()
+	// Delegate entirely to sema which manages its own internal mutex.
+	// We update wr.cap after the semaphore resize succeeds so that
+	// ticketReady and positionOf remain consistent with actual capacity.
 	if err := wr.sem.SetCap(int(cap)); err != nil {
 		return err
 	}
 	wr.cap.Store(cap)
-	wr.cond.Broadcast()
 	return nil
 }
 
