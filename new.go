@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"net/http"
-	"sync"
 
 	"github.com/andreimerlescu/sema"
 	"github.com/gin-gonic/gin"
@@ -90,6 +89,9 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.nextTicket.Store(0)
 	wr.reaperInterval.Store(int64(reaperInterval))
 	wr.secureCookie.Store(secureCookieDefault)
+	wr.maxQueueDepth.Store(defaultMaxQueueDepth)
+	wr.cookiePath.Store("/")
+	wr.cookieDomain.Store("")
 	wr.initialised.Store(true)
 	wr.callbacks = newCallbackRegistry()
 
@@ -125,16 +127,56 @@ func (wr *WaitingRoom) SetSecureCookie(secure bool) {
 	wr.secureCookie.Store(secure)
 }
 
-// isSecureCookie returns the current Secure cookie setting. When the
-// incoming request arrived over a TLS connection we always upgrade to
-// secure regardless of the stored setting, so that deployments that
-// terminate TLS at the Go layer get correct behaviour without additional
-// configuration.
-func (wr *WaitingRoom) isSecureCookie(r interface{ TLS() bool }) bool {
-	if wr.secureCookie.Load() {
-		return true
+// SetMaxQueueDepth sets the maximum number of requests that may wait in the
+// queue simultaneously. When the queue is at this depth, new arrivals
+// receive a 503 Service Unavailable immediately instead of being queued.
+//
+// A value of 0 disables the limit (unlimited queue depth). This is the
+// default. Negative values return ErrInvalidMaxQueueDepth.
+//
+// Safe to call at any time including while requests are in flight.
+func (wr *WaitingRoom) SetMaxQueueDepth(max int64) error {
+	if max < 0 {
+		return ErrInvalidMaxQueueDepth{Given: max}
 	}
-	return false
+	wr.maxQueueDepth.Store(max)
+	return nil
+}
+
+// MaxQueueDepth returns the current maximum queue depth. Zero means unlimited.
+func (wr *WaitingRoom) MaxQueueDepth() int64 {
+	return wr.maxQueueDepth.Load()
+}
+
+// SetCookiePath sets the Path attribute of the waiting-room session cookie.
+// The default is "/". Use this to scope the cookie to a specific route
+// prefix in multi-app deployments sharing a domain.
+//
+// Safe to call at any time.
+func (wr *WaitingRoom) SetCookiePath(path string) {
+	if path == "" {
+		path = "/"
+	}
+	wr.cookiePath.Store(path)
+}
+
+// CookiePath returns the current cookie Path setting.
+func (wr *WaitingRoom) CookiePath() string {
+	return wr.cookiePath.Load().(string)
+}
+
+// SetCookieDomain sets the Domain attribute of the waiting-room session
+// cookie. The default is empty (browser uses the request host). Set this
+// to restrict or expand cookie scope in multi-subdomain deployments.
+//
+// Safe to call at any time.
+func (wr *WaitingRoom) SetCookieDomain(domain string) {
+	wr.cookieDomain.Store(domain)
+}
+
+// CookieDomain returns the current cookie Domain setting.
+func (wr *WaitingRoom) CookieDomain() string {
+	return wr.cookieDomain.Load().(string)
 }
 
 // checkInitialised aborts the request with 500 and returns false if the
@@ -147,10 +189,3 @@ func (wr *WaitingRoom) checkInitialised(c *gin.Context) bool {
 	}
 	return true
 }
-
-// mu is used only to protect html (SetHTML/resolveHTML). The cond variable
-// previously stored here has been removed: the WaitingRoom uses a
-// poll-driven admission model (clients poll /queue/status), not a
-// push-driven one. There are no goroutines blocking on cond.Wait() in this
-// package; the sync.Cond and all associated Broadcast() calls were dead code.
-var _ sync.Mutex // keep sync import for mu field in WaitingRoom struct

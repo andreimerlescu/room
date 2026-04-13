@@ -48,14 +48,23 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			if entry, ok := wr.tokens.get(cookie.Value); ok {
 				if wr.ticketReady(entry.ticket) {
 					// Client's ticket is now within the serving window.
+
+					// Snapshot occupancy BEFORE acquiring the slot so we
+					// can detect the non-full→full transition edge.
+					wasFull := wr.Len() >= int(wr.Cap())
+
 					// Acquire a slot and let them through.
 					if err := wr.sem.AcquireWith(c.Request.Context()); err != nil {
 						// Acquire failed (client disconnected, context
-						// cancelled). Clean up the dead token and advance
-						// nowServing so the queue doesn't stall waiting
-						// for the reaper to evict this ticket.
+						// cancelled). Clean up the dead token. Only
+						// advance nowServing if the ticket was outside
+						// the serving window — tickets inside the window
+						// already consumed a conceptual slot allocation
+						// and advancing for them inflates capacity.
 						wr.tokens.delete(cookie.Value)
-						wr.nowServing.Add(1)
+						if entry.ticket > wr.nowServing.Load()+int64(wr.cap.Load()) {
+							wr.nowServing.Add(1)
+						}
 						wr.emit(EventTimeout, wr.snapshot(EventTimeout))
 						c.AbortWithStatus(http.StatusServiceUnavailable)
 						return
@@ -63,7 +72,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 					wr.tokens.delete(cookie.Value)
 					defer wr.release("")
 					wr.emit(EventEnter, wr.snapshot(EventEnter))
-					if wr.Len() >= int(wr.Cap()) {
+					if !wasFull && wr.Len() >= int(wr.Cap()) {
 						wr.emit(EventFull, wr.snapshot(EventFull))
 					}
 					c.Next()
@@ -85,22 +94,34 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			}
 		}
 
+		// Check queue depth limit before issuing a new ticket.
+		maxDepth := wr.maxQueueDepth.Load()
+		if maxDepth > 0 && wr.QueueDepth() >= maxDepth {
+			c.AbortWithStatus(http.StatusServiceUnavailable)
+			return
+		}
+
 		ticket := wr.nextTicket.Add(1)
 		ctx := c.Request.Context()
+
+		// Snapshot occupancy BEFORE acquiring the slot for edge detection.
+		wasFull := wr.Len() >= int(wr.Cap())
 
 		// Fast path — ticket is within the serving window.
 		if wr.ticketReady(ticket) {
 			if err := wr.sem.AcquireWith(ctx); err != nil {
-				// Ticket consumed but not served — advance nowServing
-				// so the gap doesn't stall the queue.
-				wr.nowServing.Add(1)
+				// Ticket consumed but not served. Only advance
+				// nowServing if the ticket was outside the window.
+				if ticket > wr.nowServing.Load()+int64(wr.cap.Load()) {
+					wr.nowServing.Add(1)
+				}
 				wr.emit(EventTimeout, wr.snapshot(EventTimeout))
 				c.AbortWithStatus(http.StatusServiceUnavailable)
 				return
 			}
 			defer wr.release("")
 			wr.emit(EventEnter, wr.snapshot(EventEnter))
-			if wr.Len() >= int(wr.Cap()) {
+			if !wasFull && wr.Len() >= int(wr.Cap()) {
 				wr.emit(EventFull, wr.snapshot(EventFull))
 			}
 			c.Next()
@@ -126,7 +147,8 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		http.SetCookie(c.Writer, &http.Cookie{
 			Name:     cookieName,
 			Value:    token,
-			Path:     "/",
+			Path:     wr.CookiePath(),
+			Domain:   wr.CookieDomain(),
 			MaxAge:   int(cookieTTL.Seconds()),
 			HttpOnly: true,
 			Secure:   secure,
@@ -152,11 +174,20 @@ func (wr *WaitingRoom) ticketReady(ticket int64) bool {
 // release returns a semaphore slot, optionally removes a session token,
 // advances nowServing, and fires exit/drain lifecycle events.
 //
+// EventDrain fires on the transition from full to not-full — i.e. when
+// the room was at capacity before this release and now has at least one
+// free slot. This matches the documented semantics and is useful for
+// scale-in decisions.
+//
 // Note: nowServing is advanced here without holding wr.mu because the
 // WaitingRoom uses a poll-driven admission model. There are no goroutines
 // performing cond.Wait(); the advance only needs to be atomic, which
 // atomic.Int64.Add guarantees.
 func (wr *WaitingRoom) release(token string) {
+	// Snapshot BEFORE releasing the slot so we can detect the
+	// full→not-full transition.
+	wasFull := wr.Len() >= int(wr.Cap())
+
 	if token != "" {
 		wr.tokens.delete(token)
 	}
@@ -165,7 +196,7 @@ func (wr *WaitingRoom) release(token string) {
 
 	snap := wr.snapshot(EventExit)
 	wr.emit(EventExit, snap)
-	if snap.Empty() {
+	if wasFull && !snap.Full() {
 		wr.emit(EventDrain, wr.snapshot(EventDrain))
 	}
 }

@@ -44,12 +44,16 @@ type WaitingRoom struct {
 	initialised    atomic.Bool
 	callbacks      *callbackRegistry
 	secureCookie   atomic.Bool
+	maxQueueDepth  atomic.Int64
+	cookiePath     atomic.Value // string
+	cookieDomain   atomic.Value // string
 }
 
 // ticketEntry holds the state for a single queued client.
 type ticketEntry struct {
 	ticket   int64
 	issuedAt time.Time
+	lastPoll time.Time
 }
 
 // tokenStore maps random token strings to ticketEntry values.
@@ -111,6 +115,28 @@ func (ts *tokenStore) touchIssuedAt(token string) {
 	}
 	entry.issuedAt = time.Now()
 	ts.entries[token] = entry
+}
+
+// touchLastPoll updates the lastPoll timestamp and returns the previous
+// value. Callers use this to enforce per-token poll rate limits.
+func (ts *tokenStore) touchLastPoll(token string) (previous time.Time, ok bool) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	entry, exists := ts.entries[token]
+	if !exists {
+		return time.Time{}, false
+	}
+	previous = entry.lastPoll
+	entry.lastPoll = time.Now()
+	ts.entries[token] = entry
+	return previous, true
+}
+
+// len returns the number of entries in the token store.
+func (ts *tokenStore) len() int {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	return len(ts.entries)
 }
 
 // isExpired reports whether the token exists and has exceeded cookieTTL.

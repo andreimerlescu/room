@@ -258,7 +258,7 @@ func TestConcurrent_OnOffEmit_AllEvents(t *testing.T) {
 	wg.Wait()
 }
 
-// ── Integration: EventFull fires when room hits capacity ──────────────────────
+// ── Integration: EventFull fires on transition, not every admission ──────────
 
 func TestIntegration_EventFull_FiredWhenRoomFull(t *testing.T) {
 	t.Parallel()
@@ -281,7 +281,48 @@ func TestIntegration_EventFull_FiredWhenRoomFull(t *testing.T) {
 	close(release)
 }
 
-// ── Integration: EventDrain fires when room drops below capacity ──────────────
+// TestIntegration_EventFull_DoesNotFireRepeatedly verifies that EventFull
+// fires only on the non-full→full transition, not on every admission while
+// the room is already at capacity.
+func TestIntegration_EventFull_DoesNotFireRepeatedly(t *testing.T) {
+	t.Parallel()
+	const cap = 2
+	wr := newTestWR(t, int32(cap))
+
+	var fullCount atomic.Int32
+	wr.On(EventFull, func(s Snapshot) { fullCount.Add(1) })
+
+	serving := make(chan struct{}, cap)
+	release := make(chan struct{})
+	r := newTestRouter(wr, serving, release)
+
+	// Fill both slots.
+	for i := 0; i < cap; i++ {
+		go func() {
+			req := httptest.NewRequest("GET", "/", nil)
+			r.ServeHTTP(httptest.NewRecorder(), req)
+		}()
+	}
+	for i := 0; i < cap; i++ {
+		select {
+		case <-serving:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for handler %d", i)
+		}
+	}
+
+	// EventFull should have fired exactly once (on the transition to full).
+	waitForCount(t, &fullCount, 1, 200*time.Millisecond)
+	time.Sleep(50 * time.Millisecond)
+
+	if got := fullCount.Load(); got != 1 {
+		t.Errorf("expected EventFull to fire exactly 1 time, got %d", got)
+	}
+
+	close(release)
+}
+
+// ── Integration: EventDrain fires on full→not-full transition ─────────────────
 
 func TestIntegration_EventDrain_FiredAfterRelease(t *testing.T) {
 	t.Parallel()
@@ -302,6 +343,59 @@ func TestIntegration_EventDrain_FiredAfterRelease(t *testing.T) {
 	close(release)
 
 	waitForCount(t, &drainCount, 1, 200*time.Millisecond)
+}
+
+// TestIntegration_EventDrain_OnlyFiresOnTransition verifies that EventDrain
+// fires only on the full→not-full transition, not when the room goes from
+// partially occupied to empty.
+func TestIntegration_EventDrain_OnlyFiresOnTransition(t *testing.T) {
+	t.Parallel()
+	const cap = 3
+	wr := newTestWR(t, int32(cap))
+
+	var drainCount atomic.Int32
+	wr.On(EventDrain, func(s Snapshot) { drainCount.Add(1) })
+
+	serving := make(chan struct{}, cap)
+	gates := make([]chan struct{}, cap)
+	for i := range gates {
+		gates[i] = make(chan struct{})
+	}
+
+	r := newTestRouter(wr, serving, nil)
+	// Override the handler to use individual gates.
+	r = newTestRouterWithGates(wr, serving, gates)
+
+	// Fill all 3 slots.
+	for i := 0; i < cap; i++ {
+		go func() {
+			req := httptest.NewRequest("GET", "/", nil)
+			r.ServeHTTP(httptest.NewRecorder(), req)
+		}()
+	}
+	for i := 0; i < cap; i++ {
+		select {
+		case <-serving:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for handler %d", i)
+		}
+	}
+
+	// Release first slot: full→not-full. EventDrain should fire.
+	close(gates[0])
+	waitForCount(t, &drainCount, 1, 200*time.Millisecond)
+
+	// Release second slot: not-full→still-not-full. No additional drain.
+	close(gates[1])
+	time.Sleep(50 * time.Millisecond)
+
+	// Release third slot: occupancy→0. Still no additional drain.
+	close(gates[2])
+	time.Sleep(50 * time.Millisecond)
+
+	if got := drainCount.Load(); got != 1 {
+		t.Errorf("expected EventDrain to fire exactly 1 time, got %d", got)
+	}
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

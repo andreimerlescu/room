@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"net/http"
+	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -22,6 +23,10 @@ import (
 // evicting tokens that belong to actively polling clients. This makes the
 // effective TTL a sliding window from the last poll rather than a fixed
 // window from initial issuance.
+//
+// A per-token rate limit prevents clients from hammering this endpoint
+// faster than statusPollMinInterval. Polls arriving too quickly receive
+// a Retry-After header and a 429 status.
 //
 // Related: WaitingRoom.Middleware, WaitingRoom.RegisterRoutes
 func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
@@ -52,6 +57,21 @@ func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 			// as expired/admitted.
 			c.JSON(http.StatusOK, statusResponse{Ready: true})
 			return
+		}
+
+		// Per-token poll rate limiting. If the client is polling faster
+		// than statusPollMinInterval, return 429 with a Retry-After
+		// header to shed excess load without touching the token store
+		// write lock repeatedly.
+		if prevPoll, found := wr.tokens.touchLastPoll(cookie.Value); found {
+			if !prevPoll.IsZero() && time.Since(prevPoll) < statusPollMinInterval {
+				c.Header("Retry-After", "1")
+				c.JSON(http.StatusTooManyRequests, statusResponse{
+					Ready:    false,
+					Position: wr.positionOf(entry.ticket),
+				})
+				return
+			}
 		}
 
 		position := wr.positionOf(entry.ticket)

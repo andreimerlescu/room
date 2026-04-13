@@ -76,9 +76,8 @@ func (wr *WaitingRoom) startReaper(ctx context.Context) {
 	}()
 }
 
-// reap performs a single eviction pass over the token store.
-// Expired tokens are collected under the token store read lock, then
-// deleted under the token store write lock with a double-check.
+// reap performs a full eviction cycle over the token store. It loops over
+// batch-sized scans until all expired tokens have been removed.
 //
 // Only tokens whose ticket number is OUTSIDE the current serving window
 // (i.e. ticket > nowServing + cap) are counted toward nowServing advances.
@@ -92,6 +91,18 @@ func (wr *WaitingRoom) startReaper(ctx context.Context) {
 //
 // Related: WaitingRoom.startReaper, WaitingRoom.SetReaperInterval
 func (wr *WaitingRoom) reap() {
+	for {
+		evictedCount := wr.reapBatch()
+		if evictedCount < reaperBatchSize {
+			return
+		}
+	}
+}
+
+// reapBatch performs a single bounded eviction pass. It returns the number
+// of tokens that were expired in the scan phase (before double-check).
+// The caller uses this to decide whether another pass is needed.
+func (wr *WaitingRoom) reapBatch() int {
 	now := time.Now()
 
 	// Collect expired tokens under token store read lock.
@@ -112,8 +123,10 @@ func (wr *WaitingRoom) reap() {
 	wr.tokens.mu.RUnlock()
 
 	if len(expired) == 0 {
-		return
+		return 0
 	}
+
+	scanned := len(expired)
 
 	// Evict under token store write lock with double-check.
 	// Count only tickets that were genuinely blocking the queue
@@ -142,14 +155,14 @@ func (wr *WaitingRoom) reap() {
 	}
 	wr.tokens.mu.Unlock()
 
-	if evicted == 0 {
-		return
+	if evicted > 0 {
+		// Advance nowServing atomically. No mutex or broadcast needed:
+		// admission is poll-driven. The next /queue/status poll from a
+		// waiting client will see the updated nowServing and return
+		// ready=true if their ticket is now within the window.
+		wr.nowServing.Add(evicted)
+		wr.emit(EventEvict, wr.snapshot(EventEvict))
 	}
 
-	// Advance nowServing atomically. No mutex or broadcast needed:
-	// admission is poll-driven. The next /queue/status poll from a
-	// waiting client will see the updated nowServing and return ready=true
-	// if their ticket is now within the window.
-	wr.nowServing.Add(evicted)
-	wr.emit(EventEvict, wr.snapshot(EventEvict))
+	return scanned
 }

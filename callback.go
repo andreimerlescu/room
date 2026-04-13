@@ -19,14 +19,17 @@ const (
 	// Paired with EventEnter it gives you a complete picture of slot lifetime.
 	EventExit
 
-	// EventFull fires when the room reaches capacity — i.e. every slot is
-	// occupied and the next arrival will be queued. Use this to trigger
-	// scale-out logic such as provisioning a new host or opening a new room.
+	// EventFull fires once when the room transitions from below capacity to
+	// at capacity — i.e. every slot is now occupied. It does NOT fire on
+	// every admission while full; only on the transition edge. Use this to
+	// trigger scale-out logic such as provisioning a new host.
 	EventFull
 
-	// EventDrain fires when the room transitions from full back to having at
-	// least one free slot. Use this to signal that scale-in is safe or to
-	// re-enable a previously throttled upstream.
+	// EventDrain fires once when the room transitions from full (all slots
+	// occupied) back to having at least one free slot. It does NOT fire
+	// when the room becomes completely empty — only on the full→available
+	// edge. Use this to signal that scale-in is safe or to re-enable a
+	// previously throttled upstream.
 	EventDrain
 
 	// EventQueue fires when an arriving request cannot be admitted immediately
