@@ -2,9 +2,7 @@ package room
 
 import (
 	"bytes"
-	"crypto/rand"
 	_ "embed"
-	"encoding/hex"
 	"fmt"
 	"net/http"
 	"time"
@@ -30,8 +28,8 @@ var defaultWaitingRoomBytes []byte
 func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		ticket := wr.nextTicket.Add(1)
-		ctx    := c.Request.Context()
-		token  := ""
+		ctx := c.Request.Context()
+		token := ""
 
 		// Fast path — ticket is within the serving window.
 		if wr.ticketReady(ticket) {
@@ -54,12 +52,24 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			token = cookie.Value
 		}
 
+		// cancelWatcher broadcasts to cond when ctx is cancelled so the
+		// blocked cond.Wait() below wakes up and can check ctx.Done().
+		waitDone := make(chan struct{})
+		go func() {
+			select {
+			case <-ctx.Done():
+				wr.cond.Broadcast()
+			case <-waitDone:
+			}
+		}()
+
 		// Block until our ticket is called or context is cancelled.
 		wr.mu.Lock()
 		for !wr.ticketReady(ticket) {
 			select {
 			case <-ctx.Done():
 				wr.mu.Unlock()
+				close(waitDone)
 				wr.tokens.delete(token)
 				c.AbortWithStatus(http.StatusServiceUnavailable)
 				return
@@ -68,6 +78,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			wr.cond.Wait()
 		}
 		wr.mu.Unlock()
+		close(waitDone)
 
 		if err := wr.sem.AcquireWith(ctx); err != nil {
 			wr.tokens.delete(token)
@@ -119,7 +130,7 @@ func (wr *WaitingRoom) serveWaitingRoom(c *gin.Context, ticket int64) error {
 	})
 
 	position := ticket - wr.nowServing.Load()
-	html     := wr.resolveHTML()
+	html := wr.resolveHTML()
 	c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectPosition(html, position))
 	return nil
 }
@@ -138,7 +149,11 @@ func (wr *WaitingRoom) resolveHTML() []byte {
 // injectPosition substitutes {{.Position}} in the HTML bytes with the
 // caller's numeric queue position.
 func (wr *WaitingRoom) injectPosition(html []byte, position int64) []byte {
-	return bytes.ReplaceAll(html, []byte("{{.Position}}"), []byte(fmt.Sprintf("%d", position)))
+	return bytes.ReplaceAll(
+		html,
+		[]byte("{{.Position}}"),
+		[]byte(fmt.Sprintf("%d", position)),
+	)
 }
 
 // SetHTML replaces the waiting room page served to queued requests.
@@ -153,8 +168,9 @@ func (wr *WaitingRoom) SetHTML(html []byte) {
 }
 
 // SetCap adjusts the number of concurrently active requests at runtime.
-// Expanding capacity immediately admits waiting tickets. Shrinking drains
-// in-flight work first.
+// Expanding capacity immediately admits waiting tickets by broadcasting
+// to all blocked goroutines so they can recheck ticketReady against the
+// new cap value. Shrinking drains in-flight work first.
 //
 // Returns ErrInvalidCap if cap < 1.
 //
@@ -164,7 +180,12 @@ func (wr *WaitingRoom) SetCap(cap int32) error {
 		return ErrInvalidCap{Given: cap}
 	}
 	wr.cap = cap
-	return wr.sem.SetCap(int(cap))
+	if err := wr.sem.SetCap(int(cap)); err != nil {
+		return err
+	}
+	// Wake all waiters so they recheck ticketReady against the new cap.
+	wr.cond.Broadcast()
+	return nil
 }
 
 // Cap returns the current capacity.
@@ -205,13 +226,4 @@ func (wr *WaitingRoom) Utilization() float64 {
 // Related: WaitingRoom.Utilization
 func (wr *WaitingRoom) UtilizationSmoothed() float64 {
 	return wr.sem.UtilizationSmoothed()
-}
-
-// generateToken returns a cryptographically random hex string.
-func generateToken() (string, error) {
-	b := make([]byte, tokenBytes)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
 }
