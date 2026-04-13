@@ -3,6 +3,7 @@ package room
 import (
 	"context"
 	"fmt"
+	"sync"
 
 	"github.com/andreimerlescu/sema"
 	"github.com/gin-gonic/gin"
