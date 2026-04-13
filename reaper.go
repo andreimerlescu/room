@@ -120,17 +120,3 @@ func (wr *WaitingRoom) reap() {
 	wr.tokens.mu.Unlock()
 }
 
-// ErrReaperInterval is returned by SetReaperInterval when the provided
-// duration falls outside [reaperMinInterval, reaperMaxInterval].
-type ErrReaperInterval struct {
-	Given time.Duration
-	Min   time.Duration
-	Max   time.Duration
-}
-
-func (e ErrReaperInterval) Error() string {
-	return fmt.Sprintf(
-		"room: reaper interval %s out of range [%s, %s]",
-		e.Given, e.Min, e.Max,
-	)
-}
