@@ -14,9 +14,10 @@ import (
 // polling requests from the waiting room page bypass the queue entirely.
 //
 // The handler reads the room_ticket cookie set when the client was first
-// placed in the waiting room. If the ticket is not found or has expired,
-// it returns ready=true so the client retries the original request and
-// either enters or re-queues cleanly.
+// placed in the waiting room. If the ticket is present but unknown or
+// expired, it returns ready=true so the client retries the original
+// request and either enters or re-queues cleanly. If the cookie is absent
+// entirely, it returns cookies_required=true instead — see below.
 //
 // Each successful status poll (where the client is still actively waiting)
 // refreshes the token's issuedAt timestamp, preventing the reaper from
@@ -41,9 +42,29 @@ func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 
 		cookie, err := c.Request.Cookie(cookieName)
 		if err != nil {
-			// No cookie — client has no queued position; send them back
-			// to try the main handler.
-			c.JSON(http.StatusOK, statusResponse{Ready: true})
+			// No room_ticket cookie at all.
+			//
+			// This previously returned ready=true, reasoning that a client
+			// with no queue position should retry the original request.
+			// That is correct for a client that never queued — but it is
+			// catastrophic for a client that CANNOT store cookies: the
+			// waiting room page reads ready=true, reloads, is handed a
+			// fresh ticket at the back of the line, and repeats every few
+			// seconds indefinitely, never admitted, leaking a token-store
+			// entry and a nextTicket increment per cycle.
+			//
+			// Signal the condition explicitly instead. The page stops
+			// polling and surfaces an error.
+			//
+			// This does not affect the normal admission flow: a client
+			// that was just admitted still HAS the cookie (now pointing
+			// at a deleted token) and so takes the ready=true path below.
+			// Only a client with no cookie at all reaches here, and for
+			// such a client ready=true was never actionable anyway.
+			c.JSON(http.StatusOK, statusResponse{
+				Ready:           false,
+				CookiesRequired: true,
+			})
 			return
 		}
 
@@ -142,6 +163,11 @@ func (wr *WaitingRoom) positionOf(ticket int64) int64 {
 //	r.OPTIONS("/queue/status", func(c *gin.Context) { c.Status(http.StatusNoContent) })
 //	r.GET("/queue/status", wr.StatusHandler())
 //	r.Use(wr.Middleware())
+//
+// Note that a cross-origin deployment must also send credentials on the
+// polling fetch and allow them in the CORS response, or the room_ticket
+// cookie will not accompany the poll and every client will be reported
+// as cookieless.
 //
 // Usage:
 //

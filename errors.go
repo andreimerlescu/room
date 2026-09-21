@@ -94,3 +94,18 @@ func (e ErrPassDuration) Error() string {
 		e.Given, e.Min, e.Max,
 	)
 }
+
+// ErrTokenTTL is returned by SetTokenTTL when the provided duration
+// falls outside [tokenTTLMin, tokenTTLMax].
+type ErrTokenTTL struct {
+	Given time.Duration
+	Min   time.Duration
+	Max   time.Duration
+}
+
+func (e ErrTokenTTL) Error() string {
+	return fmt.Sprintf(
+		"room: token TTL %s out of range [%s, %s]",
+		e.Given, e.Min, e.Max,
+	)
+}
