@@ -69,11 +69,6 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			if entry, ok := wr.tokens.get(cookie.Value); ok {
 				if wr.ticketReady(entry.ticket) {
 					// Client's ticket is now within the serving window.
-
-					// Snapshot occupancy BEFORE acquiring the slot so we
-					// can detect the non-full→full transition edge.
-					wasFull := wr.Len() >= int(wr.Cap())
-
 					// Acquire a slot and let them through.
 					if err := wr.sem.AcquireWith(c.Request.Context()); err != nil {
 						// Acquire failed (client disconnected, context
@@ -90,10 +85,11 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 						c.AbortWithStatus(http.StatusServiceUnavailable)
 						return
 					}
+					filled := wr.enter()
 					wr.tokens.delete(cookie.Value)
 					defer wr.release("")
 					wr.emit(EventEnter, wr.snapshot(EventEnter))
-					if !wasFull && wr.Len() >= int(wr.Cap()) {
+					if filled {
 						wr.emit(EventFull, wr.snapshot(EventFull))
 					}
 					c.Next()
@@ -153,9 +149,6 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		ticket := wr.nextTicket.Add(1)
 		ctx := c.Request.Context()
 
-		// Snapshot occupancy BEFORE acquiring the slot for edge detection.
-		wasFull := wr.Len() >= int(wr.Cap())
-
 		// Fast path — ticket is within the serving window.
 		if wr.ticketReady(ticket) {
 			if err := wr.sem.AcquireWith(ctx); err != nil {
@@ -168,9 +161,10 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 				c.AbortWithStatus(http.StatusServiceUnavailable)
 				return
 			}
+			filled := wr.enter()
 			defer wr.release("")
 			wr.emit(EventEnter, wr.snapshot(EventEnter))
-			if !wasFull && wr.Len() >= int(wr.Cap()) {
+			if filled {
 				wr.emit(EventFull, wr.snapshot(EventFull))
 			}
 			c.Next()
@@ -225,6 +219,48 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectTemplateVars(html, position))
 		c.Abort()
 	}
+}
+
+// enter records that this request has acquired a semaphore slot and
+// reports whether THIS request is the one that took the room from below
+// capacity to at capacity.
+//
+// The return value of atomic.Int32.Add is unique to the caller, so among
+// any number of concurrent admissions exactly one observes the counter
+// landing on cap. That is what makes EventFull an edge rather than a
+// level: the previous implementation snapshotted wr.Len() before
+// acquiring and re-read it afterwards, which let every goroutine involved
+// in the same crossing observe "was below, now at" and emit EventFull.
+// With cap=2 and two simultaneous arrivals that produced two EventFull
+// emissions for one transition.
+//
+// Must be called exactly once per successful acquire, and paired with
+// release (which calls exit).
+//
+// Note on SetCap: capacity is read once here. If SetCap changes capacity
+// concurrently with an admission, a transition may be missed or attributed
+// to a neighbouring request. The events remain edge-triggered; only their
+// exact timing around a resize is approximate.
+//
+// Related: WaitingRoom.exit, WaitingRoom.release
+func (wr *WaitingRoom) enter() bool {
+	capacity := wr.cap.Load()
+	return wr.occupancy.Add(1) == capacity
+}
+
+// exit records that a semaphore slot has been released and reports
+// whether THIS release is the one that took the room from at capacity
+// back to having a free slot.
+//
+// The mirror of enter: exactly one concurrent releaser sees the counter
+// land on cap-1, so EventDrain fires once per crossing. It does NOT fire
+// when occupancy merely falls toward zero from an already non-full state,
+// which matches the documented semantics.
+//
+// Related: WaitingRoom.enter, WaitingRoom.release
+func (wr *WaitingRoom) exit() bool {
+	capacity := wr.cap.Load()
+	return wr.occupancy.Add(-1) == capacity-1
 }
 
 // setProbeCookie writes the JS-readable probe cookie. It is deliberately
@@ -301,27 +337,25 @@ func (wr *WaitingRoom) ticketReady(ticket int64) bool {
 //
 // EventDrain fires on the transition from full to not-full — i.e. when
 // the room was at capacity before this release and now has at least one
-// free slot. This matches the documented semantics and is useful for
-// scale-in decisions.
+// free slot. The transition is determined by exit, whose atomic decrement
+// attributes the crossing to exactly one releaser; comparing occupancy
+// readings taken before and after the release would let several
+// concurrent releasers claim the same crossing.
 //
 // Note: nowServing is advanced here without holding wr.mu because the
 // WaitingRoom uses a poll-driven admission model. There are no goroutines
 // performing cond.Wait(); the advance only needs to be atomic, which
 // atomic.Int64.Add guarantees.
 func (wr *WaitingRoom) release(token string) {
-	// Snapshot BEFORE releasing the slot so we can detect the
-	// full→not-full transition.
-	wasFull := wr.Len() >= int(wr.Cap())
-
 	if token != "" {
 		wr.tokens.delete(token)
 	}
 	wr.sem.Release()
+	drained := wr.exit()
 	wr.nowServing.Add(1)
 
-	snap := wr.snapshot(EventExit)
-	wr.emit(EventExit, snap)
-	if wasFull && !snap.Full() {
+	wr.emit(EventExit, wr.snapshot(EventExit))
+	if drained {
 		wr.emit(EventDrain, wr.snapshot(EventDrain))
 	}
 }
@@ -411,7 +445,8 @@ func (wr *WaitingRoom) Cap() int32 {
 	return wr.cap.Load()
 }
 
-// Len returns the number of requests currently being actively served.
+// Len returns the number of requests currently being actively served, as
+// reported by the underlying semaphore.
 //
 // Related: WaitingRoom.QueueDepth
 func (wr *WaitingRoom) Len() int {

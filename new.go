@@ -91,6 +91,7 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.reaperRestart = make(chan struct{}, 1)
 	wr.nowServing.Store(0)
 	wr.nextTicket.Store(0)
+	wr.occupancy.Store(0)
 	wr.reaperInterval.Store(int64(reaperInterval))
 	wr.secureCookie.Store(secureCookieDefault)
 	wr.maxQueueDepth.Store(defaultMaxQueueDepth)

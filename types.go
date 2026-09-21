@@ -60,6 +60,21 @@ type WaitingRoom struct {
 	skipURL        atomic.Value // string
 	passes         *passStore
 	passDuration   atomic.Int64 // nanoseconds; 0 = passes disabled
+
+	// occupancy mirrors the number of semaphore slots currently held. It
+	// exists solely so that EventFull and EventDrain can be attributed to
+	// the single request that CAUSED each transition.
+	//
+	// Reading wr.Len() before and after acquiring cannot do this: under
+	// concurrency several goroutines each observe "was below capacity,
+	// now at capacity" for the same crossing and all emit EventFull. The
+	// return value of an atomic Add is unique to the caller, so exactly
+	// one request sees occupancy reach cap and exactly one sees it fall
+	// back below.
+	//
+	// Maintained by enter and exit. wr.Len() remains the public,
+	// semaphore-backed occupancy reading.
+	occupancy atomic.Int32
 }
 
 // ticketEntry holds the state for a single queued client.
