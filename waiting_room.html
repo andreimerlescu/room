@@ -20,6 +20,7 @@
             --text:      #e2e8f0;
             --muted:     #64748b;
             --success:   #34d399;
+            --danger:    #f87171;
             --radius:    12px;
         }
 
@@ -214,6 +215,53 @@
             margin-top: 0.25rem;
         }
 
+        /* ── Cookie failure panel ────────────────────────────── */
+
+        .cookie-error {
+            display: none;
+            background: rgba(248, 113, 113, 0.08);
+            border: 1px solid rgba(248, 113, 113, 0.3);
+            border-radius: var(--radius);
+            padding: 1.25rem;
+            margin-bottom: 2rem;
+            text-align: left;
+        }
+
+        .cookie-error.visible {
+            display: block;
+        }
+
+        .cookie-error-title {
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--danger);
+            margin-bottom: 0.5rem;
+        }
+
+        .cookie-error-body {
+            font-size: 0.8rem;
+            color: #94a3b8;
+            line-height: 1.5;
+            margin-bottom: 0.9rem;
+        }
+
+        .cookie-retry-btn {
+            background: var(--surface);
+            color: var(--text);
+            border: 1px solid var(--border);
+            border-radius: 8px;
+            padding: 0.5rem 1.25rem;
+            font-size: 0.78rem;
+            font-weight: 500;
+            cursor: pointer;
+            width: 100%;
+            transition: border-color 0.2s ease;
+        }
+
+        .cookie-retry-btn:hover {
+            border-color: var(--accent);
+        }
+
         /* ── Progress bar ────────────────────────────────────── */
 
         .bar-wrap {
@@ -303,6 +351,25 @@
         <div class="pass-badge-detail">You're being fast-tracked to the front automatically.</div>
     </div>
 
+    <!-- Cookie failure panel. Shown when the browser is not storing our
+         cookies, which makes holding a queue position impossible. This
+         terminates polling: continuing would reload the page every few
+         seconds forever and push the client to the back of the line each
+         time, while leaving an orphaned ticket behind on the server. -->
+    <div class="cookie-error" id="cookie-error" role="alert">
+        <div class="cookie-error-title">⚠ Cookies are required</div>
+        <div class="cookie-error-body">
+            We hold your place in line using a cookie, and your browser
+            isn't storing it. Without it every page load puts you at the
+            back of the queue, so you'd never be admitted.<br><br>
+            Enable cookies for this site (or leave private browsing mode)
+            and try again.
+        </div>
+        <button class="cookie-retry-btn" id="cookie-retry" type="button">
+            Try again
+        </button>
+    </div>
+
     <!-- Skip-the-line offer: hidden by default, shown only when the
          server returns skip_cost > 0, a SkipURL was configured, and
          the client does NOT already have a valid pass. -->
@@ -346,6 +413,11 @@
     const JITTER_MS          = 500;
     const STATUS_ENDPOINT    = "/queue/status";
 
+    // Name of the non-HttpOnly probe cookie the server sets alongside
+    // room_ticket on every waiting-room render. See setProbeCookie in
+    // room.go — its only job is to be readable from here.
+    const PROBE_COOKIE       = "room_probe";
+
     // SkipURL is injected by the server via template substitution.
     // If the application did not call SetSkipURL, this is empty and
     // the skip-the-line offer is never shown.
@@ -357,17 +429,22 @@
 
     // ── DOM references ──────────────────────────────────────────
 
-    const positionEl   = document.getElementById("position");
-    const skipOfferEl  = document.getElementById("skip-offer");
-    const skipCostEl   = document.getElementById("skip-cost");
-    const skipRateEl   = document.getElementById("skip-rate");
-    const skipBtnEl    = document.getElementById("skip-btn");
-    const passBadgeEl  = document.getElementById("pass-badge");
-    const statusTextEl = document.getElementById("status-text");
-    const lastChecked  = document.getElementById("last-checked");
-    const admittedEl   = document.getElementById("admitted");
-    const statusEl     = document.querySelector(".status");
-    const iconEl       = document.querySelector(".icon");
+    const positionEl    = document.getElementById("position");
+    const skipOfferEl   = document.getElementById("skip-offer");
+    const skipCostEl    = document.getElementById("skip-cost");
+    const skipRateEl    = document.getElementById("skip-rate");
+    const skipBtnEl     = document.getElementById("skip-btn");
+    const passBadgeEl   = document.getElementById("pass-badge");
+    const cookieErrorEl = document.getElementById("cookie-error");
+    const cookieRetryEl = document.getElementById("cookie-retry");
+    const statusTextEl  = document.getElementById("status-text");
+    const lastChecked   = document.getElementById("last-checked");
+    const admittedEl    = document.getElementById("admitted");
+    const statusEl      = document.querySelector(".status");
+    const iconEl        = document.querySelector(".icon");
+    const positionBlock = document.querySelector(".position-block");
+    const barWrapEl     = document.querySelector(".bar-wrap");
+    const metaEl        = document.querySelector(".meta");
 
     // ── Helpers ─────────────────────────────────────────────────
 
@@ -388,6 +465,40 @@
     function setStatus(text) {
         statusTextEl.textContent = text;
     }
+
+    // ── Cookie detection ────────────────────────────────────────
+
+    // Detect cookie storage from the client side.
+    //
+    // room_ticket is HttpOnly and therefore invisible here, which is why
+    // the server also sets room_probe — a value-free, non-HttpOnly cookie
+    // whose sole job is to be readable. If it is missing on a page the
+    // server just set it on, the browser is discarding our cookies and
+    // no queue position can be held.
+    function cookiesEnabled() {
+        if (navigator.cookieEnabled === false) return false;
+        return document.cookie.split("; ").some(function (c) {
+            return c.indexOf(PROBE_COOKIE + "=") === 0;
+        });
+    }
+
+    // Terminal state: stop polling, stop reloading, explain the problem.
+    // Everything that implies "you have a place in line" is hidden,
+    // because the client does not.
+    function showCookieError() {
+        cookieErrorEl.classList.add("visible");
+        skipOfferEl.classList.remove("visible");
+        passBadgeEl.classList.remove("visible");
+        if (positionBlock) positionBlock.style.display = "none";
+        if (barWrapEl)     barWrapEl.style.display = "none";
+        if (metaEl)        metaEl.style.display = "none";
+        statusEl.style.display = "none";
+        iconEl.textContent = "🍪";
+    }
+
+    cookieRetryEl.addEventListener("click", function () {
+        window.location.reload();
+    });
 
     // ── Skip-the-line / VIP pass ────────────────────────────────
 
@@ -429,6 +540,15 @@
     // ── Admission ───────────────────────────────────────────────
 
     function admit() {
+        // Defence in depth: never reload on a ready signal we can't act
+        // on. Without a stored cookie the reload lands as a fresh arrival
+        // at the back of the queue, which is the reload loop this page
+        // exists to avoid.
+        if (!cookiesEnabled()) {
+            showCookieError();
+            return;
+        }
+
         admittedEl.style.display = "block";
         statusEl.style.display   = "none";
         iconEl.textContent       = "✅";
@@ -446,6 +566,13 @@
             if (!res.ok) { scheduleNext(); return; }
 
             const data = await res.json();
+
+            // Server saw no room_ticket cookie on this poll — our position
+            // cannot be tracked. Terminal: do not reschedule, do not reload.
+            if (data.cookies_required === true) {
+                showCookieError();
+                return;
+            }
 
             // Server signals this client is ready to enter.
             if (data.ready === true) {
@@ -482,8 +609,14 @@
         setTimeout(poll, POLL_INTERVAL_MS + jitter);
     }
 
-    // Kick off the first poll after one interval.
-    scheduleNext();
+    // Check cookie support before the first poll. Catching this here means
+    // a cookieless client costs the server exactly one ticket, not one
+    // every few seconds for as long as the tab stays open.
+    if (!cookiesEnabled()) {
+        showCookieError();
+    } else {
+        scheduleNext();
+    }
 </script>
 </body>
 </html>

@@ -86,6 +86,7 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.cap.Store(cap)
 	wr.sem = sema.Must(int(cap))
 	wr.tokens = newTokenStore()
+	wr.tokens.setTTL(defaultTokenTTL)
 	wr.passes = newPassStore()
 	wr.reaperRestart = make(chan struct{}, 1)
 	wr.nowServing.Store(0)
@@ -129,9 +130,48 @@ func (wr *WaitingRoom) Stop() {
 // nginx, AWS ALB, etc.) where c.Request.TLS may be nil even though the
 // end-user connection is encrypted.
 //
+// Note that setting this to true on a deployment that is NOT fully HTTPS
+// causes browsers to silently discard the session cookie, which puts
+// every client into the cookie-disabled failure mode. The waiting room
+// page detects and reports that condition rather than looping, but the
+// clients still cannot be admitted — verify your TLS terminator before
+// enabling this.
+//
 // Safe to call at any time before or after traffic starts.
 func (wr *WaitingRoom) SetSecureCookie(secure bool) {
 	wr.secureCookie.Store(secure)
+}
+
+// SetTokenTTL sets the sliding-window lifetime of a queued client's
+// token. The window is reset on every successful /queue/status poll, so
+// an actively waiting client is never reaped no matter how long it waits;
+// the TTL governs only how long an ABANDONED token lingers.
+//
+// Lower values reclaim ghost tickets faster and keep QueueDepth honest —
+// which matters because QueueDepth drives displayed positions, surge
+// pricing via RateFunc, and the SetMaxQueueDepth circuit breaker. Higher
+// values let a client close the tab and return to the same position.
+//
+// The token TTL is also used as the MaxAge of the room_ticket cookie.
+//
+// Valid range: 30s – 24h. Values outside this range return ErrTokenTTL.
+//
+// Safe to call at any time.
+//
+// Related: TokenTTL, SetReaperInterval, SetMaxQueueDepth
+func (wr *WaitingRoom) SetTokenTTL(d time.Duration) error {
+	if d < tokenTTLMin || d > tokenTTLMax {
+		return ErrTokenTTL{Given: d, Min: tokenTTLMin, Max: tokenTTLMax}
+	}
+	wr.tokens.setTTL(d)
+	return nil
+}
+
+// TokenTTL returns the current sliding-window token lifetime.
+//
+// Related: SetTokenTTL
+func (wr *WaitingRoom) TokenTTL() time.Duration {
+	return wr.tokens.ttl()
 }
 
 // SetMaxQueueDepth sets the maximum number of requests that may wait in the
@@ -140,6 +180,11 @@ func (wr *WaitingRoom) SetSecureCookie(secure bool) {
 //
 // A value of 0 disables the limit (unlimited queue depth). This is the
 // default. Negative values return ErrInvalidMaxQueueDepth.
+//
+// The limit is evaluated against two independent measures — the ticket-
+// counter derived QueueDepth and the live token count — so that a flood
+// of abandoned arrivals cannot consume the entire budget on paper and
+// reject real clients.
 //
 // Safe to call at any time including while requests are in flight.
 func (wr *WaitingRoom) SetMaxQueueDepth(max int64) error {
@@ -153,6 +198,18 @@ func (wr *WaitingRoom) SetMaxQueueDepth(max int64) error {
 // MaxQueueDepth returns the current maximum queue depth. Zero means unlimited.
 func (wr *WaitingRoom) MaxQueueDepth() int64 {
 	return wr.maxQueueDepth.Load()
+}
+
+// LiveQueueDepth returns the number of queued clients that currently hold
+// a token in the token store. Unlike QueueDepth, which is derived from the
+// monotonic ticket counter and includes tickets burned by clients that
+// never returned, this reflects only clients the server can still admit.
+//
+// Prefer this for dashboards where an inflated number would be misleading.
+//
+// Related: WaitingRoom.QueueDepth, WaitingRoom.SetTokenTTL
+func (wr *WaitingRoom) LiveQueueDepth() int64 {
+	return int64(wr.tokens.len())
 }
 
 // SetCookiePath sets the Path attribute of the waiting-room session cookie.

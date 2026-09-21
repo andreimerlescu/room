@@ -29,6 +29,13 @@ import (
 // proxy such as Cloudflare, nginx, or an AWS ALB). Alternatively, use
 // SetSecureCookieFromRequest to derive the flag from each incoming request.
 //
+// # Cookie availability
+//
+// A client that cannot store cookies cannot hold a queue position: every
+// request it makes is indistinguishable from a brand-new arrival. The
+// WaitingRoom detects this condition rather than letting such a client
+// spin — see probeCookieName and statusResponse.CookiesRequired.
+//
 // Related: NewWaitingRoom, Init, Middleware, RegisterRoutes
 type WaitingRoom struct {
 	sem            sema.Semaphore
@@ -72,15 +79,35 @@ type passEntry struct {
 }
 
 // tokenStore maps random token strings to ticketEntry values.
+//
+// The store owns its own TTL so that expiry checks remain a single
+// lock-scoped operation with no reference back to the WaitingRoom. The
+// TTL is a sliding window: touchIssuedAt resets it on every poll, so it
+// governs how long an ABANDONED token lingers, not how long a client may
+// legitimately wait.
 type tokenStore struct {
-	mu      sync.RWMutex
-	entries map[string]ticketEntry
+	mu       sync.RWMutex
+	entries  map[string]ticketEntry
+	ttlNanos atomic.Int64
 }
 
 func newTokenStore() *tokenStore {
-	return &tokenStore{
+	ts := &tokenStore{
 		entries: make(map[string]ticketEntry),
 	}
+	ts.ttlNanos.Store(int64(defaultTokenTTL))
+	return ts
+}
+
+// ttl returns the current sliding-window token lifetime.
+func (ts *tokenStore) ttl() time.Duration {
+	return time.Duration(ts.ttlNanos.Load())
+}
+
+// setTTL updates the sliding-window token lifetime. Safe to call at any
+// time; takes effect on the next expiry check.
+func (ts *tokenStore) setTTL(d time.Duration) {
+	ts.ttlNanos.Store(int64(d))
 }
 
 func (ts *tokenStore) set(token string, entry ticketEntry) {
@@ -106,13 +133,14 @@ func (ts *tokenStore) delete(token string) {
 // single write lock. Returns true if the token existed and was expired.
 // This eliminates the TOCTOU window between separate isExpired + delete calls.
 func (ts *tokenStore) deleteIfExpired(token string) bool {
+	ttl := ts.ttl()
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 	entry, ok := ts.entries[token]
 	if !ok {
 		return false
 	}
-	if time.Since(entry.issuedAt) > cookieTTL {
+	if time.Since(entry.issuedAt) > ttl {
 		delete(ts.entries, token)
 		return true
 	}
@@ -147,23 +175,27 @@ func (ts *tokenStore) touchLastPoll(token string) (previous time.Time, ok bool) 
 	return previous, true
 }
 
-// len returns the number of entries in the token store.
+// len returns the number of entries in the token store. This is the count
+// of LIVE queued clients — unlike QueueDepth, which is derived from the
+// monotonic ticket counter and therefore also counts tickets burned by
+// clients that never came back.
 func (ts *tokenStore) len() int {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	return len(ts.entries)
 }
 
-// isExpired reports whether the token exists and has exceeded cookieTTL.
+// isExpired reports whether the token exists and has exceeded the TTL.
 // Deprecated: prefer deleteIfExpired to avoid the TOCTOU window.
 func (ts *tokenStore) isExpired(token string) bool {
+	ttl := ts.ttl()
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	entry, ok := ts.entries[token]
 	if !ok {
 		return true
 	}
-	return time.Since(entry.issuedAt) > cookieTTL
+	return time.Since(entry.issuedAt) > ttl
 }
 
 // passStore maps pass tokens (from the room_pass cookie) to their
@@ -237,4 +269,10 @@ type statusResponse struct {
 	SkipCost    float64 `json:"skip_cost,omitempty"`
 	RatePerPos  float64 `json:"rate_per_pos,omitempty"`
 	HasPass     bool    `json:"has_pass,omitempty"`
+
+	// CookiesRequired is set when a poll arrives with no room_ticket
+	// cookie at all. The client cannot hold a queue position, so the
+	// page must stop its reload cycle and surface an error rather than
+	// treating the absent position as an admission signal.
+	CookiesRequired bool `json:"cookies_required,omitempty"`
 }

@@ -442,7 +442,16 @@ func TestFIFO_RequestsAdmittedInOrder(t *testing.T) {
 
 // ── Status endpoint tests ────────────────────────────────────────────────────
 
-func TestStatusEndpoint_UnknownTokenReturnsReady(t *testing.T) {
+// TestStatusEndpoint_NoCookieReportsCookiesRequired verifies that a poll
+// arriving with NO room_ticket cookie reports cookies_required rather than
+// ready=true.
+//
+// This test previously asserted ready=true. That was the wrong contract: a
+// client that cannot store cookies reads ready=true, reloads, is issued a
+// fresh ticket at the back of the queue, and repeats forever — never
+// admitted, leaking a token-store entry and a nextTicket increment per
+// cycle. See StatusHandler for the full reasoning.
+func TestStatusEndpoint_NoCookieReportsCookiesRequired(t *testing.T) {
 	wr := &WaitingRoom{}
 	if err := wr.Init(5); err != nil {
 		t.Fatal(err)
@@ -454,8 +463,37 @@ func TestStatusEndpoint_UnknownTokenReturnsReady(t *testing.T) {
 	r.GET("/", func(c *gin.Context) { c.Status(http.StatusOK) })
 
 	resp := pollStatus(r, "")
+	if !resp.CookiesRequired {
+		t.Error("expected cookies_required=true when no room_ticket cookie is present")
+	}
+	if resp.Ready {
+		t.Error("expected ready=false when no room_ticket cookie is present — " +
+			"ready=true drives the waiting room page into a reload loop")
+	}
+}
+
+// TestStatusEndpoint_UnknownTokenReturnsReady verifies that a poll carrying
+// a room_ticket cookie whose token is not in the store still returns
+// ready=true. This is the admitted / expired / restarted-server case: the
+// client demonstrably stores cookies, it just has no live queue position,
+// so sending it back to the main handler is correct.
+func TestStatusEndpoint_UnknownTokenReturnsReady(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(5); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	r := gin.New()
+	wr.RegisterRoutes(r)
+	r.GET("/", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	resp := pollStatus(r, "deadbeefdeadbeefdeadbeefdeadbeef")
 	if !resp.Ready {
-		t.Error("expected ready=true for unknown token")
+		t.Error("expected ready=true for a cookie holding an unknown token")
+	}
+	if resp.CookiesRequired {
+		t.Error("expected cookies_required=false — the client sent a cookie")
 	}
 }
 

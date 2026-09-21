@@ -16,13 +16,18 @@ import (
 // contention on the token store. Loosening it (e.g. to 30m) is appropriate
 // when queue depth is low and memory pressure is not a concern.
 //
+// The reaper interval and the token TTL work together: the TTL decides
+// when a token becomes eligible for eviction, the interval decides how
+// soon after that it is actually removed. Worst-case ghost residency is
+// roughly TTL + interval.
+//
 // Usage:
 //
 //	if err := wr.SetReaperInterval(30 * time.Second); err != nil {
 //	    log.Fatal(err)
 //	}
 //
-// Related: WaitingRoom.ReaperInterval, WaitingRoom.startReaper
+// Related: WaitingRoom.ReaperInterval, WaitingRoom.SetTokenTTL, WaitingRoom.startReaper
 func (wr *WaitingRoom) SetReaperInterval(d time.Duration) error {
 	if d < reaperMinInterval || d > reaperMaxInterval {
 		return ErrReaperInterval{Given: d, Min: reaperMinInterval, Max: reaperMaxInterval}
@@ -88,7 +93,9 @@ func (wr *WaitingRoom) startReaper(ctx context.Context) {
 //
 // Because active pollers have their issuedAt refreshed on each
 // /queue/status call, only genuinely abandoned (ghost) clients will be
-// reaped under normal operation.
+// reaped under normal operation. Clients that cannot store cookies are a
+// significant source of such ghosts, which is why the default TTL is kept
+// short — see defaultTokenTTL.
 //
 // Related: WaitingRoom.startReaper, WaitingRoom.SetReaperInterval
 func (wr *WaitingRoom) reap() {
@@ -111,6 +118,10 @@ func (wr *WaitingRoom) reap() {
 func (wr *WaitingRoom) reapBatch() int {
 	now := time.Now()
 
+	// Snapshot the TTL once so the scan phase and the double-check phase
+	// agree even if SetTokenTTL is called mid-pass.
+	ttl := wr.tokens.ttl()
+
 	// Collect expired tokens under token store read lock.
 	wr.tokens.mu.RLock()
 	type expiredEntry struct {
@@ -119,7 +130,7 @@ func (wr *WaitingRoom) reapBatch() int {
 	}
 	expired := make([]expiredEntry, 0, min(len(wr.tokens.entries), reaperBatchSize))
 	for token, entry := range wr.tokens.entries {
-		if now.Sub(entry.issuedAt) > cookieTTL {
+		if now.Sub(entry.issuedAt) > ttl {
 			expired = append(expired, expiredEntry{token: token, ticket: entry.ticket})
 		}
 		if len(expired) >= reaperBatchSize {
@@ -147,7 +158,7 @@ func (wr *WaitingRoom) reapBatch() int {
 		if entry, ok := wr.tokens.entries[e.token]; ok {
 			// Re-check expiry under write lock to close the TOCTOU
 			// window between the read-lock scan and now.
-			if now.Sub(entry.issuedAt) > cookieTTL {
+			if now.Sub(entry.issuedAt) > ttl {
 				delete(wr.tokens.entries, e.token)
 				// Only advance nowServing for tickets that were outside
 				// the serving window. Tickets inside the window already

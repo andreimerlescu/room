@@ -37,6 +37,16 @@ var defaultWaitingRoomBytes []byte
 // blocking on behalf of waiting clients; the Middleware is stateless per
 // request beyond the token store lookup.
 //
+// # Cookie dependency
+//
+// Queue position lives entirely in the room_ticket cookie. A client that
+// cannot store it is, from the server's perspective, a new arrival on
+// every request — it can never be admitted while a queue exists, and each
+// attempt burns a ticket and a token-store entry. Every waiting-room
+// render therefore also sets a non-HttpOnly probe cookie so the page can
+// detect the condition and stop, rather than reloading forever. See
+// setProbeCookie.
+//
 // Related: WaitingRoom.RegisterRoutes, WaitingRoom.StatusHandler
 func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
@@ -106,6 +116,14 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 				if position < 1 {
 					position = 1
 				}
+
+				// Refresh the probe alongside the position render. The
+				// client demonstrably stores cookies (it just sent one),
+				// but the probe has a finite MaxAge and must not expire
+				// out from under a still-valid ticket — that would
+				// produce a false "cookies disabled" panel.
+				wr.setProbeCookie(c, secure)
+
 				html := wr.resolveHTML()
 				c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectTemplateVars(html, position))
 				c.Abort()
@@ -114,8 +132,20 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		}
 
 		// Check queue depth limit before issuing a new ticket.
+		//
+		// Two independent measures, either of which trips the breaker:
+		//
+		//   QueueDepth()    — derived from the monotonic ticket counter.
+		//                     Includes tickets burned by clients that
+		//                     never returned, so it over-reports.
+		//   tokens.len()    — live queued clients only.
+		//
+		// Checking both means a flood of abandoned or cookieless arrivals
+		// cannot silently consume the entire budget and 503 real users,
+		// while a genuine backlog still trips it on the first measure.
 		maxDepth := wr.maxQueueDepth.Load()
-		if maxDepth > 0 && wr.QueueDepth() >= maxDepth {
+		if maxDepth > 0 &&
+			(wr.QueueDepth() >= maxDepth || int64(wr.tokens.len()) >= maxDepth) {
 			c.AbortWithStatus(http.StatusServiceUnavailable)
 			return
 		}
@@ -151,7 +181,13 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		// abort. The client will poll /queue/status and reload when ready.
 		token, err := generateToken()
 		if err != nil {
-			wr.nowServing.Add(1)
+			// Ticket consumed but no token issued. Apply the same
+			// window guard used elsewhere: advancing nowServing for a
+			// within-window ticket inflates the serving window beyond
+			// the configured capacity.
+			if ticket > wr.nowServing.Load()+int64(wr.cap.Load()) {
+				wr.nowServing.Add(1)
+			}
 			c.AbortWithStatus(http.StatusInternalServerError)
 			return
 		}
@@ -168,11 +204,12 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			Value:    token,
 			Path:     wr.CookiePath(),
 			Domain:   wr.CookieDomain(),
-			MaxAge:   int(cookieTTL.Seconds()),
+			MaxAge:   int(wr.TokenTTL().Seconds()),
 			HttpOnly: true,
 			Secure:   secure,
 			SameSite: http.SameSiteLaxMode,
 		})
+		wr.setProbeCookie(c, secure)
 
 		// If the client has a valid pass, auto-promote the freshly
 		// issued ticket immediately so they jump to the front.
@@ -188,6 +225,38 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectTemplateVars(html, position))
 		c.Abort()
 	}
+}
+
+// setProbeCookie writes the JS-readable probe cookie. It is deliberately
+// NOT HttpOnly: the waiting room page reads it via document.cookie to
+// confirm the browser is storing our cookies at all.
+//
+// Without this, a cookieless client is invisible to itself — room_ticket
+// is HttpOnly, so the page has no way to distinguish "I have a queue
+// position the server will honour" from "every request I make is a brand
+// new arrival at the back of the line". It polls, is told ready=true
+// (no cookie means no position to report), reloads, and starts over —
+// forever, while burning a ticket and a token-store entry each cycle.
+//
+// The probe carries a constant value and no session meaning, so exposing
+// it to script grants nothing: admission is decided solely by room_ticket.
+// It is written with the same Path, Domain, Secure and SameSite attributes
+// as the session cookie so that a misconfiguration which blocks one blocks
+// both — a probe that survives while room_ticket is rejected would be
+// worse than no probe at all.
+//
+// Related: WaitingRoom.Middleware, WaitingRoom.StatusHandler
+func (wr *WaitingRoom) setProbeCookie(c *gin.Context, secure bool) {
+	http.SetCookie(c.Writer, &http.Cookie{
+		Name:     probeCookieName,
+		Value:    probeCookieValue,
+		Path:     wr.CookiePath(),
+		Domain:   wr.CookieDomain(),
+		MaxAge:   int(wr.TokenTTL().Seconds()),
+		HttpOnly: false,
+		Secure:   secure,
+		SameSite: http.SameSiteLaxMode,
+	})
 }
 
 // autoPromote silently promotes a token to the front of the queue.
@@ -299,6 +368,14 @@ func (wr *WaitingRoom) injectTemplateVars(html []byte, position int64) []byte {
 //   - {{.Position}} — replaced with the client's queue position (integer)
 //   - {{.SkipURL}}  — replaced with the skip-the-line payment URL (string)
 //
+// Custom pages SHOULD replicate two behaviours from the default page or
+// cookieless clients will reload indefinitely without ever being admitted:
+//
+//  1. Before the first poll, confirm document.cookie contains "room_probe".
+//     If it does not, show an error and do not poll.
+//  2. Treat a status response containing "cookies_required": true as
+//     terminal — show an error and stop polling rather than reloading.
+//
 // Related: WaitingRoom.resolveHTML, WaitingRoom.SetSkipURL
 func (wr *WaitingRoom) SetHTML(html []byte) {
 	wr.mu.Lock()
@@ -341,9 +418,15 @@ func (wr *WaitingRoom) Len() int {
 	return wr.sem.Len()
 }
 
-// QueueDepth returns the number of requests currently waiting for a slot.
+// QueueDepth returns the number of requests currently waiting for a slot,
+// derived from the monotonic ticket counter.
 //
-// Related: WaitingRoom.Len
+// This measure counts tickets, not clients. A ticket issued to a client
+// that never returns (abandoned tab, disabled cookies, crawler) continues
+// to contribute until the reaper evicts its token. For a count of clients
+// the server can actually still admit, use LiveQueueDepth.
+//
+// Related: WaitingRoom.Len, WaitingRoom.LiveQueueDepth
 func (wr *WaitingRoom) QueueDepth() int64 {
 	depth := wr.nextTicket.Load() - (wr.nowServing.Load() + int64(wr.cap.Load()))
 	if depth < 0 {

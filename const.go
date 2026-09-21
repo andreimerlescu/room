@@ -12,10 +12,58 @@ const (
 	// are auto-promoted on re-entry without paying again.
 	passCookieName = "room_pass"
 
-	// cookieTTL is how long a queued client's token remains valid.
-	// If a client disappears before being admitted, their token is
-	// evicted by the reaper after this duration.
-	cookieTTL = 30 * time.Minute
+	// probeCookieName is a deliberately NON-HttpOnly cookie set alongside
+	// room_ticket on every waiting-room render. It carries no secret and
+	// no state — its only purpose is to be readable from JavaScript via
+	// document.cookie so the waiting room page can determine whether the
+	// browser is actually storing our cookies.
+	//
+	// Without this probe, a client with cookies disabled cannot detect its
+	// own condition: room_ticket is HttpOnly and therefore invisible to
+	// JS, so the page polls /queue/status, receives ready=true (no cookie
+	// means no queue position), reloads, is issued a fresh ticket at the
+	// back of the line, and repeats indefinitely — never admitted, while
+	// leaking a token-store entry and a nextTicket increment every cycle.
+	//
+	// The probe is safe to expose: it is a constant value with no session
+	// meaning. An attacker forging it gains nothing, since admission is
+	// decided entirely by room_ticket.
+	probeCookieName = "room_probe"
+
+	// probeCookieValue is the constant value written to probeCookieName.
+	probeCookieValue = "1"
+
+	// defaultTokenTTL is the default lifetime of a queued client's token.
+	//
+	// This is a SLIDING window: StatusHandler calls touchIssuedAt on every
+	// successful poll, so an actively waiting client refreshes its token
+	// roughly every 3 seconds and is never reaped regardless of how long
+	// it waits. The TTL therefore only needs to cover a small multiple of
+	// the poll interval, not the expected total wait.
+	//
+	// It was formerly 30 minutes, which meant every abandoned or cookieless
+	// client's token occupied the store for half an hour, inflating
+	// QueueDepth (and therefore displayed positions, surge pricing, and the
+	// max-queue-depth breaker) with load that no longer exists. Five minutes
+	// preserves the "close the laptop for a moment" case while bounding
+	// ghost residency at roughly 1/6 of the previous worst case.
+	//
+	// Tune with SetTokenTTL.
+	defaultTokenTTL = 5 * time.Minute
+
+	// cookieTTL is retained as the package-internal default token lifetime
+	// for backwards compatibility with existing call sites and tests.
+	//
+	// Deprecated: the effective TTL is now per-WaitingRoom and runtime
+	// configurable. Read WaitingRoom.TokenTTL() instead of this constant.
+	cookieTTL = defaultTokenTTL
+
+	// tokenTTLMin is the minimum value accepted by SetTokenTTL. Values
+	// below this risk reaping clients that are polling normally.
+	tokenTTLMin = 30 * time.Second
+
+	// tokenTTLMax is the maximum value accepted by SetTokenTTL.
+	tokenTTLMax = 24 * time.Hour
 
 	// tokenBytes is the number of random bytes in a ticket token.
 	// 16 bytes = 128 bits of entropy.
