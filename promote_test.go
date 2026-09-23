@@ -462,89 +462,260 @@ func TestPromoteTokenToFront_JumpsToPositionOne(t *testing.T) {
 
 // ── Serialization: concurrent promotions ─────────────────────────────────────
 
-func TestPromoteToken_ConcurrentPromotions_NoCollision(t *testing.T) {
+// TestPromoteToken_ConcurrentPromotions_AllLandAtTarget replaces
+// TestPromoteToken_ConcurrentPromotions_NoCollision. Concurrent promotions
+// to the same target all land at that target (ties are allowed and
+// documented), none errors, and queue accounting is unchanged.
+func TestPromoteToken_ConcurrentPromotions_AllLandAtTarget(t *testing.T) {
 	t.Parallel()
 	wr := newTestWR(t, 1)
 	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
 
 	const n = 20
-
+	wr.nextTicket.Store(10 + (n-1)*5)
 	for i := 0; i < n; i++ {
 		wr.tokens.set(fmt.Sprintf("tok-%d", i), ticketEntry{
 			ticket:   int64(10 + i*5),
 			issuedAt: time.Now(),
 		})
 	}
+	depthBefore := wr.QueueDepth()
 
 	var wg sync.WaitGroup
-	var successCount atomic.Int32
-	var errorCount atomic.Int32
-
+	var errs atomic.Int32
 	for i := 0; i < n; i++ {
 		wg.Add(1)
-		i := i
-		go func() {
+		go func(i int) {
 			defer wg.Done()
-			_, err := wr.PromoteToken(fmt.Sprintf("tok-%d", i), 1)
-			if err != nil {
-				errorCount.Add(1)
-			} else {
-				successCount.Add(1)
+			if _, err := wr.PromoteToken(fmt.Sprintf("tok-%d", i), 1); err != nil {
+				errs.Add(1)
 			}
-		}()
+		}(i)
 	}
-
 	wg.Wait()
 
-	if errorCount.Load() > 0 {
-		t.Logf("successes=%d errors=%d (errors may include already-admitted tokens)",
-			successCount.Load(), errorCount.Load())
+	if errs.Load() != 0 {
+		t.Errorf("expected no errors, got %d", errs.Load())
 	}
-
-	seen := make(map[int64]string)
-	wr.tokens.mu.RLock()
-	for token, entry := range wr.tokens.entries {
-		if prev, exists := seen[entry.ticket]; exists {
-			t.Errorf("ticket collision: tokens %q and %q both have ticket %d",
-				prev, token, entry.ticket)
+	for i := 0; i < n; i++ {
+		e, _ := wr.tokens.get(fmt.Sprintf("tok-%d", i))
+		if pos := wr.positionOf(e.ticket); pos != 1 {
+			t.Errorf("tok-%d: expected position 1, got %d", i, pos)
 		}
-		seen[entry.ticket] = token
 	}
-	wr.tokens.mu.RUnlock()
+	if d := wr.QueueDepth(); d != depthBefore {
+		t.Errorf("promotions must not change QueueDepth: %d -> %d", depthBefore, d)
+	}
 }
 
-func TestPromoteToken_SerializedUnderMutex(t *testing.T) {
+// TestPromoteToken_LaterPayerNeverAheadOfEarlier replaces
+// TestPromoteToken_SerializedUnderMutex and is the regression test for the
+// LIFO bug: the second promotion to the front used to land one ticket
+// AHEAD of the first, usually straight into the serving window.
+func TestPromoteToken_LaterPayerNeverAheadOfEarlier(t *testing.T) {
 	t.Parallel()
 	wr := newTestWR(t, 1)
 	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
 
+	wr.nextTicket.Store(60)
 	wr.tokens.set("tok-a", ticketEntry{ticket: 50, issuedAt: time.Now()})
 	wr.tokens.set("tok-b", ticketEntry{ticket: 60, issuedAt: time.Now()})
 
-	var wg sync.WaitGroup
-	wg.Add(2)
-
-	go func() {
-		defer wg.Done()
-		wr.PromoteToken("tok-a", 1)
-	}()
-	go func() {
-		defer wg.Done()
-		wr.PromoteToken("tok-b", 1)
-	}()
-
-	wg.Wait()
-
-	entryA, okA := wr.tokens.get("tok-a")
-	entryB, okB := wr.tokens.get("tok-b")
-
-	if !okA || !okB {
-		t.Fatal("tokens disappeared after concurrent promotion")
+	if _, err := wr.PromoteToken("tok-a", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wr.PromoteToken("tok-b", 1); err != nil {
+		t.Fatal(err)
 	}
 
-	if entryA.ticket == entryB.ticket {
-		t.Errorf("ticket collision after serialized promotions: both have ticket %d",
-			entryA.ticket)
+	a, _ := wr.tokens.get("tok-a")
+	b, _ := wr.tokens.get("tok-b")
+	posA, posB := wr.positionOf(a.ticket), wr.positionOf(b.ticket)
+
+	if posB < posA {
+		t.Errorf("later payer ahead of earlier: posA=%d posB=%d", posA, posB)
+	}
+	if posB <= 0 {
+		t.Errorf("second promotion must not land inside the serving window, pos=%d", posB)
+	}
+	if posA != 1 || posB != 1 {
+		t.Errorf("both should sit at position 1, got A=%d B=%d", posA, posB)
+	}
+}
+
+// TestPromoteToken_IntermediateTargetHonouredAfterFront covers the second
+// symptom of the old counter: after any front promotion, an intermediate
+// target was ignored and the client landed near the front.
+func TestPromoteToken_IntermediateTargetHonouredAfterFront(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 1)
+	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
+
+	wr.nextTicket.Store(80)
+	wr.tokens.set("front", ticketEntry{ticket: 70, issuedAt: time.Now()})
+	wr.tokens.set("mid", ticketEntry{ticket: 80, issuedAt: time.Now()})
+
+	if _, err := wr.PromoteToken("front", 1); err != nil {
+		t.Fatal(err)
+	}
+	res, err := wr.PromoteToken("mid", 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e, _ := wr.tokens.get("mid")
+	if pos := wr.positionOf(e.ticket); pos != 10 {
+		t.Errorf("expected position 10, got %d", pos)
+	}
+	// 80 - 0 - 1 = position 79 → 10 is a distance of 69.
+	if res.Cost != 69.0 {
+		t.Errorf("expected cost 69.0, got %f", res.Cost)
+	}
+}
+
+// TestPromoteToken_TargetAccountsForGhosts verifies placement is exact when
+// retired tickets sit between the window and the target.
+func TestPromoteToken_TargetAccountsForGhosts(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 1)
+	wr.SetRateFunc(func(depth int64) float64 { return 1.0 })
+
+	wr.nextTicket.Store(30)
+	wr.tokens.set("tok", ticketEntry{ticket: 30, issuedAt: time.Now()})
+	for _, g := range []int64{3, 4, 5} {
+		wr.retire(g)
+	}
+
+	if _, err := wr.PromoteToken("tok", 5); err != nil {
+		t.Fatal(err)
+	}
+	e, _ := wr.tokens.get("tok")
+	if pos := wr.positionOf(e.ticket); pos != 5 {
+		t.Errorf("expected position 5 with ghosts ahead, got %d (ticket %d)", pos, e.ticket)
+	}
+}
+
+// ── AdminPromote ──────────────────────────────────────────────────────────────
+
+func TestAdminPromote_WorksWithoutRateFunc(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 1)
+	events := collectEvents(wr, EventPromote)
+
+	wr.nextTicket.Store(11)
+	wr.tokens.set("tok", ticketEntry{ticket: 11, issuedAt: time.Now(), clientKey: "k"})
+
+	if err := wr.AdminPromote("tok", 1); err != nil {
+		t.Fatalf("AdminPromote without RateFunc: %v", err)
+	}
+	e, _ := wr.tokens.get("tok")
+	if pos := wr.positionOf(e.ticket); pos != 1 {
+		t.Errorf("expected position 1, got %d", pos)
+	}
+	if !e.promoted {
+		t.Error("expected promoted=true")
+	}
+
+	s := nextSnapshot(t, events)
+	if s.Token != "tok" || s.ClientKey != "k" {
+		t.Errorf("EventPromote payload: Token=%q ClientKey=%q", s.Token, s.ClientKey)
+	}
+}
+
+func TestAdminPromote_DoesNotEnablePaidFlow(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 1)
+	wr.nextTicket.Store(20)
+	wr.tokens.set("a", ticketEntry{ticket: 20, issuedAt: time.Now()})
+	wr.tokens.set("b", ticketEntry{ticket: 19, issuedAt: time.Now()})
+
+	if err := wr.AdminPromote("a", 1); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := wr.PromoteToken("b", 1); err == nil {
+		t.Error("PromoteToken must still require a RateFunc")
+	} else if _, ok := err.(ErrPromotionDisabled); !ok {
+		t.Errorf("expected ErrPromotionDisabled, got %T", err)
+	}
+	if _, err := wr.QuoteCost("b", 1); err == nil {
+		t.Error("QuoteCost must still require a RateFunc")
+	}
+}
+
+func TestAdminPromote_Errors(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 10)
+	wr.tokens.set("ready", ticketEntry{ticket: 3, issuedAt: time.Now()})
+
+	if _, ok := wr.AdminPromote("x", 0).(ErrInvalidTargetPosition); !ok {
+		t.Error("expected ErrInvalidTargetPosition for target 0")
+	}
+	if _, ok := wr.AdminPromote("missing", 1).(ErrTokenNotFound); !ok {
+		t.Error("expected ErrTokenNotFound")
+	}
+	if _, ok := wr.AdminPromote("ready", 1).(ErrAlreadyAdmitted); !ok {
+		t.Error("expected ErrAlreadyAdmitted for an in-window ticket")
+	}
+
+	var zero WaitingRoom
+	if _, ok := zero.AdminPromote("x", 1).(ErrNotInitialised); !ok {
+		t.Error("expected ErrNotInitialised on a zero WaitingRoom")
+	}
+}
+
+func TestAdminPromote_AlreadyAheadIsNoop(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 1)
+	events := collectEvents(wr, EventPromote)
+	wr.tokens.set("tok", ticketEntry{ticket: 4, issuedAt: time.Now()})
+
+	if err := wr.AdminPromote("tok", 5); err != nil {
+		t.Fatalf("expected nil for a no-op promotion, got %v", err)
+	}
+	if e, _ := wr.tokens.get("tok"); e.ticket != 4 || e.promoted {
+		t.Errorf("no-op promotion changed the ticket: %+v", e)
+	}
+	select {
+	case s := <-events:
+		t.Errorf("EventPromote fired for a no-op: %+v", s)
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+// TestPromote_RaceWithRemove_NoResurrection is the regression test for the
+// get-then-set race: a promotion that read the token before a concurrent
+// RemoveToken must not re-insert it afterwards.
+func TestPromote_RaceWithRemove_NoResurrection(t *testing.T) {
+	wr := newTestWR(t, 1)
+
+	const n = 200
+	wr.nextTicket.Store(10 + n)
+	for i := 0; i < n; i++ {
+		wr.tokens.set(fmt.Sprintf("tok-%d", i), ticketEntry{ticket: int64(10 + i), issuedAt: time.Now()})
+	}
+
+	var wg sync.WaitGroup
+	var removeErrs atomic.Int32
+	for i := 0; i < n; i++ {
+		tok := fmt.Sprintf("tok-%d", i)
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			_ = wr.AdminPromote(tok, 1)
+		}()
+		go func() {
+			defer wg.Done()
+			if err := wr.RemoveToken(tok); err != nil {
+				removeErrs.Add(1)
+			}
+		}()
+	}
+	wg.Wait()
+
+	if removeErrs.Load() != 0 {
+		t.Errorf("every RemoveToken should succeed exactly once, %d failed", removeErrs.Load())
+	}
+	if live := wr.tokens.len(); live != 0 {
+		t.Errorf("promotion resurrected %d removed tokens", live)
 	}
 }
 

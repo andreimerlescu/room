@@ -29,8 +29,8 @@ func (e ErrInvalidCap) Error() string {
 	return fmt.Sprintf("room: invalid capacity %d: must be >= 1", e.Given)
 }
 
-// ErrNotInitialised is returned by Middleware or RegisterRoutes when
-// called on a WaitingRoom that has not been initialised via Init.
+// ErrNotInitialised is returned by methods that require Init when called
+// on a WaitingRoom that has not been initialised (for example RemoveToken).
 type ErrNotInitialised struct{}
 
 func (e ErrNotInitialised) Error() string {
@@ -56,7 +56,7 @@ func (e ErrPromotionDisabled) Error() string {
 }
 
 // ErrTokenNotFound is returned when the token does not exist in the
-// token store (expired, already admitted, or never issued).
+// token store (expired, already admitted, removed, or never issued).
 type ErrTokenNotFound struct{}
 
 func (e ErrTokenNotFound) Error() string {
@@ -108,4 +108,38 @@ func (e ErrTokenTTL) Error() string {
 		"room: token TTL %s out of range [%s, %s]",
 		e.Given, e.Min, e.Max,
 	)
+}
+
+// ErrFirstPollGrace is returned by SetFirstPollGrace when a non-zero
+// duration falls outside [firstPollGraceMin, firstPollGraceMax].
+type ErrFirstPollGrace struct {
+	Given time.Duration
+	Min   time.Duration
+	Max   time.Duration
+}
+
+func (e ErrFirstPollGrace) Error() string {
+	return fmt.Sprintf(
+		"room: first-poll grace %s out of range [%s, %s] (0 disables)",
+		e.Given, e.Min, e.Max,
+	)
+}
+
+// ErrImportNotEmpty is returned by Import when the WaitingRoom has already
+// issued a ticket or holds a pass. Import must run on a freshly
+// initialised room, before it serves traffic.
+type ErrImportNotEmpty struct{}
+
+func (e ErrImportNotEmpty) Error() string {
+	return "room: import requires a freshly initialised WaitingRoom that has not served traffic"
+}
+
+// ErrImportFormat is returned by Import when the input cannot be decoded
+// or fails validation. The WaitingRoom is left unchanged.
+type ErrImportFormat struct {
+	Reason string
+}
+
+func (e ErrImportFormat) Error() string {
+	return "room: invalid import data: " + e.Reason
 }
