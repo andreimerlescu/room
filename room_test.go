@@ -915,32 +915,63 @@ func TestReaper_PreservesLiveTokens(t *testing.T) {
 	}
 }
 
-func TestReaper_AdvancesNowServingOnEviction(t *testing.T) {
+// TestReaper_OutOfWindowGhostSkippedWhenWindowArrives replaces
+// TestReaper_AdvancesNowServingOnEviction. An out-of-window ghost no longer
+// advances nowServing at reap time (which would admit the head of the
+// queue early); it is skipped exactly when the window reaches it.
+func TestReaper_OutOfWindowGhostSkippedWhenWindowArrives(t *testing.T) {
 	wr := &WaitingRoom{}
 	if err := wr.Init(1); err != nil {
 		t.Fatal(err)
 	}
 	defer wr.Stop()
 
-	if ns := wr.nowServing.Load(); ns != 0 {
-		t.Fatalf("expected nowServing=0 initially, got %d", ns)
-	}
-
+	wr.nextTicket.Store(10)
 	wr.tokens.set("ghost", ticketEntry{
-		ticket:   10,
+		ticket:   5,
 		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
 	})
+	wr.tokens.set("live", ticketEntry{ticket: 10, issuedAt: time.Now()})
 
-	before := wr.nowServing.Load()
 	wr.reap()
 
-	if wr.nowServing.Load() != before+1 {
-		t.Errorf("expected nowServing to advance by 1 after evicting an out-of-window ghost, got %d (before=%d)",
-			wr.nowServing.Load(), before)
+	if ns := wr.nowServing.Load(); ns != 0 {
+		t.Errorf("expected nowServing unchanged at reap time, got %d", ns)
+	}
+	// 10 - 0 - 1 - 1 ghost ahead = 8
+	if pos := wr.positionOf(10); pos != 8 {
+		t.Errorf("expected live position 8 immediately after reap, got %d", pos)
+	}
+	if d := wr.QueueDepth(); d != 8 {
+		t.Errorf("expected QueueDepth 8, got %d", d)
+	}
+
+	// Three releases: edge moves to 4, ghost at 5 still ahead.
+	for range 3 {
+		wr.advance(1)
+	}
+	if ns := wr.nowServing.Load(); ns != 3 {
+		t.Fatalf("expected nowServing=3, got %d", ns)
+	}
+
+	// Fourth release: edge reaches 5, the ghost is skipped in the same step.
+	wr.advance(1)
+	if ns := wr.nowServing.Load(); ns != 5 {
+		t.Errorf("expected nowServing=5 (4 releases + 1 skipped ghost), got %d", ns)
+	}
+	if l := wr.ledger.len(); l != 0 {
+		t.Errorf("expected empty ledger, got %d", l)
+	}
+	if pos := wr.positionOf(10); pos != 4 {
+		t.Errorf("expected live position 4, got %d", pos)
 	}
 }
 
-func TestReaper_DoesNotAdvanceNowServingForWindowTicket(t *testing.T) {
+// TestReaper_AdvancesNowServingForWindowGhost replaces
+// TestReaper_DoesNotAdvanceNowServingForWindowTicket. Not advancing for an
+// in-window ghost did not protect capacity — it leaked a slot, and at
+// cap=1 froze the queue (see TestStall_AbandonAtReadyDoesNotFreezeQueue).
+func TestReaper_AdvancesNowServingForWindowGhost(t *testing.T) {
 	wr := &WaitingRoom{}
 	if err := wr.Init(5); err != nil {
 		t.Fatal(err)
@@ -958,11 +989,8 @@ func TestReaper_DoesNotAdvanceNowServingForWindowTicket(t *testing.T) {
 	if _, ok := wr.tokens.get("window-ghost"); ok {
 		t.Error("expected window-ghost token to be evicted")
 	}
-
-	if wr.nowServing.Load() != before {
-		t.Errorf("nowServing advanced for a within-window ghost: before=%d after=%d (cap=5) — "+
-			"this would inflate capacity beyond configured limit",
-			before, wr.nowServing.Load())
+	if got := wr.nowServing.Load(); got != before+1 {
+		t.Errorf("expected nowServing=%d after retiring an in-window ghost, got %d", before+1, got)
 	}
 }
 
@@ -996,8 +1024,10 @@ func TestSetReaperInterval_InvalidRange(t *testing.T) {
 	}
 	defer wr.Stop()
 
+	// 0 is no longer invalid — it restores the default. See
+	// TestSetReaperInterval_ZeroRestoresDefault.
 	cases := []time.Duration{
-		0,
+		-time.Second,
 		time.Millisecond,
 		reaperMinInterval - time.Nanosecond,
 		reaperMaxInterval + time.Nanosecond,
@@ -1010,6 +1040,24 @@ func TestSetReaperInterval_InvalidRange(t *testing.T) {
 		if _, ok := err.(ErrReaperInterval); !ok {
 			t.Errorf("expected ErrReaperInterval for %s, got %T", d, err)
 		}
+	}
+}
+
+func TestSetReaperInterval_ZeroRestoresDefault(t *testing.T) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(5); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	if err := wr.SetReaperInterval(30 * time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if err := wr.SetReaperInterval(0); err != nil {
+		t.Fatalf("SetReaperInterval(0) should restore the default, got error %v", err)
+	}
+	if got := wr.ReaperInterval(); got != DefaultReaperInterval {
+		t.Errorf("expected %s after SetReaperInterval(0), got %s", DefaultReaperInterval, got)
 	}
 }
 

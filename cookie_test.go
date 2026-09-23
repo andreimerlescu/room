@@ -138,11 +138,12 @@ func TestProbeCookie_MatchesTicketCookieAttributes(t *testing.T) {
 	}
 }
 
-// TestProbeCookie_RefreshedOnResumeRender verifies the probe is re-sent when a
-// returning client is served an updated position. The probe has a finite
-// MaxAge; if it expired while the ticket remained valid the page would show a
-// false "cookies disabled" panel.
-func TestProbeCookie_RefreshedOnResumeRender(t *testing.T) {
+// TestCookies_RefreshedOnResumeRender replaces
+// TestProbeCookie_RefreshedOnResumeRender. A returning client reloading the
+// waiting page must receive BOTH cookies with a fresh MaxAge: an expired
+// room_ticket makes the next poll report cookies_required, and an expired
+// probe makes the page show a false "cookies disabled" panel.
+func TestCookies_RefreshedOnResumeRender(t *testing.T) {
 	wr := newTestWR(t, 1)
 
 	serving := make(chan struct{}, 1)
@@ -158,8 +159,19 @@ func TestProbeCookie_RefreshedOnResumeRender(t *testing.T) {
 	}
 
 	_, cookies := cookiesByName(r, token)
+
 	if _, ok := cookies[probeCookieName]; !ok {
 		t.Errorf("expected %q to be refreshed on the resume render", probeCookieName)
+	}
+	ticket, ok := cookies[cookieName]
+	if !ok {
+		t.Fatalf("expected %q to be refreshed on the resume render", cookieName)
+	}
+	if ticket.Value != token {
+		t.Errorf("resume render must re-send the same ticket, got %q want %q", ticket.Value, token)
+	}
+	if want := int(wr.TokenTTL().Seconds()); ticket.MaxAge != want {
+		t.Errorf("expected MaxAge %d, got %d", want, ticket.MaxAge)
 	}
 }
 
@@ -330,8 +342,10 @@ func TestSetTokenTTL_ValidRange(t *testing.T) {
 func TestSetTokenTTL_InvalidRange(t *testing.T) {
 	wr := newTestWR(t, 5)
 
+	// 0 is no longer invalid — it restores the default. See
+	// TestSetTokenTTL_ZeroRestoresDefault.
 	cases := []time.Duration{
-		0,
+		-time.Second,
 		time.Second,
 		tokenTTLMin - time.Nanosecond,
 		tokenTTLMax + time.Nanosecond,
@@ -345,6 +359,23 @@ func TestSetTokenTTL_InvalidRange(t *testing.T) {
 		if _, ok := err.(ErrTokenTTL); !ok {
 			t.Errorf("expected ErrTokenTTL for %s, got %T", d, err)
 		}
+	}
+}
+
+func TestSetTokenTTL_ZeroRestoresDefault(t *testing.T) {
+	wr := newTestWR(t, 5)
+
+	if err := wr.SetTokenTTL(time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	if err := wr.SetTokenTTL(0); err != nil {
+		t.Fatalf("SetTokenTTL(0) should restore the default, got error %v", err)
+	}
+	if got := wr.TokenTTL(); got != DefaultTokenTTL {
+		t.Errorf("expected %s after SetTokenTTL(0), got %s", DefaultTokenTTL, got)
+	}
+	if DefaultTokenTTL != defaultTokenTTL {
+		t.Errorf("exported and internal defaults diverged: %s vs %s", DefaultTokenTTL, defaultTokenTTL)
 	}
 }
 

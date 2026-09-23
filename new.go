@@ -32,6 +32,10 @@ import (
 //	defer wr.Stop()
 //	wr.RegisterRoutes(r)
 //
+// Each call creates a new WaitingRoom with its own reaper. To share one
+// queue across several engines, construct a single WaitingRoom and call
+// RegisterRoutes on each engine instead.
+//
 // Related: WaitingRoom.RegisterRoutes, WaitingRoom.Middleware
 func NewWaitingRoom(r *gin.Engine, cap int32) gin.HandlerFunc {
 	wr := &WaitingRoom{}
@@ -71,6 +75,10 @@ func NewWaitingRoomFromStruct(wr *WaitingRoom) gin.HandlerFunc {
 // any goroutines start serving traffic. For runtime capacity changes use
 // SetCap; for runtime reaper changes use SetReaperInterval.
 //
+// The WaitingRoom is marked initialised only after every field has been
+// set and the reaper has started, so a request that observes it as
+// initialised never sees a partially constructed room.
+//
 // Returns ErrInvalidCap if cap < 1.
 //
 // Related: WaitingRoom.Stop, WaitingRoom.SetCap
@@ -88,11 +96,13 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.tokens = newTokenStore()
 	wr.tokens.setTTL(defaultTokenTTL)
 	wr.passes = newPassStore()
+	wr.ledger = newGhostLedger()
 	wr.reaperRestart = make(chan struct{}, 1)
 	wr.nowServing.Store(0)
 	wr.nextTicket.Store(0)
 	wr.occupancy.Store(0)
 	wr.reaperInterval.Store(int64(reaperInterval))
+	wr.firstPollGrace.Store(int64(defaultFirstPollGrace))
 	wr.secureCookie.Store(secureCookieDefault)
 	wr.maxQueueDepth.Store(defaultMaxQueueDepth)
 	wr.cookiePath.Store("/")
@@ -101,12 +111,13 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.promoteInsert.Store(math.MaxInt64)
 	wr.skipURL.Store("")
 	wr.passDuration.Store(int64(defaultPassDuration))
-	wr.initialised.Store(true)
 	wr.callbacks = newCallbackRegistry()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	wr.stopReaper = cancel
 	wr.startReaper(ctx)
+
+	wr.initialised.Store(true)
 
 	return nil
 }
@@ -144,23 +155,32 @@ func (wr *WaitingRoom) SetSecureCookie(secure bool) {
 }
 
 // SetTokenTTL sets the sliding-window lifetime of a queued client's
-// token. The window is reset on every successful /queue/status poll, so
-// an actively waiting client is never reaped no matter how long it waits;
-// the TTL governs only how long an ABANDONED token lingers.
+// token. The window is reset on every poll and every waiting-page render,
+// so an actively waiting client is never reaped no matter how long it
+// waits; the TTL governs only how long an ABANDONED token lingers.
 //
 // Lower values reclaim ghost tickets faster and keep QueueDepth honest —
 // which matters because QueueDepth drives displayed positions, surge
 // pricing via RateFunc, and the SetMaxQueueDepth circuit breaker. Higher
 // values let a client close the tab and return to the same position.
+// For clients that never come back at all, SetFirstPollGrace reclaims
+// their tickets much sooner than any TTL.
 //
-// The token TTL is also used as the MaxAge of the room_ticket cookie.
+// The token TTL is also used as the MaxAge of the room_ticket and
+// room_probe cookies, which are re-sent during the wait so they never
+// expire while the client is still polling.
 //
-// Valid range: 30s – 24h. Values outside this range return ErrTokenTTL.
+// Passing 0 restores DefaultTokenTTL. Otherwise the valid range is
+// 30s – 24h; values outside it (including negative values) return
+// ErrTokenTTL.
 //
 // Safe to call at any time.
 //
-// Related: TokenTTL, SetReaperInterval, SetMaxQueueDepth
+// Related: TokenTTL, DefaultTokenTTL, SetReaperInterval, SetFirstPollGrace, SetMaxQueueDepth
 func (wr *WaitingRoom) SetTokenTTL(d time.Duration) error {
+	if d == 0 {
+		d = DefaultTokenTTL
+	}
 	if d < tokenTTLMin || d > tokenTTLMax {
 		return ErrTokenTTL{Given: d, Min: tokenTTLMin, Max: tokenTTLMax}
 	}
@@ -182,10 +202,15 @@ func (wr *WaitingRoom) TokenTTL() time.Duration {
 // A value of 0 disables the limit (unlimited queue depth). This is the
 // default. Negative values return ErrInvalidMaxQueueDepth.
 //
-// The limit is evaluated against two independent measures — the ticket-
-// counter derived QueueDepth and the live token count — so that a flood
-// of abandoned arrivals cannot consume the entire budget on paper and
-// reject real clients.
+// The limit trips when EITHER of two measures reaches it — the ticket-
+// counter QueueDepth or the live token count — so the higher of the two
+// always wins and the breaker is deliberately pessimistic. Abandoned and
+// cookieless arrivals count toward both until they are reaped; enable
+// SetFirstPollGrace to reclaim clients that never come back within
+// seconds, tighten SetReaperInterval and SetTokenTTL to reclaim the rest
+// faster, or remove known-bad clients immediately with RemoveToken.
+// Clients that already hold a live room_ticket are never rejected by the
+// breaker.
 //
 // Safe to call at any time including while requests are in flight.
 func (wr *WaitingRoom) SetMaxQueueDepth(max int64) error {
@@ -203,8 +228,8 @@ func (wr *WaitingRoom) MaxQueueDepth() int64 {
 
 // LiveQueueDepth returns the number of queued clients that currently hold
 // a token in the token store. Unlike QueueDepth, which is derived from the
-// monotonic ticket counter and includes tickets burned by clients that
-// never returned, this reflects only clients the server can still admit.
+// monotonic ticket counter, this reflects only clients the server can
+// still admit (including ones already told ready that have not reloaded).
 //
 // Prefer this for dashboards where an inflated number would be misleading.
 //
@@ -309,15 +334,17 @@ func (wr *WaitingRoom) PassDuration() time.Duration {
 // (passes disabled), GrantPass returns an empty string and no pass is
 // created.
 //
-// Typical usage in your payment confirmation handler:
+// PromoteToken and PromoteTokenToFront already call GrantPass and return
+// the token in PromoteResult.PassToken; call GrantPass directly only when
+// issuing a pass outside a promotion. Typical usage in your payment
+// confirmation handler:
 //
-//	cost, err := wr.PromoteTokenToFront(ticketToken)
+//	result, err := wr.PromoteTokenToFront(ticketToken)
 //	if err != nil { ... }
-//	passToken := wr.GrantPass()
-//	if passToken != "" {
+//	if result.PassToken != "" {
 //	    http.SetCookie(w, &http.Cookie{
 //	        Name:     "room_pass",
-//	        Value:    passToken,
+//	        Value:    result.PassToken,
 //	        Path:     wr.CookiePath(),
 //	        MaxAge:   int(wr.PassDuration().Seconds()),
 //	        HttpOnly: true,

@@ -2,6 +2,21 @@ package room
 
 import "time"
 
+// Exported defaults. Passing 0 to the corresponding setter restores these
+// values, so callers can express "use the default" without hard-coding
+// them.
+const (
+	// DefaultTokenTTL is the default sliding-window lifetime of a queued
+	// client's token. SetTokenTTL(0) restores it.
+	//
+	// See defaultTokenTTL for the reasoning behind the value.
+	DefaultTokenTTL = 5 * time.Minute
+
+	// DefaultReaperInterval is the default interval between eviction
+	// passes. SetReaperInterval(0) restores it.
+	DefaultReaperInterval = 5 * time.Minute
+)
+
 const (
 	// cookieName is the HTTP-only session cookie issued to queued clients.
 	cookieName = "room_ticket"
@@ -35,11 +50,11 @@ const (
 
 	// defaultTokenTTL is the default lifetime of a queued client's token.
 	//
-	// This is a SLIDING window: StatusHandler calls touchIssuedAt on every
-	// successful poll, so an actively waiting client refreshes its token
-	// roughly every 3 seconds and is never reaped regardless of how long
-	// it waits. The TTL therefore only needs to cover a small multiple of
-	// the poll interval, not the expected total wait.
+	// This is a SLIDING window: every poll and every waiting-page render
+	// resets it, so an actively waiting client refreshes its token roughly
+	// every 3 seconds and is never reaped regardless of how long it waits.
+	// The TTL therefore only needs to cover a small multiple of the poll
+	// interval, not the expected total wait.
 	//
 	// It was formerly 30 minutes, which meant every abandoned or cookieless
 	// client's token occupied the store for half an hour, inflating
@@ -48,8 +63,8 @@ const (
 	// preserves the "close the laptop for a moment" case while bounding
 	// ghost residency at roughly 1/6 of the previous worst case.
 	//
-	// Tune with SetTokenTTL.
-	defaultTokenTTL = 5 * time.Minute
+	// Tune with SetTokenTTL. Exported as DefaultTokenTTL.
+	defaultTokenTTL = DefaultTokenTTL
 
 	// cookieTTL is retained as the package-internal default token lifetime
 	// for backwards compatibility with existing call sites and tests.
@@ -70,7 +85,8 @@ const (
 	tokenBytes = 16
 
 	// reaperInterval is the default interval between eviction passes.
-	reaperInterval = 5 * time.Minute
+	// Exported as DefaultReaperInterval.
+	reaperInterval = DefaultReaperInterval
 
 	// reaperMinInterval is the minimum value accepted by SetReaperInterval.
 	reaperMinInterval = 5 * time.Second
@@ -83,6 +99,21 @@ const (
 	// this many, so all expired tokens are cleared in a single reap() call
 	// regardless of total volume.
 	reaperBatchSize = 1000
+
+	// defaultFirstPollGrace is the default first-poll grace: 0, disabled.
+	// Existing deployments see no change unless they opt in.
+	defaultFirstPollGrace = 0
+
+	// firstPollGraceMin is the minimum non-zero value accepted by
+	// SetFirstPollGrace. The default page first polls 3–3.5s after it
+	// loads; anything much shorter would reap real visitors on slow
+	// connections before their first poll lands.
+	firstPollGraceMin = 10 * time.Second
+
+	// firstPollGraceMax is the maximum value accepted by SetFirstPollGrace.
+	// Values at or above TokenTTL are accepted but have no effect, since
+	// the TTL reaps the token first.
+	firstPollGraceMax = 24 * time.Hour
 
 	// secureCookieDefault is the default value for the Secure cookie flag.
 	// Set to false so that plain-HTTP local development works out of the box.

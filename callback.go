@@ -32,22 +32,35 @@ const (
 	// previously throttled upstream.
 	EventDrain
 
-	// EventQueue fires when an arriving request cannot be admitted immediately
-	// and is issued a ticket for the waiting room.
+	// EventQueue fires when an arriving request cannot be admitted
+	// immediately and is issued a ticket for the waiting room. The
+	// Snapshot carries the issued Token, its ClientKey, and StaleTicket
+	// (whether the request presented a room_ticket the room did not
+	// recognise).
 	EventQueue
 
-	// EventEvict fires when the reaper removes an expired token from the
-	// token store. The associated ticket is considered abandoned.
+	// EventEvict fires when an expired token is removed and its ticket is
+	// considered abandoned: either by the reaper (once per eviction batch
+	// that removed anything) or by /queue/status discovering the expiry
+	// on a poll (once per such token). Evictions of tickets already inside
+	// the serving window are included.
 	EventEvict
 
-	// EventTimeout fires when a queued request's context is cancelled or
-	// its deadline expires before a slot becomes available.
+	// EventTimeout fires when a request's context is cancelled or its
+	// deadline expires before it could acquire a slot.
 	EventTimeout
 
 	// EventPromote fires when a queued token is promoted to a higher
-	// position via PromoteToken. Use this to track revenue events or
-	// log queue jumps for fairness monitoring.
+	// position via PromoteToken or a VIP pass. Use this to track revenue
+	// events or log queue jumps for fairness monitoring.
 	EventPromote
+
+	// EventRemove fires when the application removes queued tickets via
+	// RemoveToken (once per successful call, with Token and ClientKey set)
+	// or RemoveTokensFunc (once per call that removed at least one ticket,
+	// with Token empty). It is distinct from EventEvict so that deliberate
+	// removals — bans, kicks — are not counted as abandonment.
+	EventRemove
 )
 
 // String returns the canonical name of the Event, suitable for logging.
@@ -69,6 +82,8 @@ func (e Event) String() string {
 		return "Timeout"
 	case EventPromote:
 		return "Promote"
+	case EventRemove:
+		return "Remove"
 	default:
 		return "Unknown"
 	}
@@ -76,7 +91,7 @@ func (e Event) String() string {
 
 // Snapshot is a point-in-time view of the WaitingRoom delivered to every
 // callback. All fields are copied at trigger time and are safe to read
-// after the room's state has changed.
+// after the room's state has changed. Snapshot is comparable.
 type Snapshot struct {
 	// Event is the lifecycle event that produced this snapshot.
 	Event Event
@@ -90,6 +105,27 @@ type Snapshot struct {
 
 	// QueueDepth is the number of requests currently waiting for a slot.
 	QueueDepth int64
+
+	// Token is the room_ticket value of the single ticket the event
+	// concerns, when there is exactly one: the newly issued ticket for
+	// EventQueue, and the removed ticket for EventRemove raised by
+	// RemoveToken. Empty for all other events.
+	//
+	// It is the client's bearer credential for its queue position: treat
+	// it as a secret — do not log it or send it off-host.
+	Token string
+
+	// ClientKey is the SetClientKeyFunc key of the ticket in Token, or ""
+	// if Token is empty or no key function was registered.
+	ClientKey string
+
+	// StaleTicket is set on EventQueue when the arriving request carried a
+	// room_ticket cookie that the room did not recognise — typically a
+	// previously admitted visitor returning, a ticket that expired or was
+	// removed, or a ticket from before a restart. It is false when the
+	// request carried no room_ticket at all, which is the signature of a
+	// client that is discarding cookies.
+	StaleTicket bool
 }
 
 // Full returns true when Occupancy equals or exceeds Capacity.
@@ -120,6 +156,11 @@ func newCallbackRegistry() *callbackRegistry {
 // may be registered for the same event; all are invoked, each in its own
 // goroutine, in registration order. On is safe for concurrent use and may
 // be called after the WaitingRoom is running.
+//
+// Because every handler runs in a fresh goroutine, a handler for a
+// high-frequency event (EventEnter, EventQueue) that blocks on I/O can
+// accumulate goroutines during a traffic burst. Keep such handlers
+// non-blocking — increment a counter or send on a buffered channel.
 //
 // Example — scale out when the room is full:
 //
@@ -171,4 +212,14 @@ func (wr *WaitingRoom) snapshot(event Event) Snapshot {
 		Capacity:   int(wr.Cap()),
 		QueueDepth: wr.QueueDepth(),
 	}
+}
+
+// snapshotFor builds a Snapshot for an event that concerns one specific
+// ticket.
+func (wr *WaitingRoom) snapshotFor(event Event, token, clientKey string, staleTicket bool) Snapshot {
+	s := wr.snapshot(event)
+	s.Token = token
+	s.ClientKey = clientKey
+	s.StaleTicket = staleTicket
+	return s
 }

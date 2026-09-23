@@ -81,52 +81,6 @@ func TestReap_MixedExpiredAndLive(t *testing.T) {
 
 // ── reap() — nowServing advancement ──────────────────────────────────────────
 
-func TestReap_AdvancesNowServingOnlyForOutOfWindowTickets(t *testing.T) {
-	// cap=2, nowServing=0 → window is tickets [1..2].
-	wr := newTestWR(t, 2)
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
-
-	// Inside window — must NOT advance nowServing.
-	wr.tokens.set("inside", ticketEntry{ticket: 1, issuedAt: expired})
-	// Outside window — must advance nowServing.
-	wr.tokens.set("outside-1", ticketEntry{ticket: 10, issuedAt: expired})
-	wr.tokens.set("outside-2", ticketEntry{ticket: 20, issuedAt: expired})
-
-	before := wr.nowServing.Load()
-	wr.reap()
-
-	// 2 out-of-window tickets evicted → nowServing should advance by 2.
-	expected := before + 2
-	if got := wr.nowServing.Load(); got != expected {
-		t.Errorf("expected nowServing=%d, got %d", expected, got)
-	}
-}
-
-func TestReap_DoesNotAdvanceNowServingForWindowTickets(t *testing.T) {
-	// cap=10, nowServing=0 → window is tickets [1..10].
-	wr := newTestWR(t, 10)
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
-
-	for i := int64(1); i <= 5; i++ {
-		wr.tokens.set(fmt.Sprintf("win-%d", i), ticketEntry{
-			ticket:   i,
-			issuedAt: expired,
-		})
-	}
-
-	before := wr.nowServing.Load()
-	wr.reap()
-
-	if wr.nowServing.Load() != before {
-		t.Errorf("nowServing advanced for within-window tickets: before=%d after=%d",
-			before, wr.nowServing.Load())
-	}
-	// Tokens should still be evicted even if nowServing doesn't advance.
-	if wr.tokens.len() != 0 {
-		t.Errorf("expected all tokens evicted, got %d remaining", wr.tokens.len())
-	}
-}
-
 // ── reap() — multi-batch looping ─────────────────────────────────────────────
 
 func TestReap_ClearsMoreThanOneBatch(t *testing.T) {
@@ -197,9 +151,76 @@ func TestReap_DoesNotFireEventEvictWhenNothingExpired(t *testing.T) {
 	}
 }
 
-func TestReap_DoesNotFireEventEvictForWindowOnlyEvictions(t *testing.T) {
-	// When only within-window tokens are evicted, nowServing doesn't
-	// advance, so EventEvict should not fire (evicted == 0 in the code).
+// TestReap_RetiresInWindowNowAndOutOfWindowViaLedger replaces
+// TestReap_AdvancesNowServingOnlyForOutOfWindowTickets. In-window ghosts
+// are skipped immediately; out-of-window ghosts wait in the ledger, yet
+// positions behind them and QueueDepth improve at once.
+func TestReap_RetiresInWindowNowAndOutOfWindowViaLedger(t *testing.T) {
+	// cap=2, nowServing=0 → window is tickets [1..2].
+	wr := newTestWR(t, 2)
+	expired := time.Now().Add(-(cookieTTL + time.Minute))
+
+	wr.nextTicket.Store(25)
+	wr.tokens.set("inside", ticketEntry{ticket: 1, issuedAt: expired})
+	wr.tokens.set("outside-1", ticketEntry{ticket: 10, issuedAt: expired})
+	wr.tokens.set("outside-2", ticketEntry{ticket: 20, issuedAt: expired})
+	wr.tokens.set("live", ticketEntry{ticket: 25, issuedAt: time.Now()})
+
+	if pos := wr.positionOf(25); pos != 23 {
+		t.Fatalf("setup: expected position 23, got %d", pos)
+	}
+
+	wr.reap()
+
+	if ns := wr.nowServing.Load(); ns != 1 {
+		t.Errorf("expected nowServing=1 (only the in-window ghost skipped now), got %d", ns)
+	}
+	if l := wr.ledger.len(); l != 2 {
+		t.Errorf("expected 2 out-of-window ghosts pending, got %d", l)
+	}
+	// 25 - 1 (nowServing) - 2 (cap) - 2 (ghosts ahead) = 20
+	if pos := wr.positionOf(25); pos != 20 {
+		t.Errorf("expected position 20 after reap, got %d", pos)
+	}
+	if d := wr.QueueDepth(); d != 20 {
+		t.Errorf("expected QueueDepth 20 after reap, got %d", d)
+	}
+}
+
+// TestReap_AdvancesNowServingForWindowTickets replaces
+// TestReap_DoesNotAdvanceNowServingForWindowTickets. A token in the store
+// has not been admitted, so an in-window ghost holds no semaphore slot;
+// not advancing for it permanently removed a slot from the window.
+func TestReap_AdvancesNowServingForWindowTickets(t *testing.T) {
+	// cap=10, nowServing=0 → window is tickets [1..10].
+	wr := newTestWR(t, 10)
+	expired := time.Now().Add(-(cookieTTL + time.Minute))
+
+	for i := int64(1); i <= 5; i++ {
+		wr.tokens.set(fmt.Sprintf("win-%d", i), ticketEntry{
+			ticket:   i,
+			issuedAt: expired,
+		})
+	}
+
+	before := wr.nowServing.Load()
+	wr.reap()
+
+	if got := wr.nowServing.Load(); got != before+5 {
+		t.Errorf("expected nowServing=%d after retiring 5 in-window ghosts, got %d", before+5, got)
+	}
+	if wr.tokens.len() != 0 {
+		t.Errorf("expected all tokens evicted, got %d remaining", wr.tokens.len())
+	}
+	if l := wr.ledger.len(); l != 0 {
+		t.Errorf("expected empty ledger, got %d", l)
+	}
+}
+
+// TestReap_FiresEventEvictForWindowOnlyEvictions replaces
+// TestReap_DoesNotFireEventEvictForWindowOnlyEvictions. In-window ghosts
+// are now retired like any other, so the eviction is reported.
+func TestReap_FiresEventEvictForWindowOnlyEvictions(t *testing.T) {
 	wr := newTestWR(t, 10)
 
 	var evictCount atomic.Int32
@@ -210,10 +231,7 @@ func TestReap_DoesNotFireEventEvictForWindowOnlyEvictions(t *testing.T) {
 
 	wr.reap()
 
-	time.Sleep(50 * time.Millisecond)
-	if evictCount.Load() != 0 {
-		t.Errorf("EventEvict fired for within-window eviction (no queue advancement), got %d", evictCount.Load())
-	}
+	waitForCount(t, &evictCount, 1, 200*time.Millisecond)
 }
 
 // ── reapBatch() — TOCTOU double-check ────────────────────────────────────────

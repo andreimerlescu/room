@@ -9,6 +9,12 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// cookieRefreshDivisor sets how often, relative to TokenTTL, a waiting
+// client's cookies are re-sent on status polls: at most once per
+// TokenTTL/cookieRefreshDivisor. With 3, two consecutive refresh
+// responses can be lost before the browser cookie expires.
+const cookieRefreshDivisor = 3
+
 // StatusHandler returns a gin.HandlerFunc that serves /queue/status.
 // Register it on your router BEFORE the WaitingRoom middleware so that
 // polling requests from the waiting room page bypass the queue entirely.
@@ -19,11 +25,27 @@ import (
 // request and either enters or re-queues cleanly. If the cookie is absent
 // entirely, it returns cookies_required=true instead — see below.
 //
-// Each successful status poll (where the client is still actively waiting)
-// refreshes the token's issuedAt timestamp, preventing the reaper from
-// evicting tokens that belong to actively polling clients. This makes the
-// effective TTL a sliding window from the last poll rather than a fixed
-// window from initial issuance.
+// A token found expired on poll is retired (so its place in the serving
+// window is not lost) and EventEvict fires, exactly as if the reaper had
+// found it.
+//
+// # Keep-alive
+//
+// Every poll for a live token — including a rate-limited one — refreshes
+// the token's sliding TTL and marks it seen, so an actively polling
+// client is never reaped. The whole poll is applied under a single lock;
+// see tokenStore.poll.
+//
+// # Cookie refresh
+//
+// room_ticket and room_probe are issued with MaxAge = TokenTTL, and the
+// waiting page never reloads while it polls. To stop the browser from
+// discarding them during a long wait, an accepted poll from a client that
+// is still waiting re-sends both cookies — same value, same attributes,
+// fresh MaxAge — at most once per TokenTTL/3. Rate-limited responses
+// never carry Set-Cookie.
+//
+// # Rate limit
 //
 // A per-token rate limit prevents clients from hammering this endpoint
 // faster than statusPollMinInterval. Polls arriving too quickly receive
@@ -68,46 +90,56 @@ func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 			return
 		}
 
-		// Use deleteIfExpired to atomically check and remove in a single
-		// write-lock scope, eliminating the TOCTOU window between a
-		// separate isExpired check and delete.
-		if wr.tokens.deleteIfExpired(cookie.Value) {
+		now := time.Now()
+		edge := wr.nowServing.Load() + int64(wr.cap.Load())
+		res := wr.tokens.poll(
+			cookie.Value,
+			now,
+			edge,
+			statusPollMinInterval,
+			wr.TokenTTL()/cookieRefreshDivisor,
+		)
+
+		switch res.outcome {
+		case pollUnknown:
+			// Admitted, removed, reaped, or from another process —
+			// send the client back to the main handler.
 			c.JSON(http.StatusOK, statusResponse{Ready: true})
+			return
+
+		case pollExpired:
+			// The removed entry is ours alone, so we retire its ticket:
+			// without this, an expired ticket discovered here would never
+			// advance the window and would permanently occupy a slot.
+			wr.retire(res.entry.ticket)
+			wr.emit(EventEvict, wr.snapshot(EventEvict))
+			c.JSON(http.StatusOK, statusResponse{Ready: true})
+			return
+
+		case pollRateLimited:
+			// Shed the excess poll. The token was still kept alive by
+			// poll, so a fast poller is throttled, not reaped.
+			c.Header("Retry-After", "1")
+			c.JSON(http.StatusTooManyRequests, statusResponse{
+				Ready:    false,
+				Position: wr.positionOf(res.entry.ticket),
+			})
 			return
 		}
 
-		entry, ok := wr.tokens.get(cookie.Value)
-		if !ok {
-			// Token was deleted between deleteIfExpired and get — treat
-			// as expired/admitted.
-			c.JSON(http.StatusOK, statusResponse{Ready: true})
-			return
+		// Accepted poll. Re-send cookies first (headers must precede the
+		// body) if poll decided they are due.
+		if res.refreshCookie {
+			secure := wr.cookieSecure(c.Request)
+			wr.setTicketCookie(c, cookie.Value, secure)
+			wr.setProbeCookie(c, secure)
 		}
 
-		// Per-token poll rate limiting. If the client is polling faster
-		// than statusPollMinInterval, return 429 with a Retry-After
-		// header to shed excess load without touching the token store
-		// write lock repeatedly.
-		if prevPoll, found := wr.tokens.touchLastPoll(cookie.Value); found {
-			if !prevPoll.IsZero() && time.Since(prevPoll) < statusPollMinInterval {
-				c.Header("Retry-After", "1")
-				c.JSON(http.StatusTooManyRequests, statusResponse{
-					Ready:    false,
-					Position: wr.positionOf(entry.ticket),
-				})
-				return
-			}
-		}
-
-		position := wr.positionOf(entry.ticket)
+		position := wr.positionOf(res.entry.ticket)
 		if position <= 0 {
 			c.JSON(http.StatusOK, statusResponse{Ready: true})
 			return
 		}
-
-		// Client is still actively waiting — refresh the sliding TTL so
-		// that the reaper does not evict tokens from polling clients.
-		wr.tokens.touchIssuedAt(cookie.Value)
 
 		// Check if the client has a valid VIP pass.
 		hasPass := false
@@ -137,21 +169,49 @@ func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 	}
 }
 
-// positionOf returns the raw queue position for a ticket. A value <= 0
-// means the ticket is within the serving window and eligible for admission.
-// Callers that need a display-safe value (minimum 1) should clamp separately.
+// positionOf returns the queue position for a ticket.
 //
-// This is the single authoritative formula for queue position used by both
-// StatusHandler and Middleware. Having one implementation prevents the two
-// call sites from silently diverging during future edits.
+// A value <= 0 means the ticket is within the serving window and eligible
+// for admission; this is exactly the ticketReady condition, so the status
+// endpoint and the middleware can never disagree about readiness.
+//
+// For a waiting ticket the value is the raw distance past the window edge
+// minus the retired tickets (ghost ledger entries) ahead of it, clamped to
+// a minimum of 1. The subtraction is what makes positions behind a
+// removed or abandoned ticket improve immediately, while positions ahead
+// of it are unaffected.
+//
+// This is the single authoritative formula for queue position used by
+// StatusHandler, Middleware and the promotion code. Having one
+// implementation prevents the call sites from silently diverging.
 func (wr *WaitingRoom) positionOf(ticket int64) int64 {
-	return ticket - wr.nowServing.Load() - int64(wr.cap.Load())
+	raw := ticket - wr.nowServing.Load() - int64(wr.cap.Load())
+	if raw <= 0 {
+		return raw
+	}
+	pos := raw - wr.ledger.countBelow(ticket)
+	if pos < 1 {
+		pos = 1
+	}
+	return pos
 }
 
 // RegisterRoutes registers GET /queue/status on the given gin.Engine and
 // then attaches the WaitingRoom middleware. It ensures the status endpoint
 // always bypasses the queue — if you register routes manually, always add
 // StatusHandler before Use(Middleware()).
+//
+// # Multiple engines
+//
+// RegisterRoutes may be called on any number of gin.Engines for the same
+// WaitingRoom — for example, building a fresh engine per configuration
+// "generation" and swapping it in atomically. It is side-effect free with
+// respect to the WaitingRoom: it starts no goroutines (the reaper belongs
+// to Init), registers no callbacks, and keeps no per-engine state; every
+// engine's handlers are closures over the same shared WaitingRoom, so
+// in-flight requests on an old engine and new requests on a new one see
+// one queue. Calling it twice on the SAME engine panics, because gin
+// rejects duplicate route registrations.
 //
 // # CORS note
 //
@@ -167,7 +227,8 @@ func (wr *WaitingRoom) positionOf(ticket int64) int64 {
 // Note that a cross-origin deployment must also send credentials on the
 // polling fetch and allow them in the CORS response, or the room_ticket
 // cookie will not accompany the poll and every client will be reported
-// as cookieless.
+// as cookieless — and cookie refreshes on poll responses will not be
+// stored.
 //
 // Usage:
 //
