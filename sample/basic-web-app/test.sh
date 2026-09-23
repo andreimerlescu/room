@@ -7,8 +7,9 @@
 #   bash test.sh
 #
 # The script builds and starts the server, runs a load test, prints a
-# live dashboard, then shuts everything down. Open http://localhost:8080/
-# in a browser while it runs to see yourself in the queue.
+# live dashboard and a snapshot of the operator view (/admin/queue), then
+# shuts everything down. Open http://localhost:8080/ in a browser while it
+# runs to see yourself in the queue.
 #
 # Requirements:
 #   bash  >= 5.2
@@ -53,6 +54,9 @@ CONCURRENCY="${CONCURRENCY:-30}"
 DURATION_SECS="${DURATION_SECS:-30}"
 RAMP_DELAY_MS="${RAMP_DELAY_MS:-50}"
 
+# Room lifecycle tags as printed by main.go's roomLog, e.g. "[ FULL    ]".
+EVENT_PATTERN='\[ (FULL|DRAIN|QUEUE|ENTER|EXIT|EVICT|TIMEOUT|PROMOTE|REMOVE)'
+
 # ── Colors ───────────────────────────────────────────────────────────
 
 RED='\033[0;31m'
@@ -68,16 +72,26 @@ RESET='\033[0m'
 #
 # Each client session touches a unique file in a per-event directory.
 # The dashboard counts files. Lock-free, atomic, works everywhere.
+#
+#   sent      every session
+#   served    every session that ended with a 200 (direct or after queuing)
+#   queued    every session that landed in the waiting room
+#   dequeued  every queued session that has finished (admitted or gave up)
+#   errors    every session that ended without a 200
 
 TMPDIR_TEST="$(mktemp -d)"
 
-mkdir -p "${TMPDIR_TEST}/tally_sent"
-mkdir -p "${TMPDIR_TEST}/tally_served"
-mkdir -p "${TMPDIR_TEST}/tally_queued"
-mkdir -p "${TMPDIR_TEST}/tally_errors"
+for t in sent served queued dequeued errors; do
+    mkdir -p "${TMPDIR_TEST}/tally_${t}"
+done
 
 SERVER_PID=""
 SERVER_LOG="${TMPDIR_TEST}/server.log"
+
+# The server saves its queue on shutdown and restores it on startup. Keep
+# that file inside this run's temp dir so a previous run's dead clients are
+# never restored into the next test.
+STATE_FILE="${TMPDIR_TEST}/queue-state.json"
 
 # ── Cleanup ──────────────────────────────────────────────────────────
 
@@ -94,7 +108,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# ── Tally helpers (lock-free, subshell-safe) ─────────────────────────
+# ── Helpers ──────────────────────────────────────────────────────────
 
 tally() {
     local name="$1"
@@ -107,17 +121,23 @@ tally_count() {
     find "${TMPDIR_TEST}/tally_${name}" -type f 2>/dev/null | wc -l | tr -d ' '
 }
 
-# ── Safe grep count (always returns a plain integer) ─────────────────
-# grep -c can produce unexpected output on macOS with certain inputs.
-# This helper always returns a single integer on stdout.
+# sleep_ms sleeps for a whole number of milliseconds. Handles values of
+# 1000 and above correctly (1500 → "1.500", not "0.1500").
+sleep_ms() {
+    local ms="$1"
+    sleep "$(printf '%d.%03d' $((ms / 1000)) $((ms % 1000)))"
+}
 
+# grep_count prints the number of lines in FILE matching the extended
+# regex PATTERN, always as a single plain integer (0 when the file is
+# missing or nothing matches). grep -c exits 1 on zero matches, hence
+# the "|| true".
 grep_count() {
     local pattern="$1"
     local file="$2"
     local result
-    result=$(grep -c "$pattern" "$file" 2>/dev/null || true)
-    # Strip whitespace and take only the first line.
-    result=$(echo "$result" | head -1 | tr -d '[:space:]')
+    result=$(grep -cE -- "$pattern" "$file" 2>/dev/null || true)
+    result=$(head -1 <<< "$result" | tr -d '[:space:]')
     if [[ -z "$result" ]] || ! [[ "$result" =~ ^[0-9]+$ ]]; then
         echo "0"
     else
@@ -138,7 +158,7 @@ start_server() {
     go build -o "${TMPDIR_TEST}/basic-web-app" . 2>&1
 
     echo -e "${DIM}Starting server...${RESET}"
-    "${TMPDIR_TEST}/basic-web-app" > "$SERVER_LOG" 2>&1 &
+    ROOM_STATE_FILE="$STATE_FILE" "${TMPDIR_TEST}/basic-web-app" > "$SERVER_LOG" 2>&1 &
     SERVER_PID=$!
 
     local attempts=0
@@ -160,6 +180,10 @@ start_server() {
 }
 
 # ── Single client session ────────────────────────────────────────────
+#
+# Behaves like a browser: stores cookies from EVERY response, including
+# /queue/status polls — room re-sends room_ticket and room_probe on polls
+# so they never expire during a long wait.
 
 client_session() {
     local id="$1"
@@ -180,15 +204,15 @@ client_session() {
         local max_polls=40
         local poll_count=0
         while [[ $poll_count -lt $max_polls ]]; do
-            local jitter_ms=$(( (RANDOM % 1000) + 2500 ))
-            sleep "$(printf '%d.%03d' $((jitter_ms / 1000)) $((jitter_ms % 1000)))"
+            # Same cadence as the real page: 3s plus up to ~0.5s of jitter.
+            sleep_ms $(( (RANDOM % 500) + 3000 ))
 
             local status_json
-            status_json=$(curl -s -b "$cookie_jar" --max-time 5 \
+            status_json=$(curl -s -c "$cookie_jar" -b "$cookie_jar" --max-time 5 \
                 "${BASE_URL}/queue/status" 2>/dev/null || echo '{}')
 
             local ready
-            ready=$(echo "$status_json" | jq -r '.ready // false' 2>/dev/null || echo "false")
+            ready=$(jq -r '.ready // false' <<< "$status_json" 2>/dev/null || echo "false")
 
             if [[ "$ready" == "true" ]]; then
                 http_code=$(curl -s -o /dev/null -w '%{http_code}' \
@@ -201,6 +225,7 @@ client_session() {
                 else
                     tally "errors" "$id"
                 fi
+                tally "dequeued" "$id"
                 rm -f "$cookie_jar" "$body_file"
                 return
             fi
@@ -208,7 +233,9 @@ client_session() {
             ((poll_count++)) || true
         done
 
+        # Gave up waiting.
         tally "errors" "$id"
+        tally "dequeued" "$id"
     elif [[ "$http_code" == "200" ]]; then
         tally "served" "$id"
     else
@@ -224,10 +251,11 @@ print_dashboard() {
     local elapsed="$1"
     local phase="$2"
 
-    local c_sent c_served c_queued c_errors
+    local c_sent c_served c_queued c_dequeued c_errors
     c_sent=$(tally_count "sent")
     c_served=$(tally_count "served")
     c_queued=$(tally_count "queued")
+    c_dequeued=$(tally_count "dequeued")
     c_errors=$(tally_count "errors")
 
     local active
@@ -242,17 +270,45 @@ print_dashboard() {
         rps=$((c_served / elapsed))
     fi
 
-    local queue_now=$((c_queued - c_served - c_errors))
+    # Sessions currently waiting in the room.
+    local queue_now=$((c_queued - c_dequeued))
     if [[ $queue_now -lt 0 ]]; then queue_now=0; fi
 
     printf "\r  ${BOLD}[%3ds]${RESET} " "$elapsed"
     printf "${CYAN}sent:${RESET}%-4d " "$c_sent"
     printf "${GREEN}served:${RESET}%-4d " "$c_served"
-    printf "${YELLOW}queued:${RESET}%-4d " "$queue_now"
+    printf "${YELLOW}waiting:${RESET}%-4d " "$queue_now"
     printf "${RED}err:${RESET}%-3d " "$c_errors"
     printf "${MAGENTA}active:${RESET}%-3d " "$active"
     printf "${DIM}~%d req/s${RESET} " "$rps"
     printf "${DIM}[%s]${RESET}   " "$phase"
+}
+
+# ── Operator view ────────────────────────────────────────────────────
+#
+# Reads GET /admin/queue — the room's Queue() API behind a loopback-only
+# endpoint. Tokens are never exposed; visitors appear by position and
+# client key.
+
+print_admin_snapshot() {
+    echo -e "${BOLD}Operator view (GET /admin/queue?limit=5):${RESET}"
+    echo -e "${DIM}──────────────────────────────────────────────────────────────────────${RESET}"
+
+    local json
+    json=$(curl -s --max-time 5 "${BASE_URL}/admin/queue?limit=5" 2>/dev/null || true)
+
+    if [[ -z "$json" ]] || ! jq -e . >/dev/null 2>&1 <<< "$json"; then
+        echo "  (admin view unavailable)"
+    else
+        jq -r '
+            "  occupancy \(.occupancy)/\(.cap)   queue_depth \(.queue_depth)   live \(.live_queue_depth)   first_poll_grace \(.first_poll_grace)",
+            (if (.tickets | length) == 0 then "  (nobody waiting)" else empty end),
+            (.tickets[] | "  pos \(.position)\tclient=\(.client_key)\twaiting=\(.waiting_for)\tseen=\(.seen)\tpromoted=\(.promoted)")
+        ' <<< "$json" || echo "  (could not parse admin view)"
+    fi
+
+    echo -e "${DIM}──────────────────────────────────────────────────────────────────────${RESET}"
+    echo ""
 }
 
 # ── Main ─────────────────────────────────────────────────────────────
@@ -299,7 +355,7 @@ main() {
 
         for (( i=0; i<batch_size; i++ )); do
             client_session "${wave}_${i}" &
-            sleep "$(printf '0.%03d' "$RAMP_DELAY_MS")" 2>/dev/null || sleep 0.05
+            sleep_ms "$RAMP_DELAY_MS"
         done
 
         local wave_start=$SECONDS
@@ -311,6 +367,10 @@ main() {
 
     echo ""
     echo ""
+
+    # Snapshot the line while it is at its deepest.
+    print_admin_snapshot
+
     echo -e "${YELLOW}⏳${RESET} Draining in-flight requests (up to 30s)..."
     echo ""
 
@@ -329,20 +389,28 @@ main() {
     echo ""
 
     # ── Server log highlights ────────────────────────────────────────
-    # The server log uses tags like "[ FULL    ]" with internal spaces,
-    # so we grep for the keyword anywhere on the line.
+    #
+    # Capture first, then trim with a here-string. Piping grep into head
+    # under `set -o pipefail` makes the pipeline "fail" whenever head
+    # stops reading early (grep gets SIGPIPE), which previously printed
+    # "(no lifecycle events captured)" right after printing the events.
 
     echo -e "${BOLD}Server lifecycle events:${RESET}"
     echo -e "${DIM}──────────────────────────────────────────────────────────────────────${RESET}"
     if [[ -f "$SERVER_LOG" ]]; then
-        # Match the actual log format: [ FULL   ], [ DRAIN  ], etc.
-        grep -E '(FULL|DRAIN|QUEUE|ENTER|EXIT|EVICT|TIMEOUT)' "$SERVER_LOG" \
-            | head -30 || echo "  (no lifecycle events captured)"
+        local events
+        events=$(grep -E -- "$EVENT_PATTERN" "$SERVER_LOG" 2>/dev/null || true)
 
-        local event_count
-        event_count=$(grep_count -E 'FULL|DRAIN|QUEUE|ENTER|EXIT|EVICT|TIMEOUT' "$SERVER_LOG")
-        if [[ "$event_count" -gt 30 ]]; then
-            echo -e "  ${DIM}... and $((event_count - 30)) more events${RESET}"
+        if [[ -z "$events" ]]; then
+            echo "  (no lifecycle events captured)"
+        else
+            head -30 <<< "$events"
+
+            local event_count
+            event_count=$(grep_count "$EVENT_PATTERN" "$SERVER_LOG")
+            if [[ "$event_count" -gt 30 ]]; then
+                echo -e "  ${DIM}... and $((event_count - 30)) more events${RESET}"
+            fi
         fi
     else
         echo "  (server log not found)"
@@ -352,11 +420,15 @@ main() {
 
     # ── Summary ──────────────────────────────────────────────────────
 
-    local c_sent c_served c_queued c_errors
+    local c_sent c_served c_queued c_dequeued c_errors
     c_sent=$(tally_count "sent")
     c_served=$(tally_count "served")
     c_queued=$(tally_count "queued")
+    c_dequeued=$(tally_count "dequeued")
     c_errors=$(tally_count "errors")
+
+    local still_waiting=$((c_queued - c_dequeued))
+    if [[ $still_waiting -lt 0 ]]; then still_waiting=0; fi
 
     local total_elapsed=$((SECONDS - start_time))
     local effective_rps=0
@@ -364,10 +436,11 @@ main() {
         effective_rps=$((c_served / total_elapsed))
     fi
 
-    local full_events drain_events queue_events
-    full_events=$(grep_count 'FULL' "$SERVER_LOG")
-    drain_events=$(grep_count 'DRAIN' "$SERVER_LOG")
-    queue_events=$(grep_count 'QUEUE' "$SERVER_LOG")
+    local full_events drain_events queue_events evict_events
+    full_events=$(grep_count '\[ FULL' "$SERVER_LOG")
+    drain_events=$(grep_count '\[ DRAIN' "$SERVER_LOG")
+    queue_events=$(grep_count '\[ QUEUE' "$SERVER_LOG")
+    evict_events=$(grep_count '\[ EVICT' "$SERVER_LOG")
 
     echo -e "${BOLD}╔══════════════════════════════════════════════════╗${RESET}"
     echo -e "${BOLD}║   Results                                       ║${RESET}"
@@ -375,6 +448,7 @@ main() {
     printf  "${BOLD}║${RESET}  %-22s  ${CYAN}%5d${RESET}                  ${BOLD}║${RESET}\n" "Total sent:" "$c_sent"
     printf  "${BOLD}║${RESET}  %-22s  ${GREEN}%5d${RESET}                  ${BOLD}║${RESET}\n" "Served (200):" "$c_served"
     printf  "${BOLD}║${RESET}  %-22s  ${YELLOW}%5d${RESET}                  ${BOLD}║${RESET}\n" "Queued (waited):" "$c_queued"
+    printf  "${BOLD}║${RESET}  %-22s  ${YELLOW}%5d${RESET}                  ${BOLD}║${RESET}\n" "Still waiting at end:" "$still_waiting"
     printf  "${BOLD}║${RESET}  %-22s  ${RED}%5d${RESET}                  ${BOLD}║${RESET}\n" "Errors:" "$c_errors"
     printf  "${BOLD}║${RESET}  %-22s  %3ds                    ${BOLD}║${RESET}\n" "Elapsed:" "$total_elapsed"
     printf  "${BOLD}║${RESET}  %-22s  %3d req/s              ${BOLD}║${RESET}\n" "Throughput:" "$effective_rps"
@@ -383,6 +457,7 @@ main() {
     printf  "${BOLD}║${RESET}  %-22s  %5d                  ${BOLD}║${RESET}\n" "FULL transitions:" "$full_events"
     printf  "${BOLD}║${RESET}  %-22s  %5d                  ${BOLD}║${RESET}\n" "DRAIN transitions:" "$drain_events"
     printf  "${BOLD}║${RESET}  %-22s  %5d                  ${BOLD}║${RESET}\n" "QUEUE events:" "$queue_events"
+    printf  "${BOLD}║${RESET}  %-22s  %5d                  ${BOLD}║${RESET}\n" "EVICT events:" "$evict_events"
     echo -e "${BOLD}╚══════════════════════════════════════════════════╝${RESET}"
     echo ""
 
@@ -392,6 +467,11 @@ main() {
     else
         echo -e "${YELLOW}⚠${RESET}  No requests were queued. Try:"
         echo "     CONCURRENCY=100 bash test.sh"
+    fi
+
+    if [[ "$still_waiting" -gt 0 ]]; then
+        echo ""
+        echo -e "${DIM}  ${still_waiting} clients were still waiting when the drain window closed.${RESET}"
     fi
 
     if [[ "$c_errors" -gt 0 ]]; then

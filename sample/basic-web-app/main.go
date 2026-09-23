@@ -2,11 +2,15 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
+	"strconv"
 	"syscall"
 	"time"
 
@@ -19,6 +23,11 @@ import (
 // without restarting the server.
 var wr *room.WaitingRoom
 
+// secureCookies mirrors wr.SetSecureCookie so cookies this app sets itself
+// (room_pass) use the same Secure rule as the room's own cookies. Set
+// SECURE_COOKIES=1 when serving over HTTPS or behind a TLS terminator.
+var secureCookies = os.Getenv("SECURE_COOKIES") == "1"
+
 func main() {
 	// ── 1. Use gin.New() instead of gin.Default() ─────────────────────────
 	//
@@ -28,6 +37,16 @@ func main() {
 	// gin.New() gives us a blank engine so we can install our own logger
 	// that prints immediately, before and after each request.
 	r := gin.New()
+
+	// Trust no proxy headers. c.ClientIP() then reports the real TCP peer
+	// instead of a spoofable X-Forwarded-For value. That matters twice in
+	// this sample: the room records ClientIP as each ticket's client key,
+	// and the /admin endpoints are restricted to loopback by ClientIP.
+	// Behind a real reverse proxy, list its addresses here instead.
+	if err := r.SetTrustedProxies(nil); err != nil {
+		log.Fatalf("SetTrustedProxies: %v", err)
+	}
+
 	r.Use(gin.Recovery())  // keep the panic recovery middleware
 	r.Use(requestLogger()) // our structured logger — prints on entry AND exit
 
@@ -43,16 +62,39 @@ func main() {
 	defer wr.Stop()
 
 	// ── 3. Configure the WaitingRoom ─────────────────────────────────────
+	//
+	// Apply settings BEFORE restoring a saved queue (step 5): Import uses
+	// the token TTL and the first-poll grace to decide which saved tickets
+	// are stale.
 
-	// Leave SetSecureCookie at its default (false) for local development
-	// so the cookie works over plain http://localhost.
-	// Call wr.SetSecureCookie(true) in production behind TLS.
+	// Leave Secure off for local development so cookies work over plain
+	// http://localhost; SECURE_COOKIES=1 turns it on.
+	wr.SetSecureCookie(secureCookies)
 
-	// Tighten the reaper so ghost tickets from ab's aborted connections
-	// are cleaned up quickly during the load test.
+	// 0 means "use the default" (room.DefaultTokenTTL, 5 minutes). The TTL
+	// is a sliding window reset on every poll, so it only governs how long
+	// an ABANDONED ticket lingers — waiting visitors never expire.
+	if err := wr.SetTokenTTL(0); err != nil {
+		log.Fatalf("room.SetTokenTTL: %v", err)
+	}
+
+	// Tighten the reaper so ghost tickets from aborted connections are
+	// cleaned up quickly during the load test.
 	if err := wr.SetReaperInterval(10 * time.Second); err != nil {
 		log.Fatalf("room.SetReaperInterval: %v", err)
 	}
+
+	// Reclaim tickets whose client never comes back at all — cookieless
+	// clients, bots, or tabs closed within seconds — after 30s instead of
+	// after the full TTL. Visitors who poll even once are unaffected.
+	if err := wr.SetFirstPollGrace(30 * time.Second); err != nil {
+		log.Fatalf("room.SetFirstPollGrace: %v", err)
+	}
+
+	// Record who each ticket belongs to. The key shows up in the admin
+	// view, in event snapshots, and lets /admin/remove drop every ticket
+	// from one client in a single call.
+	wr.SetClientKeyFunc(func(c *gin.Context) string { return c.ClientIP() })
 
 	// ── 3a. Configure skip-the-line pricing ──────────────────────────────
 	//
@@ -71,6 +113,9 @@ func main() {
 	// remains valid. During this window, if the client is evicted,
 	// times out, or refreshes, they are auto-promoted to the front
 	// without paying again. Set to 0 to disable (single-use promotions).
+	//
+	// Operator promotions (/admin/promote below) use AdminPromote, which
+	// does not depend on any of this.
 	wr.SetRateFunc(func(depth int64) float64 { return 2.50 })
 	wr.SetSkipURL("/queue/purchase")
 	if err := wr.SetPassDuration(90 * time.Minute); err != nil {
@@ -82,14 +127,18 @@ func main() {
 	// These callbacks are what you will see in the terminal during ab.
 	// Each line is prefixed with a tag so you can grep for it:
 	//
-	//   grep '\[FULL\]'   — moments the room hit capacity
-	//   grep '\[QUEUE\]'  — every request that had to wait
-	//   grep '\[ENTER\]'  — every admission into active service
-	//   grep '\[EXIT\]'   — every slot release
-	//   grep '\[DRAIN\]'  — moments the room dropped below capacity
-	//   grep '\[EVICT\]'  — abandoned ghost tickets removed by the reaper
-	//   grep '\[TIMEOUT\]'— requests whose context was cancelled mid-queue
-	//   grep '\[PROMOTE\]'— a queued client paid to skip the line
+	//   grep '\[ FULL'    — moments the room hit capacity
+	//   grep '\[ QUEUE'   — every request that had to wait
+	//   grep '\[ ENTER'   — every admission into active service
+	//   grep '\[ EXIT'    — every slot release
+	//   grep '\[ DRAIN'   — moments the room dropped below capacity
+	//   grep '\[ EVICT'   — abandoned tickets reclaimed by the reaper
+	//   grep '\[ TIMEOUT' — requests whose context was cancelled mid-queue
+	//   grep '\[ PROMOTE' — a queued client paid (or was moved) to skip the line
+	//   grep '\[ REMOVE'  — an operator removed queued tickets
+	//
+	// Snapshot.Token is the visitor's bearer credential for their place in
+	// line. These handlers log Snapshot.ClientKey and never the token.
 
 	wr.On(room.EventFull, func(s room.Snapshot) {
 		roomLog("FULL   ", fmt.Sprintf(
@@ -107,9 +156,18 @@ func main() {
 	})
 
 	wr.On(room.EventQueue, func(s room.Snapshot) {
+		// StaleTicket distinguishes a returning visitor (carried a
+		// room_ticket the room no longer knows — typically already
+		// admitted once) from a brand-new arrival with no cookie at all.
+		// Many "new" arrivals from one client means it is discarding
+		// cookies.
+		arrival := "new"
+		if s.StaleTicket {
+			arrival = "returning"
+		}
 		roomLog("QUEUE  ", fmt.Sprintf(
-			"request queued  depth=%d  occupancy=%d/%d  util=%.0f%%",
-			s.QueueDepth, s.Occupancy, s.Capacity,
+			"request queued  depth=%d  client=%s  arrival=%s  occupancy=%d/%d  util=%.0f%%",
+			s.QueueDepth, s.ClientKey, arrival, s.Occupancy, s.Capacity,
 			pct(s.Occupancy, s.Capacity),
 		))
 	})
@@ -132,8 +190,8 @@ func main() {
 
 	wr.On(room.EventEvict, func(s room.Snapshot) {
 		roomLog("EVICT  ", fmt.Sprintf(
-			"ghost ticket removed  queue=%d  occupancy=%d/%d",
-			s.QueueDepth, s.Occupancy, s.Capacity,
+			"abandoned ticket(s) reclaimed  queue=%d  live=%d  occupancy=%d/%d",
+			s.QueueDepth, wr.LiveQueueDepth(), s.Occupancy, s.Capacity,
 		))
 	})
 
@@ -146,48 +204,71 @@ func main() {
 
 	wr.On(room.EventPromote, func(s room.Snapshot) {
 		roomLog("PROMOTE", fmt.Sprintf(
-			"client promoted to front  occupancy=%d/%d  queue=%d",
-			s.Occupancy, s.Capacity, s.QueueDepth,
+			"client moved forward  client=%s  occupancy=%d/%d  queue=%d",
+			s.ClientKey, s.Occupancy, s.Capacity, s.QueueDepth,
 		))
 	})
 
-	// ── 5. Register skip-the-line routes BEFORE the waiting room ─────────
-	//
-	// These routes must bypass the waiting room so that queued clients
-	// can access the payment flow. Register them before RegisterRoutes.
-	//
-	// In production you would replace the GET /queue/purchase page with
-	// a handler that creates a Stripe Checkout session and redirects,
-	// and POST /queue/purchase/confirm with a Stripe webhook handler
-	// that verifies the payment event before calling PromoteTokenToFront.
+	wr.On(room.EventRemove, func(s room.Snapshot) {
+		// RemoveToken carries the ticket's client; RemoveTokensFunc fires
+		// once per batch with no token.
+		who := s.ClientKey
+		if s.Token == "" {
+			who = "batch"
+		}
+		roomLog("REMOVE ", fmt.Sprintf(
+			"ticket(s) removed  client=%s  queue=%d  live=%d",
+			who, s.QueueDepth, wr.LiveQueueDepth(),
+		))
+	})
 
-	// GET /queue/purchase — shows the "confirm payment" page.
-	// In production: creates a Stripe Checkout session and redirects.
+	// ── 5. Restore the queue saved by the previous run ───────────────────
+	//
+	// Must run after the settings above and before the server accepts
+	// traffic. Import refuses a room that has already issued tickets.
+	stateFile := envOr("ROOM_STATE_FILE",
+		filepath.Join(os.TempDir(), "room-basic-web-app-queue.json"))
+	restoreQueue(stateFile)
+
+	// ── 6. Routes that must bypass the waiting room ──────────────────────
+	//
+	// Everything registered BEFORE RegisterRoutes is not gated.
+
+	// Skip-the-line payment flow — queued clients must be able to reach it.
+	//
+	// GET /queue/purchase shows the "confirm payment" page. In production
+	// it would create a Stripe Checkout session and redirect.
 	r.GET("/queue/purchase", handlePurchasePage)
 
-	// POST /queue/purchase/confirm — processes the payment and promotes.
-	// In production: this is your Stripe webhook endpoint that verifies
-	// the payment signature before promoting.
+	// POST /queue/purchase/confirm processes the payment and promotes. In
+	// production this is your Stripe webhook endpoint that verifies the
+	// payment signature before promoting.
 	r.POST("/queue/purchase/confirm", handlePurchaseConfirm)
 
-	// ── 6. Register the WaitingRoom routes ───────────────────────────────
+	// Operator endpoints — loopback only in this sample. They address
+	// queued visitors by position or client key and never expose tokens.
+	admin := r.Group("/admin", localOnly())
+	admin.GET("/queue", adminQueue)      // the line, front first
+	admin.POST("/promote", adminPromote) // {"position": N, "to": 1}
+	admin.POST("/remove", adminRemove)   // {"position": N} or {"client_key": "..."}
+	admin.POST("/cap", adminCap)         // {"cap": N}
+
+	// ── 7. Register the WaitingRoom routes ───────────────────────────────
 	//
-	// RegisterRoutes must come AFTER the payment routes (so they bypass
-	// the queue) and BEFORE your application routes (so they are gated).
 	// It installs, in order:
 	//   OPTIONS /queue/status  — CORS preflight
 	//   GET     /queue/status  — polling endpoint for the waiting-room page
 	//   r.Use(wr.Middleware()) — gates every route registered after this
 	wr.RegisterRoutes(r)
 
-	// ── 7. Application routes (all gated by the waiting room) ────────────
+	// ── 8. Application routes (all gated by the waiting room) ────────────
 
 	r.GET("/", homePage)
 	r.GET("/about", aboutPage)
 	r.GET("/pricing", pricingPage)
 	r.GET("/contact", contactPage)
 
-	// ── 8. Graceful shutdown ──────────────────────────────────────────────
+	// ── 9. Serve, then shut down gracefully and save the queue ───────────
 
 	srv := &http.Server{
 		Addr:    ":8080",
@@ -198,8 +279,8 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		log.Printf("[ INFO  ] listening on http://localhost:8080  cap=%d  rate=$%.2f/pos  pass=%s",
-			wr.Cap(), 2.50, wr.PassDuration())
+		log.Printf("[ INFO  ] listening on http://localhost:8080  cap=%d  rate=$%.2f/pos  pass=%s  ttl=%s  first_poll_grace=%s",
+			wr.Cap(), 2.50, wr.PassDuration(), wr.TokenTTL(), wr.FirstPollGrace())
 		if err := srv.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("ListenAndServe: %v", err)
 		}
@@ -214,7 +295,259 @@ func main() {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("[ ERROR ] server forced to shut down: %v", err)
 	}
+
+	// No new requests can arrive now, so the export is a complete picture
+	// of the line. Visitors keep polling through the restart (the waiting
+	// page retries failed polls) and resume their place when we're back.
+	saveQueue(stateFile)
+
 	log.Println("[ INFO  ] server exited cleanly")
+}
+
+// ── Queue persistence ─────────────────────────────────────────────────────────
+
+// restoreQueue imports a queue saved by saveQueue, then deletes the file.
+// A missing or unreadable file just means starting with an empty line.
+func restoreQueue(path string) {
+	f, err := os.Open(path)
+	if errors.Is(err, os.ErrNotExist) {
+		log.Printf("[ INFO  ] no saved queue at %s — starting with an empty line", path)
+		return
+	}
+	if err != nil {
+		log.Printf("[ WARN  ] cannot open saved queue %s: %v — starting with an empty line", path, err)
+		return
+	}
+
+	stats, err := wr.Import(f)
+	f.Close()
+
+	// Delete whether or not the import worked: the file holds every queued
+	// visitor's bearer token, and a bad file should not be retried forever.
+	if rmErr := os.Remove(path); rmErr != nil {
+		log.Printf("[ WARN  ] could not delete saved queue %s: %v", path, rmErr)
+	}
+
+	if err != nil {
+		log.Printf("[ WARN  ] saved queue not restored: %v — starting with an empty line", err)
+		return
+	}
+	log.Printf("[ INFO  ] queue restored  tickets=%d  dropped_stale=%d  passes=%d  passes_expired=%d",
+		stats.Restored, stats.DroppedStale, stats.PassesRestored, stats.PassesExpired)
+}
+
+// saveQueue exports the line atomically: write to a 0600 temp file, fsync,
+// then rename over the target, so a crash mid-write never leaves a
+// truncated file for the next start to import.
+func saveQueue(path string) {
+	tmp := path + ".tmp"
+	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o600)
+	if err != nil {
+		log.Printf("[ ERROR ] queue not saved: %v", err)
+		return
+	}
+	if err := wr.Export(f); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		log.Printf("[ ERROR ] queue not saved: %v", err)
+		return
+	}
+	if err := f.Sync(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		log.Printf("[ ERROR ] queue not saved: fsync: %v", err)
+		return
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		log.Printf("[ ERROR ] queue not saved: close: %v", err)
+		return
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		log.Printf("[ ERROR ] queue not saved: rename: %v", err)
+		return
+	}
+	log.Printf("[ INFO  ] queue saved  tickets=%d  file=%s", wr.LiveQueueDepth(), path)
+}
+
+// ── Admin endpoints ───────────────────────────────────────────────────────────
+//
+// These are a minimal operator console. They are registered before the
+// waiting room (so an operator is never queued) and restricted to loopback.
+// In production, put them behind real authentication.
+
+// localOnly rejects any request whose peer is not a loopback address.
+func localOnly() gin.HandlerFunc {
+	return func(c *gin.Context) {
+		ip := net.ParseIP(c.ClientIP())
+		if ip == nil || !ip.IsLoopback() {
+			c.AbortWithStatusJSON(http.StatusForbidden,
+				gin.H{"error": "admin endpoints are loopback-only in this sample"})
+			return
+		}
+		c.Next()
+	}
+}
+
+// adminQueue returns the front of the line. Tokens are deliberately
+// omitted — they are bearer credentials — so visitors are addressed by
+// position or client key instead.
+//
+//	curl -s localhost:8080/admin/queue?limit=10 | jq
+func adminQueue(c *gin.Context) {
+	limit := 50
+	if v, err := strconv.Atoi(c.DefaultQuery("limit", "50")); err == nil && v > 0 && v <= 1000 {
+		limit = v
+	}
+
+	now := time.Now()
+	tickets := make([]gin.H, 0, limit)
+	for _, t := range wr.Queue(limit) {
+		row := gin.H{
+			"position":    t.Position, // <= 0: told ready, not yet reloaded
+			"client_key":  t.ClientKey,
+			"waiting_for": now.Sub(t.IssuedAt).Round(time.Second).String(),
+			"seen":        t.Seen,
+			"promoted":    t.Promoted,
+			"has_pass":    t.HasPass,
+		}
+		if !t.LastPoll.IsZero() {
+			row["last_poll_ago"] = now.Sub(t.LastPoll).Round(time.Second).String()
+		}
+		tickets = append(tickets, row)
+	}
+
+	c.JSON(http.StatusOK, gin.H{
+		"cap":              wr.Cap(),
+		"occupancy":        wr.Len(),
+		"queue_depth":      wr.QueueDepth(),
+		"live_queue_depth": wr.LiveQueueDepth(),
+		"token_ttl":        wr.TokenTTL().String(),
+		"first_poll_grace": wr.FirstPollGrace().String(),
+		"tickets":          tickets,
+	})
+}
+
+// adminPromote moves the visitor at a given position forward — free, with
+// no RateFunc involved.
+//
+//	curl -s -X POST localhost:8080/admin/promote -d '{"position": 7, "to": 1}' | jq
+func adminPromote(c *gin.Context) {
+	var body struct {
+		Position int64 `json:"position"`
+		To       int64 `json:"to"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil || body.Position < 1 {
+		c.JSON(http.StatusBadRequest, gin.H{"error": `send {"position": N} with N >= 1, optionally "to": M`})
+		return
+	}
+	if body.To == 0 {
+		body.To = 1
+	}
+
+	t, ok := findByPosition(body.Position)
+	if !ok {
+		c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("nobody is waiting at position %d", body.Position)})
+		return
+	}
+	if err := wr.AdminPromote(t.Token, body.To); err != nil {
+		c.JSON(adminErrorStatus(err), gin.H{"error": err.Error()})
+		return
+	}
+
+	resp := gin.H{"from": body.Position, "client_key": t.ClientKey}
+	if after, ok := wr.Ticket(t.Token); ok {
+		resp["now"] = after.Position
+	}
+	c.JSON(http.StatusOK, resp)
+}
+
+// adminRemove drops one visitor by position, or every ticket from one
+// client key. Removed visitors re-enter at the back on their next page
+// load unless you also block them upstream.
+//
+//	curl -s -X POST localhost:8080/admin/remove -d '{"position": 3}' | jq
+//	curl -s -X POST localhost:8080/admin/remove -d '{"client_key": "127.0.0.1"}' | jq
+func adminRemove(c *gin.Context) {
+	var body struct {
+		Position  int64  `json:"position"`
+		ClientKey string `json:"client_key"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": `send {"position": N} or {"client_key": "..."}`})
+		return
+	}
+
+	switch {
+	case body.ClientKey != "":
+		n := wr.RemoveTokensFunc(func(t room.TicketInfo) bool {
+			return t.ClientKey == body.ClientKey
+		})
+		c.JSON(http.StatusOK, gin.H{"removed": n, "client_key": body.ClientKey})
+
+	case body.Position >= 1:
+		t, ok := findByPosition(body.Position)
+		if !ok {
+			c.JSON(http.StatusNotFound, gin.H{"error": fmt.Sprintf("nobody is waiting at position %d", body.Position)})
+			return
+		}
+		if err := wr.RemoveToken(t.Token); err != nil {
+			c.JSON(adminErrorStatus(err), gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(http.StatusOK, gin.H{"removed": 1, "position": body.Position, "client_key": t.ClientKey})
+
+	default:
+		c.JSON(http.StatusBadRequest, gin.H{"error": `send {"position": N} or {"client_key": "..."}`})
+	}
+}
+
+// adminCap changes capacity at runtime.
+//
+//	curl -s -X POST localhost:8080/admin/cap -d '{"cap": 10}' | jq
+func adminCap(c *gin.Context) {
+	var body struct {
+		Cap int32 `json:"cap"`
+	}
+	if err := c.ShouldBindJSON(&body); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	if err := wr.SetCap(body.Cap); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
+	c.JSON(http.StatusOK, gin.H{
+		"cap":         wr.Cap(),
+		"occupancy":   wr.Len(),
+		"queue_depth": wr.QueueDepth(),
+		"utilization": fmt.Sprintf("%.0f%%", wr.Utilization()*100),
+	})
+}
+
+// findByPosition returns the waiting visitor currently at position pos.
+// Queue lists tickets that are already inside the serving window first
+// (position <= 0), so it looks past up to twice the capacity of them.
+func findByPosition(pos int64) (room.TicketInfo, bool) {
+	for _, t := range wr.Queue(int(pos) + 2*int(wr.Cap())) {
+		if t.Position == pos {
+			return t, true
+		}
+	}
+	return room.TicketInfo{}, false
+}
+
+// adminErrorStatus maps room errors to HTTP status codes.
+func adminErrorStatus(err error) int {
+	switch err.(type) {
+	case room.ErrTokenNotFound, room.ErrAlreadyAdmitted:
+		return http.StatusConflict // gone or already being admitted
+	case room.ErrInvalidTargetPosition:
+		return http.StatusBadRequest
+	default:
+		return http.StatusInternalServerError
+	}
 }
 
 // ── Skip-the-line payment handlers ────────────────────────────────────────────
@@ -317,7 +650,7 @@ func handlePurchaseConfirm(c *gin.Context) {
 
 	result, err := wr.PromoteTokenToFront(token)
 	if err != nil {
-		log.Printf("[ SKIP  ] promotion failed for token=%.8s...: %v", token, err)
+		log.Printf("[ SKIP  ] promotion failed: %v", err)
 		c.Data(http.StatusOK, "text/html; charset=utf-8", page("Payment failed", fmt.Sprintf(
 			`<h1>Something went wrong</h1>
 			<p>%s</p>
@@ -327,14 +660,17 @@ func handlePurchaseConfirm(c *gin.Context) {
 		return
 	}
 
-	log.Printf("[ SKIP  ] token=%.8s... promoted to front  cost=$%.2f  pass=%v",
-		token, result.Cost, result.PassToken != "")
+	log.Printf("[ SKIP  ] client=%s promoted to front  cost=$%.2f  pass=%v",
+		c.ClientIP(), result.Cost, result.PassToken != "")
 
-	// Set the VIP pass cookie if a pass was issued. This cookie
-	// persists across queue entries so the client is auto-promoted
-	// for the configured pass duration without paying again.
+	// Set the VIP pass cookie if a pass was issued. This cookie persists
+	// across queue entries so the client is auto-promoted for the
+	// configured pass duration without paying again.
+	//
+	// Secure follows the same rule as the room's own cookies: on when
+	// configured, or when this request arrived over TLS directly. Marking
+	// it Secure over plain HTTP would make some browsers drop the pass.
 	if result.PassToken != "" {
-		secure := wr.SkipURL() != "" // crude; in production use wr.SetSecureCookie logic
 		http.SetCookie(c.Writer, &http.Cookie{
 			Name:     "room_pass",
 			Value:    result.PassToken,
@@ -342,13 +678,13 @@ func handlePurchaseConfirm(c *gin.Context) {
 			Domain:   wr.CookieDomain(),
 			MaxAge:   int(wr.PassDuration().Seconds()),
 			HttpOnly: true,
-			Secure:   secure,
+			Secure:   secureCookies || c.Request.TLS != nil,
 			SameSite: http.SameSiteLaxMode,
 		})
 	}
 
-	// Redirect back to the site. The next poll (or page load) will
-	// see ready=true and admit the client immediately.
+	// Redirect back to the site. The next poll (or page load) will see
+	// ready=true and admit the client immediately.
 	passMsg := ""
 	if result.PassToken != "" {
 		passMsg = fmt.Sprintf(
@@ -373,7 +709,7 @@ func handlePurchaseConfirm(c *gin.Context) {
 
 // ── Page handlers ─────────────────────────────────────────────────────────────
 //
-// Each handler sleeps for a realistic duration so that concurrent ab requests
+// Each handler sleeps for a realistic duration so that concurrent requests
 // actually hold their semaphore slots long enough for the room to fill up.
 // Without the sleep, handlers return in microseconds and you will never see
 // the waiting room trigger, even at -c 100.
@@ -395,6 +731,18 @@ func homePage(c *gin.Context) {
 		  <strong>"Skip the line"</strong> option — click it to test the
 		  payment flow at <strong>$2.50/position</strong>. Your VIP pass
 		  lasts <strong>90 minutes</strong>.
+		</p>
+		<h2>Operator console (localhost only)</h2>
+		<ul>
+		  <li>See the line: <code>curl -s localhost:8080/admin/queue | jq</code></li>
+		  <li>Move position 7 to the front: <code>curl -s -X POST localhost:8080/admin/promote -d '{"position":7}'</code></li>
+		  <li>Remove position 3: <code>curl -s -X POST localhost:8080/admin/remove -d '{"position":3}'</code></li>
+		  <li>Change capacity: <code>curl -s -X POST localhost:8080/admin/cap -d '{"cap":10}'</code></li>
+		</ul>
+		<p>
+		  Stop the server with Ctrl-C while people are queued and start it
+		  again: the line is saved on shutdown and restored on startup, and
+		  queued visitors keep their place.
 		</p>
 		<nav>
 		  <a href="/about">About</a> ·
@@ -496,6 +844,14 @@ func pct(occupancy, capacity int) float64 {
 	return float64(occupancy) / float64(capacity) * 100
 }
 
+// envOr returns the environment variable's value, or def if it is unset.
+func envOr(key, def string) string {
+	if v := os.Getenv(key); v != "" {
+		return v
+	}
+	return def
+}
+
 // page wraps a body fragment in a complete, styled HTML document.
 func page(title, body string) []byte {
 	return []byte(`<!DOCTYPE html>
@@ -510,7 +866,9 @@ func page(title, body string) []byte {
             margin: 4rem auto; padding: 0 1.5rem; color: #1a1a1a;
             line-height: 1.6; }
     h1    { margin-bottom: 1rem; }
+    h2    { margin: 1.5rem 0 .5rem; font-size: 1.1rem; }
     p     { margin-bottom: 1rem; }
+    ul    { margin: 0 0 1rem 1.25rem; }
     code  { background: #f0f0f0; padding: .1em .4em; border-radius: 3px; }
     nav   { margin-top: 2rem; }
     a     { color: #6c8ef5; }
