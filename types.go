@@ -142,6 +142,9 @@ type ticketEntry struct {
 	// hasPass records whether the client presented a valid VIP pass at
 	// issuance or at its most recent waiting-page render.
 	hasPass bool
+
+	// rank is the rank recorded by SetTicketRank, or 0.
+	rank int
 }
 
 // passEntry holds a time-limited VIP pass issued after a skip-the-line

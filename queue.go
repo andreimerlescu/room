@@ -126,6 +126,9 @@ type TicketInfo struct {
 	// HasPass reports whether the client presented a valid VIP pass when
 	// the ticket was issued or at its most recent waiting-page render.
 	HasPass bool
+
+	// Rank is the rank recorded by SetTicketRank, or 0.
+	Rank int
 }
 
 // ticketInfo builds the public view of a token-store entry.
@@ -141,6 +144,7 @@ func (wr *WaitingRoom) ticketInfo(token string, e ticketEntry) TicketInfo {
 		Seen:      e.seen,
 		Promoted:  e.promoted,
 		HasPass:   e.hasPass,
+		Rank:      e.rank,
 	}
 }
 
