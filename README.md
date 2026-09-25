@@ -239,6 +239,17 @@ err := wr.AdminPromote(token, 1)
 
 ---
 
+### Ranking clients
+
+```go
+// Rank a queued client: it waits ahead of every lower rank, behind every
+// equal or higher rank, in arrival order within a rank.
+moved, err := wr.SetTicketRank(token, 2)
+```
+
+Unlike promotions, which tie with the client already at the target position, a rank move inserts strictly: everyone it passes moves back one place, and every position stays exact. New arrivals always join behind ranked clients. Rank only moves a ticket forward; lowering it is recorded but doesn't move the ticket back. `TicketInfo.Rank` reports it, `EventRank` fires when a ticket moves, and ranks survive `Export`/`Import`.
+
+
 ## Skip the line — paid queue jumping
 
 The cost to jump is `distance × rate`, where rate comes from your `RateFunc`.
@@ -351,6 +362,7 @@ wr.On(room.EventQueue, func(s room.Snapshot) { metrics.Inc("room.queue") })
 | `EventTimeout` | Request cancelled before getting a slot | — |
 | `EventPromote` | Paid, admin or VIP-pass promotion | ✓ |
 | `EventRemove` | `RemoveToken` (one event, with token) / `RemoveTokensFunc` (one per call, no token) | ✓ for `RemoveToken` |
+| `EventRank` | `SetTicketRank` moved a ticket ahead of lower ranks | ✓ |
 
 ```go
 type Snapshot struct {
@@ -635,6 +647,7 @@ wr.Ticket(token string) (room.TicketInfo, bool)
 wr.RemoveToken(token string) error
 wr.RemoveTokensFunc(match func(room.TicketInfo) bool) int
 wr.AdminPromote(token string, targetPosition int64) error
+wr.SetTicketRank(token string, rank int) (bool, error)
 
 // ── Skip the line ─────────────────────────────────────────
 wr.QuoteCost(token string, targetPosition int64) (float64, error)

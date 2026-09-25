@@ -37,6 +37,7 @@ type persistedTicket struct {
 	Seen      bool      `json:"seen,omitempty"`
 	Promoted  bool      `json:"promoted,omitempty"`
 	HasPass   bool      `json:"has_pass,omitempty"`
+	Rank      int       `json:"rank,omitempty"`
 }
 
 type persistedPass struct {
@@ -121,6 +122,7 @@ func (wr *WaitingRoom) Export(w io.Writer) error {
 			Seen:      s.entry.seen,
 			Promoted:  s.entry.promoted,
 			HasPass:   s.entry.hasPass,
+			Rank:      s.entry.rank,
 		})
 	}
 
@@ -245,6 +247,7 @@ func (wr *WaitingRoom) Import(r io.Reader) (ImportStats, error) {
 			seen:        t.Seen,
 			promoted:    t.Promoted,
 			hasPass:     t.HasPass,
+			rank:        t.Rank,
 		}
 	}
 	wr.tokens.setMany(entries)
@@ -279,6 +282,9 @@ func validatePersistFile(f *persistFile) error {
 			return ErrImportFormat{Reason: fmt.Sprintf("ticket %d: duplicate token", i)}
 		}
 		seen[t.Token] = struct{}{}
+		if t.Rank < 0 {
+			return ErrImportFormat{Reason: fmt.Sprintf("ticket %d: negative rank", i)}
+		}
 	}
 	for i, p := range f.Passes {
 		if p.Token == "" || len(p.Token) > maxPersistedTokenLen {

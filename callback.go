@@ -61,6 +61,11 @@ const (
 	// with Token empty). It is distinct from EventEvict so that deliberate
 	// removals — bans, kicks — are not counted as abandonment.
 	EventRemove
+
+	// EventRank fires when SetTicketRank moves a waiting ticket ahead of
+	// lower-ranked tickets, with Snapshot.Token and Snapshot.ClientKey
+	// set. It does not fire when a rank is only recorded.
+	EventRank
 )
 
 // String returns the canonical name of the Event, suitable for logging.
@@ -84,6 +89,8 @@ func (e Event) String() string {
 		return "Promote"
 	case EventRemove:
 		return "Remove"
+	case EventRank:
+		return "Rank"
 	default:
 		return "Unknown"
 	}

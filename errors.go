@@ -143,3 +143,12 @@ type ErrImportFormat struct {
 func (e ErrImportFormat) Error() string {
 	return "room: invalid import data: " + e.Reason
 }
+
+// ErrInvalidRank is returned by SetTicketRank when rank is negative.
+type ErrInvalidRank struct {
+	Given int
+}
+
+func (e ErrInvalidRank) Error() string {
+	return fmt.Sprintf("room: invalid rank %d: must be >= 0", e.Given)
+}
