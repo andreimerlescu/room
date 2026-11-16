@@ -224,6 +224,9 @@ func (wr *WaitingRoom) reap() {
 	// few (one per paying customer) and the sweep is a single lock
 	// acquisition with a linear scan.
 	wr.passes.reap()
+
+	// Release leases whose SetLeaseTTL ran out (a no-op when it is 0).
+	wr.reapLeases(time.Now())
 }
 
 // reapBatch performs a single bounded eviction pass. It returns the number
@@ -277,7 +280,7 @@ func (wr *WaitingRoom) reapBatch() int {
 			// between the read-lock scan and now: a poll in between
 			// refreshes issuedAt and marks the token seen.
 			if dead(entry) {
-				delete(wr.tokens.entries, token)
+				wr.tokens.removeLocked(token, entry)
 				retired = append(retired, entry.ticket)
 			}
 		}

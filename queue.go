@@ -129,6 +129,22 @@ type TicketInfo struct {
 
 	// Rank is the rank recorded by SetTicketRank, or 0.
 	Rank int
+
+	// Key is the application key of a keyed ticket — one created by
+	// Enter, Acquire, or a request that SetTicketKeyFunc recognised — or ""
+	// for a cookie ticket.
+	Key string
+
+	// ID is the public ticket ID of a keyed ticket, which names its place
+	// at /queue/status/{id} and grants nothing; "" for a cookie ticket.
+	ID string
+
+	// Place is the ticket's place among every ticket in the store, 1 being
+	// the front, counting tickets already told ready that have not come
+	// back. It is filled by Queue, TicketByKey and the wait responder, and
+	// is 0 everywhere else, because computing it costs a pass over the
+	// store.
+	Place int64
 }
 
 // ticketInfo builds the public view of a token-store entry.
@@ -145,6 +161,8 @@ func (wr *WaitingRoom) ticketInfo(token string, e ticketEntry) TicketInfo {
 		Promoted:  e.promoted,
 		HasPass:   e.hasPass,
 		Rank:      e.rank,
+		Key:       e.key,
+		ID:        e.id,
 	}
 }
 
@@ -212,6 +230,7 @@ func (wr *WaitingRoom) Queue(limit int) []TicketInfo {
 	out := make([]TicketInfo, len(h))
 	for i, s := range h {
 		out[i] = wr.ticketInfo(s.token, s.entry)
+		out[i].Place = int64(i + 1)
 	}
 	return out
 }

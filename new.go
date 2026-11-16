@@ -43,6 +43,7 @@ func NewWaitingRoom(r *gin.Engine, cap int32) gin.HandlerFunc {
 		panic(fmt.Sprintf("room.NewWaitingRoom: %v", err))
 	}
 	r.GET("/queue/status", wr.StatusHandler())
+	r.GET("/queue/status/:ticket", wr.TicketStatusHandler())
 	return wr.Middleware()
 }
 
@@ -112,6 +113,12 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.skipURL.Store("")
 	wr.passDuration.Store(int64(defaultPassDuration))
 	wr.callbacks = newCallbackRegistry()
+	wr.waitJSON.Store(false)
+	wr.statusBaseURL.Store(defaultStatusBaseURL)
+	wr.leaseTTL.Store(0)
+	wr.leaseMu.Lock()
+	wr.leases = make(map[string]leaseEntry)
+	wr.leaseMu.Unlock()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	wr.stopReaper = cancel

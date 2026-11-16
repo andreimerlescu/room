@@ -107,6 +107,37 @@ type WaitingRoom struct {
 	//
 	// Related: ghostLedger, WaitingRoom.retire, WaitingRoom.drainLedger
 	ledger *ghostLedger
+
+	// ticketKeyFunc (*ticketKeyHolder) and waitResponder
+	// (*waitResponderHolder) are, like clientKeyFunc, not reset by Init.
+	ticketKeyFunc atomic.Value
+	waitResponder atomic.Value
+
+	// waitJSON opts cookie requests that do not accept text/html into the
+	// JSON wait response. See SetWaitJSON.
+	waitJSON atomic.Bool
+
+	// statusBaseURL (string) prefixes a keyed ticket's ID in status_url.
+	statusBaseURL atomic.Value
+
+	// leaseMu guards leases. Lock order: leaseMu, then promoteMu, then the
+	// token store's mu; never the reverse. It is never held across a
+	// callback, a handler or a response write.
+	leaseMu sync.RWMutex
+	leases  map[string]leaseEntry
+
+	// leaseTTL is how long a lease lasts without being renewed by
+	// Acquire, in nanoseconds; 0 means leases last until Release.
+	leaseTTL atomic.Int64
+}
+
+// leaseEntry is one key's slot, held from Acquire until Release (or until
+// the lease TTL runs out). Its ticket was admitted, so the room accounts
+// for it exactly once, when the lease ends.
+type leaseEntry struct {
+	ticket     int64
+	acquiredAt time.Time
+	renewedAt  time.Time
 }
 
 // ticketEntry holds the state for a single queued client.
@@ -146,6 +177,20 @@ type ticketEntry struct {
 
 	// rank is the rank recorded by SetTicketRank, or 0.
 	rank int
+
+	// key is the application key that identifies a keyed ticket (one
+	// created by Enter, Acquire or a request SetTicketKeyFunc recognised),
+	// or "" for a cookie ticket. A keyed ticket's token is never sent to
+	// the client.
+	key string
+
+	// id is the public ticket ID of a keyed ticket: it names the place at
+	// /queue/status/{id} and grants nothing. "" for a cookie ticket.
+	id string
+
+	// viewedAt is the last accepted view of /queue/status/{id}. It drives
+	// that endpoint's rate limit and never refreshes the TTL.
+	viewedAt time.Time
 }
 
 // passEntry holds a time-limited VIP pass issued after a skip-the-line
@@ -169,18 +214,59 @@ type passEntry struct {
 // delete) return the removed entry so that exactly one caller — the one
 // that actually removed it — accounts for the ticket. See
 // WaitingRoom.retire.
+//
+// byKey and byID index keyed tickets (key → token, public ID → token).
+// They are guarded by mu together with entries, and every write goes
+// through putLocked and removeLocked so the three maps never disagree.
 type tokenStore struct {
 	mu       sync.RWMutex
 	entries  map[string]ticketEntry
+	byKey    map[string]string
+	byID     map[string]string
 	ttlNanos atomic.Int64
 }
 
 func newTokenStore() *tokenStore {
 	ts := &tokenStore{
 		entries: make(map[string]ticketEntry),
+		byKey:   make(map[string]string),
+		byID:    make(map[string]string),
 	}
 	ts.ttlNanos.Store(int64(defaultTokenTTL))
 	return ts
+}
+
+// putLocked stores entry under token and indexes its key and ID. An entry
+// it replaces is unindexed first. Caller holds ts.mu for writing.
+func (ts *tokenStore) putLocked(token string, entry ticketEntry) {
+	if old, ok := ts.entries[token]; ok {
+		ts.unindexLocked(token, old)
+	}
+	ts.entries[token] = entry
+	if entry.key != "" {
+		ts.byKey[entry.key] = token
+	}
+	if entry.id != "" {
+		ts.byID[entry.id] = token
+	}
+}
+
+// removeLocked deletes token and its index entries. Every path that ends a
+// ticket's life in the store uses it. Caller holds ts.mu for writing.
+func (ts *tokenStore) removeLocked(token string, entry ticketEntry) {
+	delete(ts.entries, token)
+	ts.unindexLocked(token, entry)
+}
+
+// unindexLocked drops entry's key and ID from the indexes, but only where
+// they still point at token. Caller holds ts.mu for writing.
+func (ts *tokenStore) unindexLocked(token string, entry ticketEntry) {
+	if entry.key != "" && ts.byKey[entry.key] == token {
+		delete(ts.byKey, entry.key)
+	}
+	if entry.id != "" && ts.byID[entry.id] == token {
+		delete(ts.byID, entry.id)
+	}
 }
 
 // ttl returns the current sliding-window token lifetime.
@@ -197,7 +283,7 @@ func (ts *tokenStore) setTTL(d time.Duration) {
 func (ts *tokenStore) set(token string, entry ticketEntry) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	ts.entries[token] = entry
+	ts.putLocked(token, entry)
 }
 
 func (ts *tokenStore) get(token string) (ticketEntry, bool) {
@@ -214,7 +300,9 @@ func (ts *tokenStore) get(token string) (ticketEntry, bool) {
 func (ts *tokenStore) delete(token string) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	delete(ts.entries, token)
+	if e, ok := ts.entries[token]; ok {
+		ts.removeLocked(token, e)
+	}
 }
 
 // take atomically removes the token and returns its entry. It is the
@@ -226,7 +314,7 @@ func (ts *tokenStore) take(token string) (ticketEntry, bool) {
 	defer ts.mu.Unlock()
 	e, ok := ts.entries[token]
 	if ok {
-		delete(ts.entries, token)
+		ts.removeLocked(token, e)
 	}
 	return e, ok
 }
@@ -245,7 +333,7 @@ func (ts *tokenStore) deleteIfExpired(token string) (ticketEntry, bool) {
 		return ticketEntry{}, false
 	}
 	if time.Since(entry.issuedAt) > ttl {
-		delete(ts.entries, token)
+		ts.removeLocked(token, entry)
 		return entry, true
 	}
 	return ticketEntry{}, false
@@ -338,7 +426,7 @@ type pollResult struct {
 
 // poll applies one /queue/status poll under a single write lock:
 //
-//  1. Unknown token → pollUnknown.
+//  1. Unknown token, or a keyed ticket's token → pollUnknown.
 //  2. TTL elapsed → delete and return pollExpired with the entry.
 //  3. Otherwise keep the token alive (issuedAt = now), mark it seen and
 //     record lastPoll — on BOTH the accepted and the rate-limited path,
@@ -362,11 +450,13 @@ func (ts *tokenStore) poll(token string, now time.Time, edge int64, minInterval,
 	defer ts.mu.Unlock()
 
 	entry, ok := ts.entries[token]
-	if !ok {
+	if !ok || entry.key != "" {
+		// A keyed ticket's token is never handed out, so a cookie that
+		// carries one is not its client's; treat it as unknown.
 		return pollResult{outcome: pollUnknown}
 	}
 	if now.Sub(entry.issuedAt) > ttl {
-		delete(ts.entries, token)
+		ts.removeLocked(token, entry)
 		return pollResult{outcome: pollExpired, entry: entry}
 	}
 
