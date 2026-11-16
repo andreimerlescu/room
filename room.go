@@ -43,6 +43,13 @@ var defaultWaitingRoomBytes []byte
 // guarantees each ticket is accounted for exactly once — see
 // WaitingRoom.retire.
 //
+// # Keyed requests
+//
+// When SetTicketKeyFunc recognises a request, the key — not a cookie — is
+// the ticket's identity, and the request is answered with JSON instead of
+// the page. See SetTicketKeyFunc. Everything below describes the cookie
+// flow, which every other request follows unchanged.
+//
 // # Cookie dependency
 //
 // Queue position lives entirely in the room_ticket cookie. A client that
@@ -78,13 +85,21 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 			hasPass = wr.HasValidPass(passCookie.Value)
 		}
 
+		// A request the application identifies by key never uses cookies.
+		if key, ok := wr.ticketKey(c); ok {
+			wr.serveKeyed(c, key, hasPass)
+			return
+		}
+
 		// Resume an existing queued position if the client presents a
 		// valid room_ticket cookie. This preserves queue position across
 		// page reloads and polling retries.
 		cookie, cookieErr := c.Request.Cookie(cookieName)
 		hadTicketCookie := cookieErr == nil
 		if hadTicketCookie {
-			if entry, ok := wr.tokens.get(cookie.Value); ok {
+			// A keyed ticket's token is internal; a cookie carrying one
+			// is treated as unknown (see keyed.go).
+			if entry, ok := wr.tokens.get(cookie.Value); ok && entry.key == "" {
 				if wr.ticketReady(entry.ticket) {
 					// Client's ticket is now within the serving window.
 					// Claim the token BEFORE acquiring: whoever removes
@@ -131,9 +146,12 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 					// expired room_ticket makes the next poll report
 					// cookies_required, and an expired probe makes the
 					// page show a false "cookies disabled" panel.
-					wr.setTicketCookie(c, cookie.Value, secure)
-					wr.setProbeCookie(c, secure)
+					wr.setTicketCookie(c.Writer, cookie.Value, secure)
+					wr.setProbeCookie(c.Writer, secure)
 
+					if wr.respondCookieWait(c, cookie.Value, position) {
+						return
+					}
 					html := wr.resolveHTML()
 					c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectTemplateVars(html, position))
 					c.Abort()
@@ -200,8 +218,8 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 
 		wr.emit(EventQueue, wr.snapshotFor(EventQueue, token, key, hadTicketCookie))
 
-		wr.setTicketCookie(c, token, secure)
-		wr.setProbeCookie(c, secure)
+		wr.setTicketCookie(c.Writer, token, secure)
+		wr.setProbeCookie(c.Writer, secure)
 
 		// If the client has a valid pass, auto-promote the freshly
 		// issued ticket immediately so they jump to the front.
@@ -215,6 +233,9 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		position := wr.positionOf(ticket)
 		if position < 1 {
 			position = 1
+		}
+		if wr.respondCookieWait(c, token, position) {
+			return
 		}
 		html := wr.resolveHTML()
 		c.Data(http.StatusOK, "text/html; charset=utf-8", wr.injectTemplateVars(html, position))
@@ -309,8 +330,8 @@ func (wr *WaitingRoom) cookieSecure(r *http.Request) bool {
 // setProbeCookie's — see there.
 //
 // Related: WaitingRoom.setProbeCookie, WaitingRoom.StatusHandler
-func (wr *WaitingRoom) setTicketCookie(c *gin.Context, token string, secure bool) {
-	http.SetCookie(c.Writer, &http.Cookie{
+func (wr *WaitingRoom) setTicketCookie(w http.ResponseWriter, token string, secure bool) {
+	http.SetCookie(w, &http.Cookie{
 		Name:     cookieName,
 		Value:    token,
 		Path:     wr.CookiePath(),
@@ -341,8 +362,8 @@ func (wr *WaitingRoom) setTicketCookie(c *gin.Context, token string, secure bool
 // worse than no probe at all.
 //
 // Related: WaitingRoom.Middleware, WaitingRoom.StatusHandler
-func (wr *WaitingRoom) setProbeCookie(c *gin.Context, secure bool) {
-	http.SetCookie(c.Writer, &http.Cookie{
+func (wr *WaitingRoom) setProbeCookie(w http.ResponseWriter, secure bool) {
+	http.SetCookie(w, &http.Cookie{
 		Name:     probeCookieName,
 		Value:    probeCookieValue,
 		Path:     wr.CookiePath(),

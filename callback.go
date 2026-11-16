@@ -66,6 +66,20 @@ const (
 	// lower-ranked tickets, with Snapshot.Token and Snapshot.ClientKey
 	// set. It does not fire when a rank is only recorded.
 	EventRank
+
+	// EventLease fires when Acquire grants a key a slot, with Snapshot.Key
+	// set. EventEnter (and EventFull, on the edge) fire as well.
+	EventLease
+
+	// EventRelease fires when Release returns a key's slot, with
+	// Snapshot.Key set. EventExit (and EventDrain, on the edge) fire as
+	// well.
+	EventRelease
+
+	// EventLeaseExpire fires when the reaper returns the slot of a lease
+	// whose SetLeaseTTL ran out, once per expired lease, with Snapshot.Key
+	// set. EventExit (and EventDrain, on the edge) fire as well.
+	EventLeaseExpire
 )
 
 // String returns the canonical name of the Event, suitable for logging.
@@ -91,6 +105,12 @@ func (e Event) String() string {
 		return "Remove"
 	case EventRank:
 		return "Rank"
+	case EventLease:
+		return "Lease"
+	case EventRelease:
+		return "Release"
+	case EventLeaseExpire:
+		return "LeaseExpire"
 	default:
 		return "Unknown"
 	}
@@ -133,6 +153,12 @@ type Snapshot struct {
 	// request carried no room_ticket at all, which is the signature of a
 	// client that is discarding cookies.
 	StaleTicket bool
+
+	// Key is the application key the event concerns: set on EventQueue for
+	// a keyed ticket, on EventRemove raised by Leave, and on EventLease,
+	// EventRelease and EventLeaseExpire. Token is empty whenever Key is
+	// set, since a keyed ticket's token is never handed out.
+	Key string
 }
 
 // Full returns true when Occupancy equals or exceeds Capacity.
@@ -228,5 +254,13 @@ func (wr *WaitingRoom) snapshotFor(event Event, token, clientKey string, staleTi
 	s.Token = token
 	s.ClientKey = clientKey
 	s.StaleTicket = staleTicket
+	return s
+}
+
+// snapshotForKey builds a Snapshot for an event that concerns one keyed
+// ticket or lease. Token stays empty: a keyed ticket's token is internal.
+func (wr *WaitingRoom) snapshotForKey(event Event, key string) Snapshot {
+	s := wr.snapshot(event)
+	s.Key = key
 	return s
 }

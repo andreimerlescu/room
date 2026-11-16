@@ -2,6 +2,8 @@
 
 all: lint clean test test-race test-fuzz bench
 
+e2e: test test-race test-fuzz bench
+
 test:
 	go test -count=1 -v ./...
 

@@ -152,3 +152,54 @@ type ErrInvalidRank struct {
 func (e ErrInvalidRank) Error() string {
 	return fmt.Sprintf("room: invalid rank %d: must be >= 0", e.Given)
 }
+
+// ErrInvalidKey is returned when an application key is empty or longer
+// than MaxKeyLen bytes. Keys are identities, so room rejects an over-long
+// key rather than truncating it into another key's place.
+type ErrInvalidKey struct {
+	Len int
+}
+
+func (e ErrInvalidKey) Error() string {
+	return fmt.Sprintf("room: invalid key of %d bytes: must be 1–%d bytes", e.Len, MaxKeyLen)
+}
+
+// ErrQueueFull is returned by Enter and Acquire when SetMaxQueueDepth is
+// reached and the key is not already in line.
+type ErrQueueFull struct {
+	Max int64
+}
+
+func (e ErrQueueFull) Error() string {
+	return fmt.Sprintf("room: queue is full (max depth %d)", e.Max)
+}
+
+// ErrLeaseHeld is returned by Enter for a key that holds a lease: a key
+// with a slot is not in line.
+type ErrLeaseHeld struct{}
+
+func (e ErrLeaseHeld) Error() string {
+	return "room: key holds a lease and is not in line"
+}
+
+// ErrNoLease is returned by Release for a key that holds no lease.
+type ErrNoLease struct{}
+
+func (e ErrNoLease) Error() string {
+	return "room: key holds no lease"
+}
+
+// ErrLeaseTTL is returned by SetLeaseTTL when a non-zero duration falls
+// outside [Min, Max].
+type ErrLeaseTTL struct {
+	Given time.Duration
+	Min   time.Duration
+	Max   time.Duration
+}
+
+func (e ErrLeaseTTL) Error() string {
+	return fmt.Sprintf(
+		"room: lease TTL %s out of range [%s, %s] (0 disables)",
+		e.Given, e.Min, e.Max,
+	)
+}

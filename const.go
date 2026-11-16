@@ -143,3 +143,20 @@ const (
 	// passMaxDuration is the maximum value accepted by SetPassDuration.
 	passMaxDuration = 24 * time.Hour
 )
+
+// MaxKeyLen is the longest application key accepted by Enter, Acquire,
+// Leave, Release and SetTicketKeyFunc, in bytes.
+const MaxKeyLen = 256
+
+const (
+	// leaseTTLMin and leaseTTLMax bound SetLeaseTTL. 0 disables expiry.
+	leaseTTLMin = time.Minute
+	leaseTTLMax = 30 * 24 * time.Hour
+
+	// waitRetryAfter is the Retry-After sent with a JSON wait response:
+	// the waiting page's own poll cadence.
+	waitRetryAfter = 3 * time.Second
+
+	// defaultStatusBaseURL prefixes a keyed ticket's ID in status_url.
+	defaultStatusBaseURL = "/queue/status/"
+)

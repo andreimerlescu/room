@@ -58,115 +58,122 @@ const cookieRefreshDivisor = 3
 // Related: WaitingRoom.Middleware, WaitingRoom.RegisterRoutes
 func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
-		if !wr.checkInitialised(c) {
-			return
-		}
+		wr.serveStatus(c.Writer, c.Request)
+	}
+}
 
-		cookie, err := c.Request.Cookie(cookieName)
-		if err != nil {
-			// No room_ticket cookie at all.
-			//
-			// This previously returned ready=true, reasoning that a client
-			// with no queue position should retry the original request.
-			// That is correct for a client that never queued — but it is
-			// catastrophic for a client that CANNOT store cookies: the
-			// waiting room page reads ready=true, reloads, is handed a
-			// fresh ticket at the back of the line, and repeats every few
-			// seconds indefinitely, never admitted, leaking a token-store
-			// entry and a nextTicket increment per cycle.
-			//
-			// Signal the condition explicitly instead. The page stops
-			// polling and surfaces an error.
-			//
-			// This does not affect the normal admission flow: a client
-			// that was just admitted still HAS the cookie (now pointing
-			// at a deleted token) and so takes the ready=true path below.
-			// Only a client with no cookie at all reaches here, and for
-			// such a client ready=true was never actionable anyway.
-			c.JSON(http.StatusOK, statusResponse{
-				Ready:           false,
-				CookiesRequired: true,
-			})
-			return
-		}
+// serveStatus is the net/http implementation of GET /queue/status, shared
+// by StatusHandler and Handler. See StatusHandler.
+func (wr *WaitingRoom) serveStatus(w http.ResponseWriter, r *http.Request) {
+	if !wr.initialised.Load() {
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
 
-		now := time.Now()
-		edge := wr.nowServing.Load() + int64(wr.cap.Load())
-		res := wr.tokens.poll(
-			cookie.Value,
-			now,
-			edge,
-			statusPollMinInterval,
-			wr.TokenTTL()/cookieRefreshDivisor,
-		)
+	cookie, err := r.Cookie(cookieName)
+	if err != nil {
+		// No room_ticket cookie at all.
+		//
+		// This previously returned ready=true, reasoning that a client
+		// with no queue position should retry the original request.
+		// That is correct for a client that never queued — but it is
+		// catastrophic for a client that CANNOT store cookies: the
+		// waiting room page reads ready=true, reloads, is handed a
+		// fresh ticket at the back of the line, and repeats every few
+		// seconds indefinitely, never admitted, leaking a token-store
+		// entry and a nextTicket increment per cycle.
+		//
+		// Signal the condition explicitly instead. The page stops
+		// polling and surfaces an error.
+		//
+		// This does not affect the normal admission flow: a client
+		// that was just admitted still HAS the cookie (now pointing
+		// at a deleted token) and so takes the ready=true path below.
+		// Only a client with no cookie at all reaches here, and for
+		// such a client ready=true was never actionable anyway.
+		writeJSON(w, http.StatusOK, statusResponse{
+			Ready:           false,
+			CookiesRequired: true,
+		})
+		return
+	}
 
-		switch res.outcome {
-		case pollUnknown:
-			// Admitted, removed, reaped, or from another process —
-			// send the client back to the main handler.
-			c.JSON(http.StatusOK, statusResponse{Ready: true})
-			return
+	now := time.Now()
+	edge := wr.nowServing.Load() + int64(wr.cap.Load())
+	res := wr.tokens.poll(
+		cookie.Value,
+		now,
+		edge,
+		statusPollMinInterval,
+		wr.TokenTTL()/cookieRefreshDivisor,
+	)
 
-		case pollExpired:
-			// The removed entry is ours alone, so we retire its ticket:
-			// without this, an expired ticket discovered here would never
-			// advance the window and would permanently occupy a slot.
-			wr.retire(res.entry.ticket)
-			wr.emit(EventEvict, wr.snapshot(EventEvict))
-			c.JSON(http.StatusOK, statusResponse{Ready: true})
-			return
+	switch res.outcome {
+	case pollUnknown:
+		// Admitted, removed, reaped, or from another process —
+		// send the client back to the main handler.
+		writeJSON(w, http.StatusOK, statusResponse{Ready: true})
+		return
 
-		case pollRateLimited:
-			// Shed the excess poll. The token was still kept alive by
-			// poll, so a fast poller is throttled, not reaped.
-			c.Header("Retry-After", "1")
-			c.JSON(http.StatusTooManyRequests, statusResponse{
-				Ready:    false,
-				Position: wr.positionOf(res.entry.ticket),
-			})
-			return
-		}
+	case pollExpired:
+		// The removed entry is ours alone, so we retire its ticket:
+		// without this, an expired ticket discovered here would never
+		// advance the window and would permanently occupy a slot.
+		wr.retire(res.entry.ticket)
+		wr.emit(EventEvict, wr.snapshot(EventEvict))
+		writeJSON(w, http.StatusOK, statusResponse{Ready: true})
+		return
 
-		// Accepted poll. Re-send cookies first (headers must precede the
-		// body) if poll decided they are due.
-		if res.refreshCookie {
-			secure := wr.cookieSecure(c.Request)
-			wr.setTicketCookie(c, cookie.Value, secure)
-			wr.setProbeCookie(c, secure)
-		}
+	case pollRateLimited:
+		// Shed the excess poll. The token was still kept alive by
+		// poll, so a fast poller is throttled, not reaped.
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusTooManyRequests, statusResponse{
+			Ready:    false,
+			Position: wr.positionOf(res.entry.ticket),
+		})
+		return
+	}
 
-		position := wr.positionOf(res.entry.ticket)
-		if position <= 0 {
-			c.JSON(http.StatusOK, statusResponse{Ready: true})
-			return
-		}
+	// Accepted poll. Re-send cookies first (headers must precede the
+	// body) if poll decided they are due.
+	if res.refreshCookie {
+		secure := wr.cookieSecure(r)
+		wr.setTicketCookie(w, cookie.Value, secure)
+		wr.setProbeCookie(w, secure)
+	}
 
-		// Check if the client has a valid VIP pass.
-		hasPass := false
-		if passCookie, err := c.Request.Cookie(passCookieName); err == nil {
-			hasPass = wr.HasValidPass(passCookie.Value)
-		}
+	position := wr.positionOf(res.entry.ticket)
+	if position <= 0 {
+		writeJSON(w, http.StatusOK, statusResponse{Ready: true})
+		return
+	}
 
-		// Build the response with optional pricing information.
-		resp := statusResponse{
-			Ready:       false,
-			Position:    position,
-			Utilization: wr.sem.UtilizationSmoothed(),
-			HasPass:     hasPass,
-		}
+	// Check if the client has a valid VIP pass.
+	hasPass := false
+	if passCookie, err := r.Cookie(passCookieName); err == nil {
+		hasPass = wr.HasValidPass(passCookie.Value)
+	}
 
-		// Only show pricing if the client does NOT already have a pass.
-		if !hasPass {
-			if fn := wr.rateFuncLoad(); fn != nil {
-				resp.RatePerPos = fn(wr.QueueDepth())
-				if position > 1 {
-					resp.SkipCost = float64(position-1) * resp.RatePerPos
-				}
+	// Build the response with optional pricing information.
+	resp := statusResponse{
+		Ready:       false,
+		Position:    position,
+		Utilization: wr.sem.UtilizationSmoothed(),
+		HasPass:     hasPass,
+	}
+
+	// Only show pricing if the client does NOT already have a pass.
+	if !hasPass {
+		if fn := wr.rateFuncLoad(); fn != nil {
+			resp.RatePerPos = fn(wr.QueueDepth())
+			if position > 1 {
+				resp.SkipCost = float64(position-1) * resp.RatePerPos
 			}
 		}
-
-		c.JSON(http.StatusOK, resp)
 	}
+
+	writeJSON(w, http.StatusOK, resp)
 }
 
 // positionOf returns the queue position for a ticket.
@@ -196,10 +203,13 @@ func (wr *WaitingRoom) positionOf(ticket int64) int64 {
 	return pos
 }
 
-// RegisterRoutes registers GET /queue/status on the given gin.Engine and
-// then attaches the WaitingRoom middleware. It ensures the status endpoint
-// always bypasses the queue — if you register routes manually, always add
-// StatusHandler before Use(Middleware()).
+// RegisterRoutes registers GET /queue/status (a cookie client's status) and
+// GET /queue/status/:ticket (a keyed ticket's place, by public ID) on the
+// given gin.Engine and then attaches the WaitingRoom middleware. It
+// ensures the status endpoints always bypass the queue — if you register
+// routes manually, always add StatusHandler and TicketStatusHandler before
+// Use(Middleware()). An engine that already has a route under
+// /queue/status/ will panic here, as gin rejects conflicting routes.
 //
 // # Multiple engines
 //
@@ -242,6 +252,7 @@ func (wr *WaitingRoom) RegisterRoutes(r *gin.Engine) {
 		c.Status(http.StatusNoContent)
 	})
 	r.GET("/queue/status", wr.StatusHandler())
+	r.GET("/queue/status/:ticket", wr.TicketStatusHandler())
 	r.Use(wr.Middleware())
 }
 
