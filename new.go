@@ -87,9 +87,9 @@ func (wr *WaitingRoom) Init(cap int32) error {
 		return ErrInvalidCap{Given: cap}
 	}
 
-	if wr.stopReaper != nil {
-		wr.stopReaper()
-	}
+	// Wait for any previous reaper to exit before replacing the state it
+	// reads.
+	wr.haltReaper()
 
 	wr.cap.Store(cap)
 	wr.sem = sema.Must(int(cap))
@@ -122,15 +122,14 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	return nil
 }
 
-// Stop shuts down the background reaper goroutine. Call it when your
+// Stop shuts down the background reaper goroutine and waits for it to
+// exit, so no reaper pass runs after Stop returns. Call it when your
 // application is shutting down to ensure a clean exit with no leaked
-// goroutines.
+// goroutines. Calling it more than once is harmless.
 //
 // Related: WaitingRoom.Init, WaitingRoom.startReaper
 func (wr *WaitingRoom) Stop() {
-	if wr.stopReaper != nil {
-		wr.stopReaper()
-	}
+	wr.haltReaper()
 }
 
 // SetSecureCookie controls whether the waiting-room session cookie is

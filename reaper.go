@@ -146,7 +146,14 @@ func (wr *WaitingRoom) signalReaperRestart() {
 //
 // Related: WaitingRoom.Stop, WaitingRoom.SetReaperInterval, WaitingRoom.SetFirstPollGrace
 func (wr *WaitingRoom) startReaper(ctx context.Context) {
+	// The goroutine reads only these locals and atomics, never the
+	// WaitingRoom's channel fields, so a later Init cannot race it; and
+	// Stop waits on done, so it never outlives the room's shutdown.
+	restart := wr.reaperRestart
+	done := make(chan struct{})
+	wr.reaperDone = done
 	go func() {
+		defer close(done)
 		ticker := time.NewTicker(wr.effectiveReaperInterval())
 		defer ticker.Stop()
 
@@ -155,7 +162,7 @@ func (wr *WaitingRoom) startReaper(ctx context.Context) {
 			case <-ctx.Done():
 				return
 
-			case <-wr.reaperRestart:
+			case <-restart:
 				ticker.Stop()
 				ticker = time.NewTicker(wr.effectiveReaperInterval())
 
@@ -164,6 +171,17 @@ func (wr *WaitingRoom) startReaper(ctx context.Context) {
 			}
 		}
 	}()
+}
+
+// haltReaper cancels the reaper goroutine and waits for it to exit. Safe
+// to call more than once and before the reaper was ever started.
+func (wr *WaitingRoom) haltReaper() {
+	if wr.stopReaper != nil {
+		wr.stopReaper()
+	}
+	if wr.reaperDone != nil {
+		<-wr.reaperDone
+	}
 }
 
 // reap performs a full eviction cycle over the token store and the pass

@@ -62,6 +62,7 @@ type WaitingRoom struct {
 	html           []byte
 	tokens         *tokenStore
 	stopReaper     context.CancelFunc
+	reaperDone     chan struct{} // closed when the reaper goroutine exits
 	reaperInterval atomic.Int64
 	reaperRestart  chan struct{}
 	initialised    atomic.Bool
