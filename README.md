@@ -68,7 +68,7 @@ callbacks, an admin read/remove API, and a line that survives restarts.
 ## Installation
 
 ```
-go get github.com/andreimerlescu/room@v1.3.0
+go get github.com/andreimerlescu/room@v1.5.0
 ```
 
 Requires [gin](https://github.com/gin-gonic/gin) and the Go version declared
@@ -344,6 +344,96 @@ and reports `has_pass: true`.
 
 ---
 
+## API clients and AI agents — keyed tickets
+
+A browser keeps its place with a cookie. An API client or an AI agent calling
+with a bearer token has no cookie jar, so v1.5.0 lets the application name a
+ticket by a **key** instead — typically the ID of the client's token.
+
+### Through the middleware
+
+```go
+wr.SetTicketKeyFunc(func(c *gin.Context) (string, bool) {
+    id, ok := tokenIDFrom(c.GetHeader("Authorization")) // your lookup
+    return id, ok // ok=false: the request uses the cookie flow as before
+})
+```
+
+A request with a key never gets a cookie. The same key finds the same place
+on every request, and a queued one is answered with:
+
+```
+HTTP/1.1 503 Service Unavailable
+Retry-After: 3
+
+{"waiting":true,"position":4,"queue_depth":120,"status_url":"/queue/status/9f…","retry_after":3}
+```
+
+`status_url` is a page a person can open to watch that place. It shows the
+place, updates itself, and grants nothing: the ID in it is not the key and
+cannot claim the ticket. Watching it never keeps the place alive — only the
+client asking again does, within `TokenTTL`. Behind a proxy, or with the
+routes mounted elsewhere, set the prefix: `wr.SetStatusBaseURL("https://example.com/wait/queue/status/")`.
+
+Requests without a key are untouched: browsers get the waiting-room page.
+To also send JSON to *cookie* clients that don't ask for HTML (`fetch`,
+curl), opt in with `wr.SetWaitJSON(true)`; it is off by default. To write
+the response yourself for every queued request, use `wr.SetWaitResponder`.
+
+### Without the middleware
+
+```go
+ticket, place, err := wr.Enter(key) // join, or find your place; 1 is the front
+place, ok := wr.Position(ticket)    // read-only
+err = wr.Leave(key)                 // a key not in line is fine
+```
+
+`Enter` never admits anyone. It suits a server that decides for itself who
+goes in — it keeps its own count, and calls `Leave` when a key starts. A key
+that stops calling `Enter` for `TokenTTL` is reaped, and the keys behind it
+move up. A place counts every ticket ahead, so with nobody admitted places
+run 1, 2, 3… whatever the capacity. Computing one costs a pass over the line,
+like `Queue`.
+
+### Leases: a slot held until you release it
+
+```go
+ok, place, err := wr.Acquire(key) // ok: the slot is yours until Release
+err = wr.Release(key)
+wr.Held()                         // slots held by leases
+wr.SetLeaseTTL(4 * time.Hour)     // optional: reclaim leases nobody renews
+```
+
+A request holds its slot until its handler returns; a lease holds one until
+`Release`, across any number of requests. Leases share the room's capacity
+and its line, first come, first served: `Acquire` succeeds only when the
+key's place has reached the serving window and a slot is free; otherwise the
+key keeps (or takes) its place and `ok` is false. `Acquire` by a holder
+renews its lease. With `SetTicketKeyFunc`, a holder's requests pass the
+middleware without taking a second slot. `SetCap` below `Held()` revokes no
+lease and grants no new slot until enough are released. Leases survive
+`Export`/`Import`.
+
+### Without gin
+
+```go
+mux.Handle("/wait/", http.StripPrefix("/wait", wr.Handler()))
+wr.SetStatusBaseURL("/wait/queue/status/")
+```
+
+`Handler()` serves `GET /queue/status`, `GET /queue/status/{id}` and the
+preflight under `net/http`. A `net/http` server drives the line with
+`Enter`/`Leave` or `Acquire`/`Release`; the middleware itself is gin-only.
+
+### One line per process
+
+The line lives in memory. Two processes behind one load balancer keep two
+lines, each with its own place 1 and its own capacity. If your service runs
+several processes and the line must be shared, keep the line in shared
+storage and use room per process only for what is local to it.
+
+---
+
 ## Lifecycle callbacks
 
 ```go
@@ -352,7 +442,7 @@ wr.On(room.EventDrain, func(s room.Snapshot) { go deregisterHost() })
 wr.On(room.EventQueue, func(s room.Snapshot) { metrics.Inc("room.queue") })
 ```
 
-| Event | Fires when | `Token` / `ClientKey` set |
+| Event | Fires when | `Token` / `ClientKey` (or `Key`) set |
 |---|---|---|
 | `EventEnter` | Request acquires a slot | — |
 | `EventExit` | Request completes | — |
@@ -364,6 +454,12 @@ wr.On(room.EventQueue, func(s room.Snapshot) { metrics.Inc("room.queue") })
 | `EventPromote` | Paid, admin or VIP-pass promotion | ✓ |
 | `EventRemove` | `RemoveToken` (one event, with token) / `RemoveTokensFunc` (one per call, no token) | ✓ for `RemoveToken` |
 | `EventRank` | `SetTicketRank` moved a ticket ahead of lower ranks | ✓ |
+| `EventLease` | `Acquire` granted a slot | `Key` |
+| `EventRelease` | `Release` returned a slot | `Key` |
+| `EventLeaseExpire` | The reaper returned a lease past `SetLeaseTTL` (one per lease) | `Key` |
+
+For a keyed ticket, `EventQueue` and `EventRemove` (from `Leave`) carry
+`Snapshot.Key` and leave `Token` empty: a keyed ticket's token is internal.
 
 ```go
 type Snapshot struct {
@@ -374,6 +470,7 @@ type Snapshot struct {
     Token       string // bearer credential — never log it
     ClientKey   string
     StaleTicket bool   // EventQueue: request carried an unrecognised room_ticket
+    Key         string // keyed tickets and leases
 }
 ```
 
@@ -437,7 +534,8 @@ setting changes live without restarting:
 `SetCap`, `SetMaxQueueDepth`, `SetReaperInterval`, `SetTokenTTL`,
 `SetFirstPollGrace`, `SetPassDuration`, `SetHTML`, `SetSkipURL`,
 `SetRateFunc`, `SetClientKeyFunc`, `SetSecureCookie`, `SetCookiePath`,
-`SetCookieDomain`.
+`SetCookieDomain`, `SetTicketKeyFunc`, `SetWaitJSON`, `SetWaitResponder`,
+`SetStatusBaseURL`, `SetLeaseTTL`.
 
 Caveats:
 
@@ -551,6 +649,36 @@ when clients abandon at the moment they are told to come in.
 | **Capacity integrity** | The semaphore is the hard limit; ledger accounting prevents both over- and under-admission. |
 | **Promotion integrity** | Promotions are serialized and never re-insert a ticket that was removed or admitted concurrently. |
 | **Pass expiry** | Enforced on the server, not only by cookie `MaxAge`. |
+| **Keyed tickets** | A keyed ticket's token is never sent to the client, and a `room_ticket` cookie carrying one is treated as unknown, so it cannot claim the admission. The public ID in `status_url` only reads a place, is rate-limited to one view per second, and never keeps the place alive. Keys are capped at 256 bytes and rejected, never truncated, past that. |
+
+---
+
+## Upgrading from v1.4.0
+
+Nothing is removed and no signature changes. Every existing request is
+handled exactly as before unless you call one of the new setters.
+
+- **New route.** `RegisterRoutes` and `NewWaitingRoom` also register
+  `GET /queue/status/:ticket`. An engine that already has a route under
+  `/queue/status/` panics there (gin rejects conflicting routes).
+- **`Stop` waits** for the reaper goroutine to exit. v1.4.0 only cancelled
+  it, so a reaper pass could still run after `Stop` — and race a following
+  `Init`.
+- **Export format.** Exports carry `key` and `id` for keyed tickets (an
+  older room ignores them). An export taken while leases are held is
+  version 2, which v1.4.0 refuses rather than drop the leases. Import
+  accepts versions 1 and 2.
+- **`ImportStats.LeasesRestored`**, **`TicketInfo.Key`/`ID`/`Place`** and
+  **`Snapshot.Key`** are new fields; `Snapshot` stays comparable.
+- **New events** `EventLease`, `EventRelease`, `EventLeaseExpire` come after
+  `EventRank`, so existing `Event` values are unchanged.
+
+New APIs: `SetTicketKeyFunc`, `TicketKeyFunc`, `Enter`, `Position`, `Leave`,
+`TicketByKey`, `Acquire`, `Release`, `Held`, `HasLease`, `SetLeaseTTL`,
+`LeaseTTL`, `SetWaitJSON`, `WaitJSON`, `SetWaitResponder`, `WaitResponder`,
+`SetStatusBaseURL`, `StatusBaseURL`, `TicketStatusHandler`, `Handler`,
+`MaxKeyLen`, and the errors `ErrInvalidKey`, `ErrQueueFull`, `ErrLeaseHeld`,
+`ErrNoLease`, `ErrLeaseTTL`.
 
 ---
 
@@ -609,6 +737,8 @@ wr.Stop()
 wr.RegisterRoutes(r *gin.Engine)
 wr.Middleware() gin.HandlerFunc
 wr.StatusHandler() gin.HandlerFunc
+wr.TicketStatusHandler() gin.HandlerFunc   // GET /queue/status/:ticket
+wr.Handler() http.Handler                  // the status routes, for net/http
 
 // ── Configuration (safe while serving) ────────────────────
 wr.SetCap(cap int32) error
@@ -650,6 +780,26 @@ wr.RemoveTokensFunc(match func(room.TicketInfo) bool) int
 wr.AdminPromote(token string, targetPosition int64) error
 wr.SetTicketRank(token string, rank int) (bool, error)
 
+// ── Keyed tickets and leases ──────────────────────────────
+wr.SetTicketKeyFunc(fn room.TicketKeyFunc)
+wr.Enter(key string) (ticket string, position int64, err error)
+wr.Position(ticket string) (position int64, ok bool)
+wr.Leave(key string) error
+wr.TicketByKey(key string) (room.TicketInfo, bool)
+wr.Acquire(key string) (ok bool, position int64, err error)
+wr.Release(key string) error
+wr.Held() int32
+wr.HasLease(key string) bool
+wr.SetLeaseTTL(d time.Duration) error        // 0 = leases last until Release
+wr.LeaseTTL() time.Duration
+
+// ── Wait responses ────────────────────────────────────────
+wr.SetWaitJSON(on bool)                      // JSON for non-HTML cookie clients; off by default
+wr.WaitJSON() bool
+wr.SetWaitResponder(fn room.WaitResponder)
+wr.SetStatusBaseURL(base string)             // "" = "/queue/status/"
+wr.StatusBaseURL() string
+
 // ── Skip the line ─────────────────────────────────────────
 wr.QuoteCost(token string, targetPosition int64) (float64, error)
 wr.PromoteToken(token string, targetPosition int64) (room.PromoteResult, error)
@@ -677,20 +827,25 @@ Measured on an Apple M4 Pro (`-14`). The HTTP benchmarks go through the full
 gin stack and `httptest`.
 
 ```
-BenchmarkFastPath-14                        1795 ns/op     5315 B/op   13 allocs/op
-BenchmarkStatusPoll_Accepted-14              986 ns/op     6880 B/op   28 allocs/op
-BenchmarkStatusPoll_RateLimited-14          2567 ns/op     6949 B/op   28 allocs/op
-BenchmarkSlowPathIssue-14                   6808 ns/op    72349 B/op   28 allocs/op
-BenchmarkResumeRender-14                   21313 ns/op    72725 B/op   36 allocs/op
-BenchmarkTokenStore_PollSequenceV121-14      692 ns/op        0 B/op    0 allocs/op
-BenchmarkTokenStore_PollSingleLock-14        339 ns/op        0 B/op    0 allocs/op
-BenchmarkQueue_100of100k-14              1622315 ns/op    44592 B/op  106 allocs/op
-BenchmarkRemoveToken-14                      286 ns/op       42 B/op    0 allocs/op
-BenchmarkRemoveTokensFunc_10k-14          830141 ns/op  1632576 B/op   14 allocs/op
-BenchmarkQueueDepth-14                     1.015 ns/op        0 B/op    0 allocs/op
-BenchmarkAdvance_EmptyLedger-14            2.287 ns/op        0 B/op    0 allocs/op
-BenchmarkPositionOf_Ledger1k-14            6.234 ns/op        0 B/op    0 allocs/op
-BenchmarkHasValidPass-14                   34.34 ns/op        0 B/op    0 allocs/op
+BenchmarkStatusPoll_Accepted-14                   845295              1210 ns/op            6928 B/op         29 allocs/op
+BenchmarkStatusPoll_RateLimited-14                477128              2380 ns/op            6996 B/op         29 allocs/op
+BenchmarkResumeRender-14                           53664             22501 ns/op           72769 B/op         38 allocs/op
+BenchmarkSlowPathIssue-14                         116276              8863 ns/op           72163 B/op         31 allocs/op
+BenchmarkTokenStore_PollSequenceV121-14          2004867               646.3 ns/op             0 B/op          0 allocs/op
+BenchmarkTokenStore_PollSingleLock-14            3384638               349.1 ns/op             0 B/op          0 allocs/op
+BenchmarkAdvance_EmptyLedger-14                 519567956                2.298 ns/op           0 B/op          0 allocs/op
+BenchmarkPositionOf_Ledger1k-14                 193003152                6.167 ns/op           0 B/op          0 allocs/op
+BenchmarkQuoteCost-14                           44820438                26.59 ns/op            0 B/op          0 allocs/op
+BenchmarkPromoteToken-14                         2242298               547.9 ns/op           507 B/op          4 allocs/op
+BenchmarkPromoteTokenToFront-14                  2319519               553.5 ns/op           504 B/op          4 allocs/op
+BenchmarkGrantPass-14                            2587899               475.4 ns/op           187 B/op          1 allocs/op
+BenchmarkHasValidPass-14                        33036274                35.57 ns/op            0 B/op          0 allocs/op
+BenchmarkQueue_100of100k-14                          308           3729343 ns/op           61296 B/op        106 allocs/op
+BenchmarkRemoveToken-14                          5842926               235.8 ns/op            43 B/op          0 allocs/op
+BenchmarkRemoveTokensFunc_10k-14                    1153           1074017 ns/op         2337088 B/op         14 allocs/op
+BenchmarkFastPath-14                              680660              1709 ns/op            5314 B/op         13 allocs/op
+BenchmarkQueueDepth-14                          1000000000               1.135 ns/op           0 B/op          0 allocs/op
+BenchmarkUtilizationSmoothed-14                 1000000000               0.7844 ns/op          0 B/op          0 allocs/op
 ```
 
 Two numbers to plan around:
