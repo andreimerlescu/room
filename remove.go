@@ -136,7 +136,7 @@ func (ts *tokenStore) takeMany(tokens []string) []ticketEntry {
 	out := make([]ticketEntry, 0, len(tokens))
 	for _, token := range tokens {
 		if entry, ok := ts.entries[token]; ok {
-			delete(ts.entries, token)
+			ts.removeLocked(token, entry)
 			out = append(out, entry)
 		}
 	}

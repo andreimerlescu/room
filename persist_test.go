@@ -359,7 +359,7 @@ func TestImport_InvalidInputLeavesRoomUntouched(t *testing.T) {
 		b, _ := json.Marshal(f)
 		return string(b)
 	}
-	cases["version"] = mk(persistFile{Version: 2, ExportedAt: now})
+	cases["version"] = mk(persistFile{Version: 3, ExportedAt: now}) // 1 and 2 (leases) are valid
 	cases["no-exported-at"] = mk(persistFile{Version: persistFormatVersion})
 	cases["empty-token"] = mk(persistFile{Version: persistFormatVersion, ExportedAt: now,
 		Tickets: []persistedTicket{{Token: "", LastSeen: now}}})

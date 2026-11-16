@@ -1,0 +1,60 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Place in line</title>
+    <style>
+        body {
+            background: #0f1117; color: #e2e8f0;
+            font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            min-height: 100vh; display: flex; align-items: center; justify-content: center;
+            margin: 0; padding: 1.5rem;
+        }
+        .card {
+            background: #1a1d27; border: 1px solid #2a2d3a; border-radius: 12px;
+            padding: 2.5rem 3rem; max-width: 420px; width: 100%; text-align: center;
+        }
+        h1 { font-size: 1.2rem; font-weight: 600; margin: 0 0 1.5rem; }
+        .label { font-size: .75rem; text-transform: uppercase; letter-spacing: .08em; color: #64748b; }
+        .number { font-size: 3rem; font-weight: 700; margin: .4rem 0 1.5rem; }
+        .note { font-size: .8rem; color: #64748b; line-height: 1.5; }
+    </style>
+</head>
+<body>
+<div class="card">
+    <h1 id="title">Waiting in line</h1>
+    <div aria-live="polite" aria-atomic="true">
+        <div class="label" id="label">Place</div>
+        <div class="number" id="position">{{.Position}}</div>
+    </div>
+    <p class="note" id="note">This page shows a place in line and updates itself.
+        It does not hold the place: the client that joined the line does.</p>
+</div>
+<script>
+    // Poll this page's own URL: correct under any mount prefix.
+    const STATUS_URL = window.location.pathname;
+    const positionEl = document.getElementById("position");
+    function done() {
+        document.getElementById("title").textContent = "No longer waiting";
+        document.getElementById("label").textContent = "";
+        positionEl.textContent = "—";
+        document.getElementById("note").textContent =
+            "This place has left the line: it was admitted, or it left or expired.";
+    }
+    async function poll() {
+        try {
+            const res = await fetch(STATUS_URL, { cache: "no-store", headers: { "Accept": "application/json" } });
+            if (res.status === 404) { done(); return; }
+            if (res.ok) {
+                const data = await res.json();
+                if (!data.waiting) { done(); return; }
+                positionEl.textContent = String(data.position);
+            }
+        } catch (_) {}
+        setTimeout(poll, 3000 + Math.random() * 500);
+    }
+    setTimeout(poll, 3000 + Math.random() * 500);
+</script>
+</body>
+</html>
