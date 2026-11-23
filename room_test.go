@@ -827,6 +827,374 @@ func TestSetCap_InvalidCapRejected(t *testing.T) {
 	}
 }
 
+func recordPeak(peak *atomic.Int32, cur int32) {
+	for {
+		prev := peak.Load()
+		if cur <= prev || peak.CompareAndSwap(prev, cur) {
+			return
+		}
+	}
+}
+
+func TestSetCap_ShrinkPreservesInFlightCeiling(t *testing.T) {
+	const (
+		initialCap = 10
+		shrunkCap  = 3
+		queuedInit = 12
+		midDrain   = 2
+		fastBurst  = 6
+		totalNew   = queuedInit + midDrain + fastBurst
+	)
+
+	wr := newTestWR(t, initialCap)
+
+	holderEntered := make(chan struct{}, initialCap)
+	holderGates := make([]chan struct{}, initialCap)
+	holderDone := make(chan struct{}, initialCap)
+	for i := range initialCap {
+		holderGates[i] = make(chan struct{})
+	}
+
+	var (
+		holderIdx   atomic.Int32
+		active      atomic.Int32
+		overallPeak atomic.Int32
+		newActive   atomic.Int32
+		newPeak     atomic.Int32
+		newEntered  atomic.Int32
+		newServed   atomic.Int32
+	)
+
+	r := gin.New()
+	wr.RegisterRoutes(r)
+	r.GET("/", func(c *gin.Context) {
+		cur := active.Add(1)
+		recordPeak(&overallPeak, cur)
+		defer active.Add(-1)
+
+		if c.Query("role") == "holder" {
+			idx := int(holderIdx.Add(1)) - 1
+			holderEntered <- struct{}{}
+			<-holderGates[idx]
+			c.Status(http.StatusOK)
+			return
+		}
+
+		newEntered.Add(1)
+		curNew := newActive.Add(1)
+		recordPeak(&newPeak, curNew)
+		defer newActive.Add(-1)
+
+		time.Sleep(15 * time.Millisecond)
+		newServed.Add(1)
+		c.Status(http.StatusOK)
+	})
+
+	// Fill all 10 initial slots and wait until all 10 are inside the origin handler.
+	for range initialCap {
+		go func() {
+			defer func() { holderDone <- struct{}{} }()
+			req := httptest.NewRequest(http.MethodGet, "/?role=holder", nil)
+			r.ServeHTTP(httptest.NewRecorder(), req)
+		}()
+	}
+	for i := range initialCap {
+		select {
+		case <-holderEntered:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for initial holder %d to enter origin", i)
+		}
+	}
+	if l := wr.Len(); l != initialCap {
+		t.Fatalf("before shrink: Len()=%d, want %d", l, initialCap)
+	}
+
+	// Shrink capacity from 10 to 3 while all 10 holders are in flight.
+	if err := wr.SetCap(shrunkCap); err != nil {
+		t.Fatalf("SetCap(%d): %v", shrunkCap, err)
+	}
+	if c := wr.Cap(); c != shrunkCap {
+		t.Fatalf("after shrink: Cap()=%d, want %d", c, shrunkCap)
+	}
+	if l := wr.Len(); l != initialCap {
+		t.Fatalf("after shrink: Len()=%d, want %d (must not drain held slots)", l, initialCap)
+	}
+	if occ := wr.occupancy.Load(); occ != initialCap {
+		t.Fatalf("after shrink: occupancy=%d, want %d", occ, initialCap)
+	}
+	if u := wr.Utilization(); u != 1.0 {
+		t.Fatalf("after shrink: Utilization()=%v, want 1.0", u)
+	}
+	if u := wr.UtilizationSmoothed(); u < 0 || u > 1.0 {
+		t.Fatalf("after shrink: UtilizationSmoothed()=%v, want in [0.0, 1.0]", u)
+	}
+
+	// driveNewClient performs GET /?role=new, and if queued, polls /queue/status
+	// until ready=true and reloads until admitted to the origin.
+	runNewClient := func(initialToken string, errCh chan<- error) {
+		tok := initialToken
+		if tok == "" {
+			req := httptest.NewRequest(http.MethodGet, "/?role=new", nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				errCh <- fmt.Errorf("initial request: status %d", w.Code)
+				return
+			}
+			for _, c := range w.Result().Cookies() {
+				if c.Name == cookieName {
+					tok = c.Value
+					break
+				}
+			}
+			if tok == "" {
+				// Admitted directly on fast path.
+				return
+			}
+		}
+
+		deadline := time.Now().Add(20 * time.Second)
+		pollInterval := statusPollMinInterval + 25*time.Millisecond
+		for time.Now().Before(deadline) {
+			resp := pollStatus(r, tok)
+			if resp.Utilization > 1.0 {
+				errCh <- fmt.Errorf("status Utilization=%v > 1.0", resp.Utilization)
+				return
+			}
+			if resp.Ready {
+				req := httptest.NewRequest(http.MethodGet, "/?role=new", nil)
+				req.AddCookie(&http.Cookie{Name: cookieName, Value: tok})
+				w := httptest.NewRecorder()
+				r.ServeHTTP(w, req)
+				if w.Code != http.StatusOK {
+					errCh <- fmt.Errorf("reload request: status %d", w.Code)
+					return
+				}
+				var newTok string
+				for _, c := range w.Result().Cookies() {
+					if c.Name == cookieName {
+						newTok = c.Value
+						break
+					}
+				}
+				if newTok == "" {
+					// Admitted to origin.
+					return
+				}
+				tok = newTok
+			}
+			time.Sleep(pollInterval)
+		}
+		errCh <- fmt.Errorf("timed out waiting for queued client %q to be admitted", tok)
+	}
+
+	errCh := make(chan error, totalNew)
+	var queuedWG sync.WaitGroup
+
+	// Queue 12 clients while all 10 holders are active.
+	queuedTokens := make([]string, queuedInit)
+	for i := range queuedInit {
+		req := httptest.NewRequest(http.MethodGet, "/?role=new", nil)
+		w := httptest.NewRecorder()
+		r.ServeHTTP(w, req)
+		for _, c := range w.Result().Cookies() {
+			if c.Name == cookieName {
+				queuedTokens[i] = c.Value
+				break
+			}
+		}
+		if queuedTokens[i] == "" {
+			t.Fatalf("new request %d admitted immediately while 10 holders active and cap=3", i)
+		}
+	}
+	for _, tok := range queuedTokens {
+		queuedWG.Add(1)
+		go func(token string) {
+			defer queuedWG.Done()
+			runNewClient(token, errCh)
+		}(tok)
+	}
+
+	// Release the first 7 holders (10 → 3 active). Zero new requests may enter
+	// while active >= shrunkCap (3).
+	for i := range initialCap - shrunkCap {
+		close(holderGates[i])
+		<-holderDone
+
+		wantActive := initialCap - (i + 1)
+		if l := wr.Len(); l != wantActive {
+			t.Fatalf("after releasing holder %d: Len()=%d, want %d", i, l, wantActive)
+		}
+		if occ := wr.occupancy.Load(); occ != int32(wantActive) {
+			t.Fatalf("after releasing holder %d: occupancy=%d, want %d", i, occ, wantActive)
+		}
+		if u := wr.Utilization(); u != 1.0 {
+			t.Fatalf("after releasing holder %d (active=%d >= cap=%d): Utilization()=%v, want 1.0",
+				i, wantActive, shrunkCap, u)
+		}
+		if entered := newEntered.Load(); entered != 0 {
+			t.Fatalf("after releasing holder %d (active=%d >= cap=%d): %d new requests entered origin early",
+				i, wantActive, shrunkCap, entered)
+		}
+
+		// Also send fresh arrivals mid-drain (at active=6 and active=3) to verify
+		// neither fast-path arrivals nor impatient reloads slip past the shrink ceiling.
+		if i == 3 || i == 6 {
+			req := httptest.NewRequest(http.MethodGet, "/?role=new", nil)
+			w := httptest.NewRecorder()
+			r.ServeHTTP(w, req)
+			var midTok string
+			for _, c := range w.Result().Cookies() {
+				if c.Name == cookieName {
+					midTok = c.Value
+					break
+				}
+			}
+			if midTok == "" {
+				t.Fatalf("mid-drain arrival at active=%d was admitted early instead of queued", wantActive)
+			}
+			queuedWG.Add(1)
+			go func(token string) {
+				defer queuedWG.Done()
+				runNewClient(token, errCh)
+			}(midTok)
+
+			// Impatient reload of the head queued client must also remain blocked.
+			reloadReq := httptest.NewRequest(http.MethodGet, "/?role=new", nil)
+			reloadReq.AddCookie(&http.Cookie{Name: cookieName, Value: queuedTokens[0]})
+			r.ServeHTTP(httptest.NewRecorder(), reloadReq)
+			if entered := newEntered.Load(); entered != 0 {
+				t.Fatalf("impatient reload at active=%d entered origin early (%d entered)", wantActive, entered)
+			}
+		}
+	}
+
+	// Brief settle check at active == 3 before releasing the remaining 3 holders.
+	time.Sleep(25 * time.Millisecond)
+	if entered := newEntered.Load(); entered != 0 {
+		t.Fatalf("at active=%d (cap=%d): %d new requests entered origin early", shrunkCap, shrunkCap, entered)
+	}
+	if p := overallPeak.Load(); p > initialCap {
+		t.Fatalf("overall peak during drain = %d, exceeds initial cap %d", p, initialCap)
+	}
+
+	// Release remaining 3 holders (3 → 0), allowing the queued clients to proceed
+	// under the new cap of 3.
+	for i := initialCap - shrunkCap; i < initialCap; i++ {
+		close(holderGates[i])
+		<-holderDone
+	}
+
+	queuedWG.Wait()
+
+	// Send 6 concurrent fresh arrivals after the queue drains so both fast-path
+	// admissions and queued poll+reload admissions are exercised under cap=3.
+	var burstWG sync.WaitGroup
+	for range fastBurst {
+		burstWG.Add(1)
+		go func() {
+			defer burstWG.Done()
+			runNewClient("", errCh)
+		}()
+	}
+	burstWG.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Errorf("new client error: %v", err)
+	}
+	if served := newServed.Load(); served != totalNew {
+		t.Errorf("new requests served = %d, want %d", served, totalNew)
+	}
+	if p := overallPeak.Load(); p > initialCap {
+		t.Errorf("overall peak = %d, exceeds initial cap %d", p, initialCap)
+	}
+	if p := newPeak.Load(); p > shrunkCap {
+		t.Errorf("peak among new requests = %d, exceeds shrunk cap %d", p, shrunkCap)
+	}
+	if l := wr.Len(); l != 0 {
+		t.Errorf("final Len() = %d, want 0", l)
+	}
+	if occ := wr.occupancy.Load(); occ != 0 {
+		t.Errorf("final occupancy = %d, want 0", occ)
+	}
+	assertAccounting(t, wr)
+}
+
+func TestSetCap_ShrinkEventDrainFiresOnce(t *testing.T) {
+	t.Parallel()
+	const (
+		initialCap = 6
+		shrunkCap  = 2
+	)
+
+	wr := newTestWR(t, initialCap)
+
+	serving := make(chan struct{}, initialCap)
+	gates := make([]chan struct{}, initialCap)
+	done := make(chan struct{}, initialCap)
+	for i := range initialCap {
+		gates[i] = make(chan struct{})
+	}
+	r := newTestRouterWithGates(wr, serving, gates)
+
+	// Fill all 6 slots.
+	for range initialCap {
+		go func() {
+			defer func() { done <- struct{}{} }()
+			r.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+		}()
+	}
+	for i := range initialCap {
+		select {
+		case <-serving:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for holder %d", i)
+		}
+	}
+
+	var drainCount atomic.Int32
+	wr.On(EventDrain, func(s Snapshot) { drainCount.Add(1) })
+
+	// Shrink from 6 to 2.
+	if err := wr.SetCap(shrunkCap); err != nil {
+		t.Fatalf("SetCap(%d): %v", shrunkCap, err)
+	}
+
+	// Release first 4 holders (6 → 2): occupancy stays >= cap, so EventDrain must not fire.
+	for i := range initialCap - shrunkCap {
+		close(gates[i])
+		<-done
+	}
+	time.Sleep(40 * time.Millisecond)
+	if got := drainCount.Load(); got != 0 {
+		t.Fatalf("after draining 6→2: EventDrain fired %d times, want 0", got)
+	}
+	if wr.Len() != shrunkCap || wr.occupancy.Load() != shrunkCap {
+		t.Fatalf("after draining 6→2: Len()=%d occupancy=%d, want both %d",
+			wr.Len(), wr.occupancy.Load(), shrunkCap)
+	}
+
+	// Release 5th holder (2 → 1): first real slot opens under new cap; EventDrain fires once.
+	close(gates[4])
+	<-done
+	waitForCount(t, &drainCount, 1, 500*time.Millisecond)
+	if got := drainCount.Load(); got != 1 {
+		t.Fatalf("after 5th release (2→1): EventDrain fired %d times, want 1", got)
+	}
+
+	// Release 6th holder (1 → 0): not-full→empty must not fire EventDrain again.
+	close(gates[5])
+	<-done
+	time.Sleep(40 * time.Millisecond)
+	if got := drainCount.Load(); got != 1 {
+		t.Errorf("after 6th release (1→0): EventDrain fired %d times, want 1", got)
+	}
+	if wr.Len() != 0 || wr.occupancy.Load() != 0 {
+		t.Errorf("final state: Len()=%d occupancy=%d, want both 0", wr.Len(), wr.occupancy.Load())
+	}
+}
+
 // ── SetHTML tests ────────────────────────────────────────────────────────────
 
 func TestSetHTML_CustomHTMLServed(t *testing.T) {

@@ -432,3 +432,116 @@ func TestExport_ConcurrentWithTraffic(t *testing.T) {
 		t.Errorf("restored %d, source had %d live tickets", stats.Restored, a.LiveQueueDepth())
 	}
 }
+
+func TestRestoreLeases_SmallerCapPreservesSemLen(t *testing.T) {
+	a := newTestWR(t, 5)
+	for i := range 5 {
+		if ok, _, err := a.Acquire(fmt.Sprintf("l%d", i)); err != nil || !ok {
+			t.Fatalf("setup Acquire(l%d): ok=%v err=%v", i, ok, err)
+		}
+	}
+	buf := exportRoom(t, a)
+
+	b := newTestWR(t, 2)
+	stats, err := b.Import(buf)
+	if err != nil {
+		t.Fatalf("Import: %v", err)
+	}
+	if stats.LeasesRestored != 5 {
+		t.Fatalf("LeasesRestored=%d, want 5", stats.LeasesRestored)
+	}
+	if b.Held() != 5 {
+		t.Fatalf("Held()=%d, want 5", b.Held())
+	}
+	if b.Len() != 5 {
+		t.Fatalf("Len()=%d, want 5", b.Len())
+	}
+	if b.Cap() != 2 {
+		t.Fatalf("Cap()=%d, want 2", b.Cap())
+	}
+	if b.occupancy.Load() != 5 {
+		t.Fatalf("occupancy=%d, want 5", b.occupancy.Load())
+	}
+	if u := b.Utilization(); u != 1.0 {
+		t.Fatalf("Utilization()=%v, want 1.0", u)
+	}
+	if u := b.UtilizationSmoothed(); u < 0 || u > 1.0 {
+		t.Fatalf("UtilizationSmoothed()=%v, want in [0.0, 1.0]", u)
+	}
+
+	var originEntered int
+	rb := gin.New()
+	b.RegisterRoutes(rb)
+	rb.GET("/", func(c *gin.Context) {
+		originEntered++
+		c.Status(http.StatusOK)
+	})
+
+	// Neither a new lease nor an HTTP request may be admitted while 5 leases are held on cap=2.
+	if ok, _, err := b.Acquire("new-lease"); err != nil || ok {
+		t.Fatalf("Acquire(new-lease) with 5 held on cap 2: ok=%v err=%v, want false", ok, err)
+	}
+	_, tok := serveWithCookie(rb, "")
+	if tok == "" || originEntered != 0 {
+		t.Fatalf("HTTP request with 5 held on cap 2: tok=%q originEntered=%d, want queued", tok, originEntered)
+	}
+
+	// Releasing 3 leases (5 → 2): occupancy is still >= cap (2), so nothing may be admitted.
+	for i := range 3 {
+		if err := b.Release(fmt.Sprintf("l%d", i)); err != nil {
+			t.Fatalf("Release(l%d): %v", i, err)
+		}
+		want := int32(5 - (i + 1))
+		if b.Held() != want || b.Len() != int(want) {
+			t.Fatalf("after releasing l%d: Held()=%d Len()=%d, want both %d", i, b.Held(), b.Len(), want)
+		}
+		if b.Utilization() != 1.0 {
+			t.Fatalf("after releasing l%d: Utilization()=%v, want 1.0", i, b.Utilization())
+		}
+		if ok, _, err := b.Acquire("new-lease"); err != nil || ok {
+			t.Fatalf("new-lease admitted early after releasing l%d (held=%d cap=2)", i, b.Held())
+		}
+		serveWithCookie(rb, tok)
+		if originEntered != 0 {
+			t.Fatalf("HTTP request admitted early after releasing l%d (held=%d cap=2)", i, b.Held())
+		}
+	}
+
+	// Releasing 4th lease (2 → 1): first slot opens under cap=2; head of queue (new-lease) is admitted.
+	if err := b.Release("l3"); err != nil {
+		t.Fatalf("Release(l3): %v", err)
+	}
+	if b.Held() != 1 || b.Len() != 1 {
+		t.Fatalf("after releasing l3: Held()=%d Len()=%d, want both 1", b.Held(), b.Len())
+	}
+	if ok, _, err := b.Acquire("new-lease"); err != nil || !ok {
+		t.Fatalf("Acquire(new-lease) after 4th release: ok=%v err=%v, want true", ok, err)
+	}
+	if b.Held() != 2 || b.Len() != 2 {
+		t.Fatalf("after granting new-lease: Held()=%d Len()=%d, want both 2", b.Held(), b.Len())
+	}
+	// Room is full again (2/2), so the queued HTTP request must still wait.
+	serveWithCookie(rb, tok)
+	if originEntered != 0 {
+		t.Fatalf("HTTP request admitted while room refilled to 2/2")
+	}
+
+	// Releasing 5th lease (2 → 1): queued HTTP request is now admitted.
+	if err := b.Release("l4"); err != nil {
+		t.Fatalf("Release(l4): %v", err)
+	}
+	w, newTok := serveWithCookie(rb, tok)
+	if w.Code != http.StatusOK || newTok != "" || originEntered != 1 {
+		t.Fatalf("queued HTTP request after 5th release: code=%d newTok=%q originEntered=%d",
+			w.Code, newTok, originEntered)
+	}
+
+	if err := b.Release("new-lease"); err != nil {
+		t.Fatalf("Release(new-lease): %v", err)
+	}
+	if b.Held() != 0 || b.Len() != 0 || b.occupancy.Load() != 0 {
+		t.Errorf("final state: Held()=%d Len()=%d occupancy=%d, want all 0",
+			b.Held(), b.Len(), b.occupancy.Load())
+	}
+	assertAccounting(t, b)
+}

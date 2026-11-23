@@ -439,8 +439,10 @@ func (wr *WaitingRoom) snapshotLeases() []persistedLease {
 
 // restoreLeases installs leases as tickets 1..L, already admitted. Their
 // times move forward by the downtime, so it is not charged against a
-// lease TTL. The semaphore holds as many of the slots as its capacity
-// allows; the serving window accounts for all of them either way.
+// lease TTL. When L exceeds the room's configured capacity, the semaphore
+// temporarily expands to absorb all L slots and immediately shrinks back
+// to cap (sema v1.2.0 preserves held slots on shrink), keeping wr.Len(),
+// wr.Held(), and wr.occupancy identical.
 func (wr *WaitingRoom) restoreLeases(leases []persistedLease, shift time.Duration) {
 	if len(leases) == 0 {
 		return
@@ -454,6 +456,17 @@ func (wr *WaitingRoom) restoreLeases(leases []persistedLease, shift time.Duratio
 		}
 	}
 	wr.leaseMu.Unlock()
+
+	curCap := int(wr.cap.Load())
+	if len(leases) > curCap {
+		_ = wr.sem.SetCap(len(leases))
+		for range leases {
+			wr.sem.TryAcquire()
+			wr.occupancy.Add(1)
+		}
+		_ = wr.sem.SetCap(curCap)
+		return
+	}
 	for range leases {
 		wr.sem.TryAcquire()
 		wr.occupancy.Add(1)
