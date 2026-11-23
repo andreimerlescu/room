@@ -694,9 +694,16 @@ func TestSetCap_BelowHeld(t *testing.T) {
 	if h := wr.Held(); h != 5 {
 		t.Fatalf("SetCap revoked leases: Held()=%d, want 5", h)
 	}
+	if l := wr.Len(); l != 5 {
+		t.Fatalf("SetCap drained semaphore: Len()=%d, want 5", l)
+	}
 	for i := range 3 { // 5 → 2 held: still not under the new cap of 2
 		if err := wr.Release(fmt.Sprintf("h%d", i)); err != nil {
 			t.Fatal(err)
+		}
+		want := int32(5 - (i + 1))
+		if wr.Held() != want || wr.Len() != int(wr.Held()) {
+			t.Fatalf("after releasing h%d: Len()=%d Held()=%d, want both %d", i, wr.Len(), wr.Held(), want)
 		}
 		if ok, _, _ := wr.Acquire("w"); ok {
 			t.Fatalf("w granted with %d held and cap 2", wr.Held())
@@ -705,8 +712,14 @@ func TestSetCap_BelowHeld(t *testing.T) {
 	if err := wr.Release("h3"); err != nil {
 		t.Fatal(err)
 	}
+	if wr.Held() != 1 || wr.Len() != 1 {
+		t.Fatalf("after releasing h3: Len()=%d Held()=%d, want both 1", wr.Len(), wr.Held())
+	}
 	if ok, _, _ := wr.Acquire("w"); !ok {
 		t.Error("w refused with 1 held and cap 2")
+	}
+	if wr.Len() != 2 || wr.Held() != 2 {
+		t.Errorf("after granting w: Len()=%d Held()=%d, want both 2", wr.Len(), wr.Held())
 	}
 	assertAccounting(t, wr)
 }

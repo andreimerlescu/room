@@ -495,8 +495,9 @@ func (wr *WaitingRoom) SetHTML(html []byte) {
 // SetCap adjusts the number of concurrently active requests at runtime.
 // Expanding capacity immediately opens new semaphore slots and widens the
 // serving window; any retired tickets the wider window now reaches are
-// skipped at once. Shrinking drains in-flight work via the underlying
-// sema implementation.
+// skipped at once. Shrinking preserves all in-flight requests and leases;
+// no new slot is granted until occupancy drops below the new capacity, so
+// the room never over-admits during a shrink.
 //
 // Returns ErrInvalidCap if cap < 1.
 //

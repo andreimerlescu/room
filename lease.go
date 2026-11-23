@@ -22,12 +22,12 @@ import "time"
 //
 // # Capacity changes
 //
-// The serving window, not the semaphore, is what bounds leases: the
-// semaphore forgets its held slots when shrunk below them (see
-// sema.Semaphore.SetCap), while the window keeps counting. SetCap below
-// Held therefore revokes nothing, and grants no new slot — to a lease or a
-// request — until enough leases have been released to bring the room back
-// under the new capacity.
+// Both the serving window and the underlying semaphore (sema v1.2.0)
+// preserve held slots when shrunk below Held (see sema.Semaphore.SetCap),
+// keeping Len() and Held() aligned at every step. SetCap below Held
+// revokes nothing, and grants no new slot — to a lease or a request —
+// until enough leases have been released to bring occupancy under the new
+// capacity.
 //
 // # Requests from a key that holds a lease
 //

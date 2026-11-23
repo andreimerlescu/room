@@ -3,7 +3,7 @@ module github.com/andreimerlescu/room
 go 1.27.3
 
 require (
-	github.com/andreimerlescu/sema v1.1.0
+	github.com/andreimerlescu/sema v1.2.0
 	github.com/gin-gonic/gin v1.12.0
 )
 

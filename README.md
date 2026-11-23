@@ -68,7 +68,7 @@ callbacks, an admin read/remove API, and a line that survives restarts.
 ## Installation
 
 ```
-go get github.com/andreimerlescu/room@v1.5.0
+go get github.com/andreimerlescu/room@v1.6.0
 ```
 
 Requires [gin](https://github.com/gin-gonic/gin) and the Go version declared
@@ -570,10 +570,15 @@ duplicate routes.
 
 ```go
 wr.SetCap(1000) // queued clients are admitted on their next poll
+wr.SetCap(200)  // zero-over-admission graceful shrink
 ```
 
-Growing capacity takes effect immediately. Shrinking lets in-flight requests
-finish.
+Growing capacity takes effect immediately. Shrinking is **graceful with zero
+over-admission**: all in-flight requests and held leases are preserved, `Len()`
+stays synchronized with active occupancy, `Utilization()` and
+`UtilizationSmoothed()` stay clamped to `[0.0, 1.0]`, and no new slot is
+granted until occupancy drops below the new capacity (when `EventDrain` fires
+once).
 
 ---
 
@@ -650,6 +655,22 @@ when clients abandon at the moment they are told to come in.
 | **Promotion integrity** | Promotions are serialized and never re-insert a ticket that was removed or admitted concurrently. |
 | **Pass expiry** | Enforced on the server, not only by cookie `MaxAge`. |
 | **Keyed tickets** | A keyed ticket's token is never sent to the client, and a `room_ticket` cookie carrying one is treated as unknown, so it cannot claim the admission. The public ID in `status_url` only reads a place, is rate-limited to one view per second, and never keeps the place alive. Keys are capped at 256 bytes and rejected, never truncated, past that. |
+
+---
+
+## Upgrading from v1.5.0
+
+Nothing is removed and no signature, cookie, endpoint, or callback changes.
+
+- **Zero-over-admission `SetCap` shrink.** Built on `sema v1.2.0`, shrinking
+  capacity below current occupancy preserves all in-flight requests and leases
+  without draining the semaphore, keeps `Len()` aligned with active occupancy
+  and `Held()`, clamps `Utilization()` and `UtilizationSmoothed()` to
+  `[0.0, 1.0]`, and blocks new admissions until occupancy drops below the new
+  capacity.
+- **Lease restore into smaller capacity.** `Import` now preserves semaphore
+  occupancy when restoring more leases than the new room's capacity, keeping
+  `Len()` and `Held()` aligned from startup.
 
 ---
 
