@@ -130,8 +130,7 @@ func (wr *WaitingRoom) Export(w io.Writer) error {
 
 	now := time.Now()
 
-	entries := wr.tokens.snapshotEntries()
-	sort.Slice(entries, func(i, j int) bool { return lessQueued(entries[i], entries[j]) })
+	entries := wr.tokens.snapshotSorted()
 
 	f := persistFile{
 		Version:    persistFormatVersion,

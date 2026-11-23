@@ -68,7 +68,7 @@ callbacks, an admin read/remove API, and a line that survives restarts.
 ## Installation
 
 ```
-go get github.com/andreimerlescu/room@v1.6.0
+go get github.com/andreimerlescu/room@v1.7.0
 ```
 
 Requires [gin](https://github.com/gin-gonic/gin) and the Go version declared
@@ -392,8 +392,8 @@ err = wr.Leave(key)                 // a key not in line is fine
 goes in — it keeps its own count, and calls `Leave` when a key starts. A key
 that stops calling `Enter` for `TokenTTL` is reaped, and the keys behind it
 move up. A place counts every ticket ahead, so with nobody admitted places
-run 1, 2, 3… whatever the capacity. Computing one costs a pass over the line,
-like `Queue`.
+run 1, 2, 3… whatever the capacity. Place lookups run in `O(log N)` under a
+read lock via the internal order-statistic tree.
 
 ### Leases: a slot held until you release it
 
@@ -658,6 +658,28 @@ when clients abandon at the moment they are told to come in.
 
 ---
 
+## Upgrading from v1.6.0
+
+Nothing is removed and no signature, cookie, endpoint, or callback changes.
+Zero new dependencies are added.
+
+- **`O(log N)` indexed token store and ghost ledger.** `tokenStore` and
+  `ghostLedger` are now backed by internal randomized order-statistic treaps
+  with lazy range-add and subtree `maxRank`, eliminating all `O(N)` full-map
+  scans in `Enter`, `Acquire`, `Position`, `TicketByKey`,
+  `GET /queue/status/{id}`, `SetTicketRank`, `Queue(limit)` (`O(log N + limit)`),
+  and `Export` (`O(N)` pre-sorted) while keeping dense ticket semantics exact.
+- **Parallel read-locked polling.** `GET /queue/status`, `GET /queue/status/{id}`,
+  and repeat keyed calls (`Enter`, `Acquire`, middleware) now run under
+  `RLock` + a per-node mutex instead of serializing on a global write lock.
+- **Lazy-heap reaping & post-spike compaction.** `reapBatch` inspects only
+  due entries via intrusive `issuedAt`-keyed min-heaps (`O(1)` when nothing is
+  expired, `O(k log N)` bounded batches otherwise) with instant runtime
+  `SetTokenTTL` / `SetFirstPollGrace` updates and automatic low-water map/heap
+  compaction once spikes drain.
+
+---
+
 ## Upgrading from v1.5.0
 
 Nothing is removed and no signature, cookie, endpoint, or callback changes.
@@ -848,34 +870,40 @@ Measured on an Apple M4 Pro (`-14`). The HTTP benchmarks go through the full
 gin stack and `httptest`.
 
 ```
-BenchmarkStatusPoll_Accepted-14                   845295              1210 ns/op            6928 B/op         29 allocs/op
-BenchmarkStatusPoll_RateLimited-14                477128              2380 ns/op            6996 B/op         29 allocs/op
-BenchmarkResumeRender-14                           53664             22501 ns/op           72769 B/op         38 allocs/op
-BenchmarkSlowPathIssue-14                         116276              8863 ns/op           72163 B/op         31 allocs/op
-BenchmarkTokenStore_PollSequenceV121-14          2004867               646.3 ns/op             0 B/op          0 allocs/op
-BenchmarkTokenStore_PollSingleLock-14            3384638               349.1 ns/op             0 B/op          0 allocs/op
-BenchmarkAdvance_EmptyLedger-14                 519567956                2.298 ns/op           0 B/op          0 allocs/op
-BenchmarkPositionOf_Ledger1k-14                 193003152                6.167 ns/op           0 B/op          0 allocs/op
-BenchmarkQuoteCost-14                           44820438                26.59 ns/op            0 B/op          0 allocs/op
-BenchmarkPromoteToken-14                         2242298               547.9 ns/op           507 B/op          4 allocs/op
-BenchmarkPromoteTokenToFront-14                  2319519               553.5 ns/op           504 B/op          4 allocs/op
-BenchmarkGrantPass-14                            2587899               475.4 ns/op           187 B/op          1 allocs/op
-BenchmarkHasValidPass-14                        33036274                35.57 ns/op            0 B/op          0 allocs/op
-BenchmarkQueue_100of100k-14                          308           3729343 ns/op           61296 B/op        106 allocs/op
-BenchmarkRemoveToken-14                          5842926               235.8 ns/op            43 B/op          0 allocs/op
-BenchmarkRemoveTokensFunc_10k-14                    1153           1074017 ns/op         2337088 B/op         14 allocs/op
-BenchmarkFastPath-14                              680660              1709 ns/op            5314 B/op         13 allocs/op
-BenchmarkQueueDepth-14                          1000000000               1.135 ns/op           0 B/op          0 allocs/op
-BenchmarkUtilizationSmoothed-14                 1000000000               0.7844 ns/op          0 B/op          0 allocs/op
+BenchmarkStatusPoll_Accepted-14            	 1203224	       980.1 ns/op	    6928 B/op	      29 allocs/op
+BenchmarkStatusPoll_RateLimited-14         	  391071	      3026 ns/op	    7014 B/op	      29 allocs/op
+BenchmarkResumeRender-14                   	   50721	     24217 ns/op	   72754 B/op	      38 allocs/op
+BenchmarkSlowPathIssue-14                  	  144732	      7615 ns/op	   72376 B/op	      31 allocs/op
+BenchmarkEnter_ExistingKey_100k-14         	 7789317	       152.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkView_TicketStatus_100k-14         	 7852430	       146.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkSetTicketRank_100k-14             	 3317515	       384.6 ns/op	       0 B/op	       0 allocs/op
+BenchmarkReap_NoExpired_100k-14            	11137540	       108.3 ns/op	       0 B/op	       0 allocs/op
+BenchmarkStatusPoll_Parallel_100k-14       	 8128274	       150.4 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTokenStore_PollSequenceV121-14    	 4256713	       283.7 ns/op	       0 B/op	       0 allocs/op
+BenchmarkTokenStore_PollSingleLock-14      	 7317097	       165.0 ns/op	       0 B/op	       0 allocs/op
+BenchmarkAdvance_EmptyLedger-14            	532877623	         2.343 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPositionOf_Ledger1k-14            	234823434	         8.428 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQuoteCost-14                      	30778339	        39.48 ns/op	       0 B/op	       0 allocs/op
+BenchmarkPromoteToken-14                   	 1000000	      1099 ns/op	     577 B/op	       3 allocs/op
+BenchmarkPromoteTokenToFront-14            	 1000000	      1041 ns/op	     577 B/op	       3 allocs/op
+BenchmarkGrantPass-14                      	 2632789	       461.5 ns/op	     185 B/op	       1 allocs/op
+BenchmarkHasValidPass-14                   	34806316	        34.54 ns/op	       0 B/op	       0 allocs/op
+BenchmarkQueue_100of100k-14                	  165769	      7095 ns/op	   40192 B/op	       2 allocs/op
+BenchmarkRemoveToken-14                    	 1413392	       888.9 ns/op	      48 B/op	       1 allocs/op
+BenchmarkRemoveTokensFunc_10k-14           	     578	   2028422 ns/op	 2368704 B/op	    1012 allocs/op
+BenchmarkFastPath-14                       	  682732	      1784 ns/op	    5318 B/op	      13 allocs/op
+BenchmarkQueueDepth-14                     	1000000000	         1.086 ns/op	       0 B/op	       0 allocs/op
+BenchmarkUtilizationSmoothed-14            	1000000000	         0.7939 ns/op	       0 B/op	       0 allocs/op
 ```
 
-Two numbers to plan around:
+Key numbers to plan around (at 100,000 queued clients):
 
-- **Status polls.** Taking one lock per poll halves the token-store cost
-  compared with v1.2.1 (339 ns vs 692 ns under 14-way parallel load).
-- **Admin reads.** `Queue(100)` over 100,000 queued clients takes about
-  1.6 ms and briefly blocks status polls, so refresh an admin view every few
-  seconds, not per request.
+- **Parallel status polls.** `poll`, `/queue/status/{id}` views, and repeat
+  `Enter` calls run under `RLock` + a per-node mutex (~150 ns/op, 0 allocs
+  under 14-way parallel load).
+- **Admin reads & ranking.** `Queue(100)` over 100,000 queued clients takes
+  ~7.1 µs without blocking status polls; `SetTicketRank` takes ~385 ns/op
+  (0 allocs), and `reap()` with no expired entries takes ~108 ns/op.
 
 ---
 

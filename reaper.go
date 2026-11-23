@@ -1,6 +1,7 @@
 package room
 
 import (
+	"container/heap"
 	"context"
 	"time"
 )
@@ -207,18 +208,21 @@ func (wr *WaitingRoom) haltReaper() {
 // so each in-window ghost permanently removed a slot, and with cap=1 a
 // single one froze the queue.
 //
-// The scan holds the token store's read lock while it walks the map, which
-// blocks status polls (they need the write lock) for the duration of the
-// walk. At very large queue depths, keep the reaper cadence in mind.
+// reapBatch inspects only due entries via the token store's intrusive lazy
+// min-heaps (unseenHeap and ttlHeap), bounded to reaperBatchSize heap
+// operations per lock hold: O(1) when nothing is due, O(k log N) otherwise.
 //
 // Related: WaitingRoom.startReaper, WaitingRoom.SetReaperInterval, WaitingRoom.retire
 func (wr *WaitingRoom) reap() {
 	for {
-		evictedCount := wr.reapBatch()
-		if evictedCount < reaperBatchSize {
+		work := wr.reapBatch()
+		if work < reaperBatchSize {
 			break
 		}
 	}
+
+	// Reclaim map bucket arrays and heap backing slices if a spike drained.
+	wr.tokens.compactIfNeeded()
 
 	// Sweep expired VIP passes. This is cheap — passes are typically
 	// few (one per paying customer) and the sweep is a single lock
@@ -229,68 +233,77 @@ func (wr *WaitingRoom) reap() {
 	wr.reapLeases(time.Now())
 }
 
-// reapBatch performs a single bounded eviction pass. It returns the number
-// of tokens that were dead in the scan phase (before double-check). The
-// caller uses this to decide whether another pass is needed.
+// reapBatch performs one bounded eviction pass over unseenHeap (when grace > 0)
+// and ttlHeap. Returns the number of heap items inspected (evictions + lazy
+// re-keys) so reap() yields the write lock between batches during large
+// rollovers or mass expirations.
 func (wr *WaitingRoom) reapBatch() int {
 	now := time.Now()
-
-	// Snapshot the TTL and grace once so the scan phase and the
-	// double-check phase agree even if a setter is called mid-pass.
 	ttl := wr.tokens.ttl()
 	grace := time.Duration(wr.firstPollGrace.Load())
 
-	dead := func(e ticketEntry) bool {
-		age := now.Sub(e.issuedAt)
-		if age > ttl {
-			return true
+	ts := wr.tokens
+	ts.mu.Lock()
+
+	var retired []int64
+	work := 0
+
+	// Phase 1: unseenHeap (never-seen tokens past firstPollGrace).
+	if grace > 0 {
+		for len(ts.unseenHeap) > 0 && work < reaperBatchSize {
+			top := ts.unseenHeap[0]
+			if now.Sub(top.unseenKey) <= grace {
+				break
+			}
+			work++
+			top.mu.Lock()
+			seen := top.seen
+			issuedAt := top.issuedAt
+			top.mu.Unlock()
+
+			if seen {
+				heap.Pop(&ts.unseenHeap)
+				continue
+			}
+			if now.Sub(issuedAt) <= grace {
+				top.unseenKey = issuedAt
+				heap.Fix(&ts.unseenHeap, 0)
+				continue
+			}
+			eff := effectiveTicket(top, ts.hasLazyShifts)
+			ts.removeLocked(top.token, top)
+			retired = append(retired, eff)
 		}
-		// issuedAt is only ever advanced by client contact, which also
-		// sets seen; for an unseen token it is still the issuance time.
-		return grace > 0 && !e.seen && age > grace
 	}
 
-	// Collect dead tokens under token store read lock.
-	wr.tokens.mu.RLock()
-	expired := make([]string, 0, min(len(wr.tokens.entries), reaperBatchSize))
-	for token, entry := range wr.tokens.entries {
-		if dead(entry) {
-			expired = append(expired, token)
-		}
-		if len(expired) >= reaperBatchSize {
+	// Phase 2: ttlHeap (every live token, keyed by recorded issuedAt).
+	for len(ts.ttlHeap) > 0 && work < reaperBatchSize {
+		top := ts.ttlHeap[0]
+		if now.Sub(top.ttlKey) <= ttl {
 			break
 		}
-	}
-	wr.tokens.mu.RUnlock()
+		work++
+		top.mu.Lock()
+		issuedAt := top.issuedAt
+		top.mu.Unlock()
 
-	if len(expired) == 0 {
-		return 0
-	}
-
-	scanned := len(expired)
-
-	// Evict under token store write lock with double-check. Whatever we
-	// delete here is ours alone — admission claims tokens with take under
-	// the same lock — so we retire exactly those tickets.
-	retired := make([]int64, 0, scanned)
-	wr.tokens.mu.Lock()
-	for _, token := range expired {
-		if entry, ok := wr.tokens.entries[token]; ok {
-			// Re-check under the write lock to close the TOCTOU window
-			// between the read-lock scan and now: a poll in between
-			// refreshes issuedAt and marks the token seen.
-			if dead(entry) {
-				wr.tokens.removeLocked(token, entry)
-				retired = append(retired, entry.ticket)
-			}
+		if now.Sub(issuedAt) <= ttl {
+			// Actively polled since ttlKey was recorded; re-key lazily.
+			top.ttlKey = issuedAt
+			heap.Fix(&ts.ttlHeap, 0)
+			continue
 		}
+		eff := effectiveTicket(top, ts.hasLazyShifts)
+		ts.removeLocked(top.token, top)
+		retired = append(retired, eff)
 	}
-	wr.tokens.mu.Unlock()
+
+	ts.mu.Unlock()
 
 	if len(retired) > 0 {
 		wr.retireMany(retired)
 		wr.emit(EventEvict, wr.snapshot(EventEvict))
 	}
 
-	return scanned
+	return work
 }

@@ -248,12 +248,7 @@ func TestEnter_ReapedAfterTTL(t *testing.T) {
 		ids[k] = id
 	}
 	// Only "gone" stops asking.
-	wr.tokens.mu.Lock()
-	tok := wr.tokens.byKey["gone"]
-	e := wr.tokens.entries[tok]
-	e.issuedAt = e.issuedAt.Add(-2 * time.Minute)
-	wr.tokens.entries[tok] = e
-	wr.tokens.mu.Unlock()
+	wr.tokens.ageKeyIssuedAt("gone", 2*time.Minute)
 
 	wr.reap()
 
@@ -924,12 +919,7 @@ func TestHandler_ServesStatusRoutes(t *testing.T) {
 	}
 
 	// Let the rate limit pass without sleeping: move the last view back.
-	wr.tokens.mu.Lock()
-	tok := wr.tokens.byID[id]
-	e := wr.tokens.entries[tok]
-	e.viewedAt = e.viewedAt.Add(-2 * statusPollMinInterval)
-	wr.tokens.entries[tok] = e
-	wr.tokens.mu.Unlock()
+	wr.tokens.ageIDViewedAt(id, 2*statusPollMinInterval)
 
 	resp, body = get("/wait/queue/status/"+id, "text/html")
 	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") ||

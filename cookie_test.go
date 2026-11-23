@@ -33,12 +33,7 @@ func cookiesByName(r *gin.Engine, ticket string) (*httptest.ResponseRecorder, ma
 // ageAllTokens rewinds every token's issuedAt by d, simulating the passage
 // of time without sleeping. Used to drive the reaper deterministically.
 func ageAllTokens(ts *tokenStore, d time.Duration) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	for token, entry := range ts.entries {
-		entry.issuedAt = entry.issuedAt.Add(-d)
-		ts.entries[token] = entry
-	}
+	ts.ageAll(d, false)
 }
 
 // ageOfToken returns how long ago the token's issuedAt was set. Tests use

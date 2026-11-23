@@ -82,9 +82,7 @@ func TestGhostLedger_AddManyMergesSorted(t *testing.T) {
 	l.addMany(nil) // no-op
 
 	want := []int64{5, 10, 20, 30, 30, 40}
-	l.mu.Lock()
-	got := append([]int64(nil), l.tickets...)
-	l.mu.Unlock()
+	got := l.snapshot()
 
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -111,10 +109,11 @@ func TestGhostLedger_ShrinksAfterBulkConsume(t *testing.T) {
 		t.Fatalf("consumed %d, want 5000", got)
 	}
 	l.mu.Lock()
-	c := cap(l.tickets)
+	empty := l.tree.root == nil
 	l.mu.Unlock()
-	if c > ledgerShrinkFloor {
-		t.Errorf("backing array not released after bulk consume: cap=%d", c)
+	if !empty || l.len() != 0 || l.minTicket() != math.MaxInt64 {
+		t.Errorf("ghost tree not released after bulk consume: rootNil=%v len=%d min=%d",
+			empty, l.len(), l.minTicket())
 	}
 }
 

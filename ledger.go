@@ -2,17 +2,9 @@ package room
 
 import (
 	"math"
-	"slices"
-	"sort"
 	"sync"
 	"sync/atomic"
 )
-
-// ledgerShrinkFloor is the slice capacity above which the ghost ledger
-// reallocates after a bulk consume that leaves it mostly empty. It keeps
-// a one-off burst of retirements (a mass ban, a reap after a flood) from
-// pinning a large backing array for the rest of the process lifetime.
-const ledgerShrinkFloor = 1024
 
 // ghostLedger records ticket numbers that will never be admitted but that
 // the serving window has not yet reached.
@@ -39,78 +31,59 @@ const ledgerShrinkFloor = 1024
 // positionOf, so positions behind a retired ticket improve at once while
 // positions ahead of it are unchanged.
 //
-// # Concurrency
+// # Complexity & Concurrency
 //
-// tickets is guarded by mu. lowest and size are published under mu and
-// read lock-free, so the release hot path — which must check whether any
-// ghost is now reachable — costs one atomic load when nothing is pending.
+// Backed by an order-statistic treap (ghostTree) guarded by mu so add,
+// consumeUpTo, countBelow, and shiftRange all run in O(log G), and consumed
+// subtrees are immediately eligible for GC without pinning a slice backing
+// array. lowest and size are published under mu and read lock-free, so the
+// release hot path costs one atomic load when nothing is pending.
 //
 // Related: WaitingRoom.retire, WaitingRoom.drainLedger, WaitingRoom.advance
 type ghostLedger struct {
-	mu      sync.Mutex
-	tickets []int64 // sorted ascending; duplicates permitted
+	mu   sync.Mutex
+	tree ghostTree
 
-	lowest atomic.Int64 // tickets[0], or math.MaxInt64 when empty
-	size   atomic.Int64 // len(tickets)
+	lowest atomic.Int64 // min ticket in tree, or math.MaxInt64 when empty
+	size   atomic.Int64 // node count in tree
 }
 
 func newGhostLedger() *ghostLedger {
-	l := &ghostLedger{}
+	l := &ghostLedger{tree: newGhostTree()}
 	l.lowest.Store(math.MaxInt64)
 	return l
 }
 
 // publishLocked refreshes the lock-free mirrors. Caller must hold l.mu.
 func (l *ghostLedger) publishLocked() {
-	l.size.Store(int64(len(l.tickets)))
-	if len(l.tickets) == 0 {
-		l.lowest.Store(math.MaxInt64)
-		return
-	}
-	l.lowest.Store(l.tickets[0])
+	l.size.Store(ghostSize(l.tree.root))
+	l.lowest.Store(l.tree.minTicket())
 }
 
-// add records a single retired ticket number.
+// add records a single retired ticket number in O(log G).
 func (l *ghostLedger) add(ticket int64) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	i := sort.Search(len(l.tickets), func(i int) bool { return l.tickets[i] > ticket })
-	l.tickets = slices.Insert(l.tickets, i, ticket)
+	l.tree.add(ticket)
 	l.publishLocked()
 }
 
-// addMany records a batch of retired ticket numbers with a single sorted
-// merge — O(n+m) rather than m separate O(n) inserts.
+// addMany records a batch of retired ticket numbers under one lock.
 func (l *ghostLedger) addMany(tickets []int64) {
 	if len(tickets) == 0 {
 		return
 	}
-	incoming := slices.Clone(tickets)
-	slices.Sort(incoming)
-
 	l.mu.Lock()
 	defer l.mu.Unlock()
-
-	merged := make([]int64, 0, len(l.tickets)+len(incoming))
-	i, j := 0, 0
-	for i < len(l.tickets) && j < len(incoming) {
-		if l.tickets[i] <= incoming[j] {
-			merged = append(merged, l.tickets[i])
-			i++
-		} else {
-			merged = append(merged, incoming[j])
-			j++
-		}
+	for _, t := range tickets {
+		l.tree.add(t)
 	}
-	merged = append(merged, l.tickets[i:]...)
-	merged = append(merged, incoming[j:]...)
-	l.tickets = merged
 	l.publishLocked()
 }
 
-// consumeUpTo removes every entry <= limit and returns how many were
-// removed. Each removed entry is owed exactly one nowServing advance by
-// the caller.
+// consumeUpTo removes every entry <= limit in O(log G) and returns how many
+// were removed. Each removed entry is owed exactly one nowServing advance
+// by the caller.
 func (l *ghostLedger) consumeUpTo(limit int64) int64 {
 	if l.lowest.Load() > limit {
 		return 0
@@ -118,27 +91,31 @@ func (l *ghostLedger) consumeUpTo(limit int64) int64 {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 
-	n := sort.Search(len(l.tickets), func(i int) bool { return l.tickets[i] > limit })
+	n := l.tree.consumeUpTo(limit)
 	if n == 0 {
 		return 0
 	}
-	l.tickets = slices.Delete(l.tickets, 0, n)
-	if c := cap(l.tickets); c > ledgerShrinkFloor && len(l.tickets)*4 < c {
-		l.tickets = slices.Clone(l.tickets)
-	}
 	l.publishLocked()
-	return int64(n)
+	return n
 }
 
 // countBelow returns the number of entries strictly less than ticket —
-// the ghosts ahead of that ticket in the queue.
+// the ghosts ahead of that ticket in the queue — in O(log G).
 func (l *ghostLedger) countBelow(ticket int64) int64 {
 	if l.size.Load() == 0 || l.lowest.Load() >= ticket {
 		return 0
 	}
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return int64(sort.Search(len(l.tickets), func(i int) bool { return l.tickets[i] >= ticket }))
+	return l.tree.countBelow(ticket)
+}
+
+// snapshot returns all pending ghost tickets in sorted ascending order.
+// Used by white-box tests.
+func (l *ghostLedger) snapshot() []int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.tree.snapshot()
 }
 
 // len returns the number of pending ghosts. Lock-free.

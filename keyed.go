@@ -101,37 +101,61 @@ type keyedEntry struct {
 
 // enterKey finds key's ticket and marks it seen (restarting its TTL), or,
 // if the key has none and reserve is non-nil, stores fresh under token
-// with a ticket number from reserve. The check, the number and the insert
-// happen under one write lock, so concurrent calls with one key create one
-// ticket, and keyed tickets enter the store in number order (their places
-// never repeat). It reports the ticket's place in line.
+// with a ticket number from reserve. Existing keys take only ts.mu.RLock +
+// node.mu and compute their place in O(log N). New keys take ts.mu.Lock so
+// concurrent calls with one key create one ticket, and keyed tickets enter
+// the store in number order (their places never repeat).
 func (ts *tokenStore) enterKey(key, token string, fresh ticketEntry, reserve func() int64, now time.Time) keyedEntry {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+	// Fast path for an existing key: RLock + per-node lock + O(log N) place.
+	ts.mu.RLock()
 	if t, ok := ts.byKey[key]; ok {
-		e := ts.entries[t]
-		e.issuedAt = now
-		e.seen = true
-		ts.entries[t] = e
-		return keyedEntry{token: t, entry: e, place: ts.placeLocked(t, e)}
+		node := ts.entries[t]
+		eff := effectiveTicket(node, ts.hasLazyShifts)
+		node.mu.Lock()
+		node.issuedAt = now
+		node.seen = true
+		e := node.toEntryMuLocked(eff)
+		node.mu.Unlock()
+		place := ts.tree.place(node)
+		ts.mu.RUnlock()
+		return keyedEntry{token: t, entry: e, place: place}
 	}
+	ts.mu.RUnlock()
+
 	if reserve == nil {
 		return keyedEntry{}
 	}
+
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	if t, ok := ts.byKey[key]; ok {
+		node := ts.entries[t]
+		eff := effectiveTicket(node, ts.hasLazyShifts)
+		node.mu.Lock()
+		node.issuedAt = now
+		node.seen = true
+		e := node.toEntryMuLocked(eff)
+		node.mu.Unlock()
+		return keyedEntry{token: t, entry: e, place: ts.tree.place(node)}
+	}
 	fresh.ticket = reserve()
-	ts.putLocked(token, fresh)
-	return keyedEntry{token: token, entry: fresh, place: ts.placeLocked(token, fresh), created: true}
+	node := ts.putLocked(token, fresh)
+	return keyedEntry{token: token, entry: fresh, place: ts.tree.place(node), created: true}
 }
 
 // lookupKey returns key's ticket, if it has one.
 func (ts *tokenStore) lookupKey(key string) (string, ticketEntry, bool) {
 	ts.mu.RLock()
-	defer ts.mu.RUnlock()
 	t, ok := ts.byKey[key]
 	if !ok {
+		ts.mu.RUnlock()
 		return "", ticketEntry{}, false
 	}
-	return t, ts.entries[t], true
+	node := ts.entries[t]
+	eff := effectiveTicket(node, ts.hasLazyShifts)
+	e := node.snapshotEntry(eff)
+	ts.mu.RUnlock()
+	return t, e, true
 }
 
 // takeKey is take for a key: it removes key's ticket and returns it. The
@@ -143,25 +167,14 @@ func (ts *tokenStore) takeKey(key string) (string, ticketEntry, bool) {
 	if !ok {
 		return "", ticketEntry{}, false
 	}
-	e := ts.entries[t]
-	ts.removeLocked(t, e)
+	node := ts.entries[t]
+	eff := effectiveTicket(node, ts.hasLazyShifts)
+	e := node.snapshotEntry(eff)
+	ts.removeLocked(t, node)
 	return t, e, true
 }
 
-// placeLocked is the place of token's entry among all entries, 1 being the
-// front, in Queue order. One pass over the store. Caller holds ts.mu.
-func (ts *tokenStore) placeLocked(token string, e ticketEntry) int64 {
-	me := tokenSnapshot{token: token, entry: e}
-	var ahead int64
-	for t, o := range ts.entries {
-		if t != token && lessQueued(tokenSnapshot{token: t, entry: o}, me) {
-			ahead++
-		}
-	}
-	return ahead + 1
-}
-
-// placeOfID is the place of the ticket with public ID id.
+// placeOfID is the place of the ticket with public ID id in O(log N).
 func (ts *tokenStore) placeOfID(id string) (int64, bool) {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
@@ -169,18 +182,18 @@ func (ts *tokenStore) placeOfID(id string) (int64, bool) {
 	if !ok {
 		return 0, false
 	}
-	return ts.placeLocked(t, ts.entries[t]), true
+	return ts.tree.place(ts.entries[t]), true
 }
 
-// placeOfToken is the place of token's entry.
+// placeOfToken is the place of token's entry in O(log N).
 func (ts *tokenStore) placeOfToken(token string) (int64, bool) {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
-	e, ok := ts.entries[token]
+	node, ok := ts.entries[token]
 	if !ok {
 		return 0, false
 	}
-	return ts.placeLocked(token, e), true
+	return ts.tree.place(node), true
 }
 
 // ── WaitingRoom: the line without the middleware ─────────────────────────────
@@ -265,8 +278,8 @@ func (wr *WaitingRoom) enterLine(key string, now time.Time) (keyedEntry, error) 
 // line, or an error from crypto/rand. Fires EventQueue, with Snapshot.Key
 // set, when it creates a ticket.
 //
-// Cost: one pass over the line under its write lock, to compute the place
-// (like Queue). Call it once per client request, not in a tight loop.
+// Cost: O(log N) via the order-statistic tree (under ts.mu.RLock for keys
+// already in line, ts.mu.Lock when creating a new ticket).
 //
 // Related: WaitingRoom.Position, WaitingRoom.Leave, WaitingRoom.Acquire
 func (wr *WaitingRoom) Enter(key string) (ticket string, position int64, err error) {
@@ -294,7 +307,7 @@ func (wr *WaitingRoom) Enter(key string) (ticket string, position int64, err err
 // room is not initialised. Position is read-only: it does not restart the
 // ticket's TTL.
 //
-// Cost: one pass over the line under its read lock.
+// Cost: O(log N) under the store's read lock.
 //
 // Related: WaitingRoom.Enter
 func (wr *WaitingRoom) Position(ticket string) (position int64, ok bool) {
@@ -336,7 +349,7 @@ func (wr *WaitingRoom) Leave(key string) error {
 // token-based APIs (SetTicketRank, AdminPromote, RemoveToken). Never send
 // it to the client: it would let the client's cookie claim the ticket.
 //
-// Cost: one pass over the line under its read lock.
+// Cost: O(log N) under the store's read lock.
 //
 // Related: WaitingRoom.Ticket, TicketInfo
 func (wr *WaitingRoom) TicketByKey(key string) (TicketInfo, bool) {
@@ -350,8 +363,10 @@ func (wr *WaitingRoom) TicketByKey(key string) (TicketInfo, bool) {
 		place int64
 	)
 	if ok {
-		e = wr.tokens.entries[t]
-		place = wr.tokens.placeLocked(t, e)
+		node := wr.tokens.entries[t]
+		eff := effectiveTicket(node, wr.tokens.hasLazyShifts)
+		e = node.snapshotEntry(eff)
+		place = wr.tokens.tree.place(node)
 	}
 	wr.tokens.mu.RUnlock()
 	if !ok {

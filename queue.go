@@ -1,8 +1,6 @@
 package room
 
 import (
-	"container/heap"
-	"sort"
 	"strings"
 	"time"
 
@@ -142,8 +140,7 @@ type TicketInfo struct {
 	// Place is the ticket's place among every ticket in the store, 1 being
 	// the front, counting tickets already told ready that have not come
 	// back. It is filled by Queue, TicketByKey and the wait responder, and
-	// is 0 everywhere else, because computing it costs a pass over the
-	// store.
+	// is 0 everywhere else.
 	Place int64
 }
 
@@ -192,12 +189,10 @@ func (wr *WaitingRoom) Ticket(token string) (TicketInfo, bool) {
 //
 // # Cost
 //
-// One pass over the token store under its read lock, selecting the
-// front-most limit entries with a bounded heap: O(n log limit) time and
-// O(limit) memory. The read lock blocks status polls (which need the
-// write lock) for the length of the pass, so call Queue every few seconds
-// for an admin view, not per request. Positions are computed after the
-// lock is released and may drift slightly if the queue moves meanwhile.
+// An O(log N + limit) in-order prefix walk of the order-statistic tree under
+// the token store's read lock, running concurrently with status polls. Positions
+// are computed after the lock is released and may drift slightly if the queue
+// moves meanwhile.
 //
 // A limit <= 0, or an uninitialised WaitingRoom, returns nil. For the
 // total count use LiveQueueDepth.
@@ -208,27 +203,19 @@ func (wr *WaitingRoom) Queue(limit int) []TicketInfo {
 		return nil
 	}
 
-	var h ticketMaxHeap
 	wr.tokens.mu.RLock()
-	h = make(ticketMaxHeap, 0, min(limit, len(wr.tokens.entries)))
-	for token, e := range wr.tokens.entries {
-		item := tokenSnapshot{token: token, entry: e}
-		if len(h) < limit {
-			heap.Push(&h, item)
-			continue
-		}
-		// h[0] is the back-most of the current front set.
-		if lessQueued(item, h[0]) {
-			h[0] = item
-			heap.Fix(&h, 0)
-		}
-	}
+	n := min(limit, wr.tokens.tree.len())
+	snaps := make([]tokenSnapshot, 0, n)
+	wr.tokens.tree.firstN(n, func(node *tokenNode, effTicket int64) {
+		snaps = append(snaps, tokenSnapshot{
+			token: node.token,
+			entry: node.snapshotEntry(effTicket),
+		})
+	})
 	wr.tokens.mu.RUnlock()
 
-	sort.Slice(h, func(i, j int) bool { return lessQueued(h[i], h[j]) })
-
-	out := make([]TicketInfo, len(h))
-	for i, s := range h {
+	out := make([]TicketInfo, len(snaps))
+	for i, s := range snaps {
 		out[i] = wr.ticketInfo(s.token, s.entry)
 		out[i].Place = int64(i + 1)
 	}
@@ -238,27 +225,5 @@ func (wr *WaitingRoom) Queue(limit int) []TicketInfo {
 // lessQueued orders tickets by line position: ticket number, then issue
 // time, then token (for determinism).
 func lessQueued(a, b tokenSnapshot) bool {
-	if a.entry.ticket != b.entry.ticket {
-		return a.entry.ticket < b.entry.ticket
-	}
-	if !a.entry.createdAt.Equal(b.entry.createdAt) {
-		return a.entry.createdAt.Before(b.entry.createdAt)
-	}
-	return a.token < b.token
-}
-
-// ticketMaxHeap keeps the back-most ticket of the selected set at the
-// root, so a better candidate can replace it in O(log k).
-type ticketMaxHeap []tokenSnapshot
-
-func (h ticketMaxHeap) Len() int           { return len(h) }
-func (h ticketMaxHeap) Less(i, j int) bool { return lessQueued(h[j], h[i]) }
-func (h ticketMaxHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i] }
-func (h *ticketMaxHeap) Push(x any)        { *h = append(*h, x.(tokenSnapshot)) }
-func (h *ticketMaxHeap) Pop() any {
-	old := *h
-	n := len(old)
-	x := old[n-1]
-	*h = old[:n-1]
-	return x
+	return lessTicketKey(a.entry.ticket, a.entry.createdAt, a.token, b.entry.ticket, b.entry.createdAt, b.token)
 }

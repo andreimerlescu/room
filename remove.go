@@ -121,9 +121,25 @@ func (ts *tokenStore) snapshotEntries() []tokenSnapshot {
 	ts.mu.RLock()
 	defer ts.mu.RUnlock()
 	out := make([]tokenSnapshot, 0, len(ts.entries))
-	for token, entry := range ts.entries {
-		out = append(out, tokenSnapshot{token: token, entry: entry})
+	for token, node := range ts.entries {
+		eff := effectiveTicket(node, ts.hasLazyShifts)
+		out = append(out, tokenSnapshot{token: token, entry: node.snapshotEntry(eff)})
 	}
+	return out
+}
+
+// snapshotSorted copies every entry in exact line order via an O(N) in-order
+// traversal of the order-statistic tree under a read lock (no sort needed).
+func (ts *tokenStore) snapshotSorted() []tokenSnapshot {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	out := make([]tokenSnapshot, 0, ts.tree.len())
+	ts.tree.walkInOrder(func(node *tokenNode, effTicket int64) {
+		out = append(out, tokenSnapshot{
+			token: node.token,
+			entry: node.snapshotEntry(effTicket),
+		})
+	})
 	return out
 }
 
@@ -135,9 +151,10 @@ func (ts *tokenStore) takeMany(tokens []string) []ticketEntry {
 	defer ts.mu.Unlock()
 	out := make([]ticketEntry, 0, len(tokens))
 	for _, token := range tokens {
-		if entry, ok := ts.entries[token]; ok {
-			ts.removeLocked(token, entry)
-			out = append(out, entry)
+		if node, ok := ts.entries[token]; ok {
+			eff := effectiveTicket(node, ts.hasLazyShifts)
+			out = append(out, node.snapshotEntry(eff))
+			ts.removeLocked(token, node)
 		}
 	}
 	return out

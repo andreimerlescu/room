@@ -271,10 +271,7 @@ func (wr *WaitingRoom) moveToPosition(token string, target int64) (promotion, er
 
 	newTicket := wr.ticketForPosition(target)
 
-	updated, ok := wr.tokens.updateIfPresent(token, func(e *ticketEntry) {
-		e.ticket = newTicket
-		e.promoted = true
-	})
+	updated, ok := wr.tokens.promoteTicket(token, newTicket)
 	if !ok {
 		return promotion{}, ErrTokenNotFound{}
 	}
@@ -300,19 +297,4 @@ func (wr *WaitingRoom) ticketForPosition(position int64) int64 {
 		}
 		n = next
 	}
-}
-
-// updateIfPresent applies fn to the token's entry under the write lock
-// only if the token still exists, and returns the updated entry. It never
-// inserts.
-func (ts *tokenStore) updateIfPresent(token string, fn func(*ticketEntry)) (ticketEntry, bool) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	e, ok := ts.entries[token]
-	if !ok {
-		return ticketEntry{}, false
-	}
-	fn(&e)
-	ts.entries[token] = e
-	return e, true
 }

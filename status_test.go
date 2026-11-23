@@ -24,26 +24,12 @@ func setCookies(w *httptest.ResponseRecorder) map[string]*http.Cookie {
 // lastPoll and cookieSetAt, so simulated polls are neither rate limited
 // nor mistaken for fresh cookie issuance.
 func ageEntries(ts *tokenStore, d time.Duration) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	for token, e := range ts.entries {
-		e.issuedAt = e.issuedAt.Add(-d)
-		if !e.lastPoll.IsZero() {
-			e.lastPoll = e.lastPoll.Add(-d)
-		}
-		e.cookieSetAt = e.cookieSetAt.Add(-d)
-		ts.entries[token] = e
-	}
+	ts.ageAll(d, true)
 }
 
 // ageCookieSetAt shifts only the cookie-refresh clock back by d.
 func ageCookieSetAt(ts *tokenStore, d time.Duration) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	for token, e := range ts.entries {
-		e.cookieSetAt = e.cookieSetAt.Add(-d)
-		ts.entries[token] = e
-	}
+	ts.ageCookieSetAtAll(d)
 }
 
 // ── Cookie lifetime: the long-wait regression ────────────────────────────────

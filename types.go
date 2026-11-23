@@ -1,6 +1,7 @@
 package room
 
 import (
+	"container/heap"
 	"context"
 	"sync"
 	"sync/atomic"
@@ -216,56 +217,81 @@ type passEntry struct {
 // WaitingRoom.retire.
 //
 // byKey and byID index keyed tickets (key → token, public ID → token).
-// They are guarded by mu together with entries, and every write goes
-// through putLocked and removeLocked so the three maps never disagree.
+// tree indexes every live token in line order (ticket, createdAt, token) with
+// O(log N) place, rank, and prefix queries. ttlHeap and unseenHeap are
+// intrusive lazy min-heaps ordered by issuedAt so reapBatch inspects only due
+// entries in O(k log N). All structural containers are guarded by mu and kept
+// strictly synchronized through putLocked and removeLocked; per-token mutable
+// poll timestamps are guarded by each node's leaf mutex so status polls run
+// concurrently under mu.RLock.
 type tokenStore struct {
-	mu       sync.RWMutex
-	entries  map[string]ticketEntry
-	byKey    map[string]string
-	byID     map[string]string
-	ttlNanos atomic.Int64
+	mu            sync.RWMutex
+	entries       map[string]*tokenNode
+	byKey         map[string]string
+	byID          map[string]string
+	tree          ticketTree
+	ttlHeap       ttlMinHeap
+	unseenHeap    unseenMinHeap
+	highWater     int
+	hasLazyShifts bool
+	ttlNanos      atomic.Int64
 }
 
 func newTokenStore() *tokenStore {
 	ts := &tokenStore{
-		entries: make(map[string]ticketEntry),
+		entries: make(map[string]*tokenNode),
 		byKey:   make(map[string]string),
 		byID:    make(map[string]string),
+		tree:    newTicketTree(),
 	}
 	ts.ttlNanos.Store(int64(defaultTokenTTL))
 	return ts
 }
 
-// putLocked stores entry under token and indexes its key and ID. An entry
-// it replaces is unindexed first. Caller holds ts.mu for writing.
-func (ts *tokenStore) putLocked(token string, entry ticketEntry) {
+// putLocked stores entry under token, indexes its key and ID, inserts it into
+// the order-statistic tree, and registers it in the intrusive expiry heaps.
+// An entry it replaces is fully removed first. Caller holds ts.mu for writing.
+func (ts *tokenStore) putLocked(token string, entry ticketEntry) *tokenNode {
 	if old, ok := ts.entries[token]; ok {
-		ts.unindexLocked(token, old)
+		ts.removeLocked(token, old)
 	}
-	ts.entries[token] = entry
-	if entry.key != "" {
-		ts.byKey[entry.key] = token
+	node := newTokenNode(token, entry, ts.tree.nextPrio())
+	ts.entries[token] = node
+	if node.key != "" {
+		ts.byKey[node.key] = token
 	}
-	if entry.id != "" {
-		ts.byID[entry.id] = token
+	if node.id != "" {
+		ts.byID[node.id] = token
 	}
+	ts.tree.insert(node)
+	heap.Push(&ts.ttlHeap, node)
+	if !node.seen {
+		heap.Push(&ts.unseenHeap, node)
+	}
+	if len(ts.entries) > ts.highWater {
+		ts.highWater = len(ts.entries)
+	}
+	return node
 }
 
-// removeLocked deletes token and its index entries. Every path that ends a
-// ticket's life in the store uses it. Caller holds ts.mu for writing.
-func (ts *tokenStore) removeLocked(token string, entry ticketEntry) {
+// removeLocked deletes token from maps, tree, and intrusive expiry heaps.
+// Every path that ends a ticket's life in the store uses it. Caller holds
+// ts.mu for writing.
+func (ts *tokenStore) removeLocked(token string, node *tokenNode) {
 	delete(ts.entries, token)
-	ts.unindexLocked(token, entry)
+	ts.unindexLocked(token, node)
+	ts.tree.delete(node)
+	ts.removeFromHeapsLocked(node)
 }
 
-// unindexLocked drops entry's key and ID from the indexes, but only where
+// unindexLocked drops node's key and ID from the indexes, but only where
 // they still point at token. Caller holds ts.mu for writing.
-func (ts *tokenStore) unindexLocked(token string, entry ticketEntry) {
-	if entry.key != "" && ts.byKey[entry.key] == token {
-		delete(ts.byKey, entry.key)
+func (ts *tokenStore) unindexLocked(token string, node *tokenNode) {
+	if node.key != "" && ts.byKey[node.key] == token {
+		delete(ts.byKey, node.key)
 	}
-	if entry.id != "" && ts.byID[entry.id] == token {
-		delete(ts.byID, entry.id)
+	if node.id != "" && ts.byID[node.id] == token {
+		delete(ts.byID, node.id)
 	}
 }
 
@@ -288,9 +314,15 @@ func (ts *tokenStore) set(token string, entry ticketEntry) {
 
 func (ts *tokenStore) get(token string) (ticketEntry, bool) {
 	ts.mu.RLock()
-	defer ts.mu.RUnlock()
-	e, ok := ts.entries[token]
-	return e, ok
+	node, ok := ts.entries[token]
+	if !ok {
+		ts.mu.RUnlock()
+		return ticketEntry{}, false
+	}
+	eff := effectiveTicket(node, ts.hasLazyShifts)
+	e := node.snapshotEntry(eff)
+	ts.mu.RUnlock()
+	return e, true
 }
 
 // delete removes a token WITHOUT reporting what was removed. It must only
@@ -300,8 +332,8 @@ func (ts *tokenStore) get(token string) (ticketEntry, bool) {
 func (ts *tokenStore) delete(token string) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	if e, ok := ts.entries[token]; ok {
-		ts.removeLocked(token, e)
+	if node, ok := ts.entries[token]; ok {
+		ts.removeLocked(token, node)
 	}
 }
 
@@ -312,11 +344,14 @@ func (ts *tokenStore) delete(token string) {
 func (ts *tokenStore) take(token string) (ticketEntry, bool) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	e, ok := ts.entries[token]
-	if ok {
-		ts.removeLocked(token, e)
+	node, ok := ts.entries[token]
+	if !ok {
+		return ticketEntry{}, false
 	}
-	return e, ok
+	eff := effectiveTicket(node, ts.hasLazyShifts)
+	e := node.snapshotEntry(eff)
+	ts.removeLocked(token, node)
+	return e, true
 }
 
 // deleteIfExpired atomically checks expiry and deletes the token under a
@@ -328,30 +363,38 @@ func (ts *tokenStore) deleteIfExpired(token string) (ticketEntry, bool) {
 	ttl := ts.ttl()
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	entry, ok := ts.entries[token]
+	node, ok := ts.entries[token]
 	if !ok {
 		return ticketEntry{}, false
 	}
-	if time.Since(entry.issuedAt) > ttl {
-		ts.removeLocked(token, entry)
-		return entry, true
+	node.mu.Lock()
+	expired := time.Since(node.issuedAt) > ttl
+	if !expired {
+		node.mu.Unlock()
+		return ticketEntry{}, false
 	}
-	return ticketEntry{}, false
+	eff := effectiveTicket(node, ts.hasLazyShifts)
+	e := node.toEntryMuLocked(eff)
+	node.mu.Unlock()
+	ts.removeLocked(token, node)
+	return e, true
 }
 
 // touchIssuedAt resets the issuedAt timestamp for a token to now and
 // marks it seen, preventing the reaper from evicting a client that is
 // actively in contact.
 func (ts *tokenStore) touchIssuedAt(token string) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	entry, ok := ts.entries[token]
+	ts.mu.RLock()
+	node, ok := ts.entries[token]
 	if !ok {
+		ts.mu.RUnlock()
 		return
 	}
-	entry.issuedAt = time.Now()
-	entry.seen = true
-	ts.entries[token] = entry
+	node.mu.Lock()
+	node.issuedAt = time.Now()
+	node.seen = true
+	node.mu.Unlock()
+	ts.mu.RUnlock()
 }
 
 // markRendered records that the client reloaded the waiting page and is
@@ -359,35 +402,56 @@ func (ts *tokenStore) touchIssuedAt(token string) {
 // the token seen, restarts the cookie-refresh clock, and records whether
 // the client presented a valid VIP pass on this request.
 func (ts *tokenStore) markRendered(token string, now time.Time, hasPass bool) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	entry, ok := ts.entries[token]
+	ts.mu.RLock()
+	node, ok := ts.entries[token]
 	if !ok {
+		ts.mu.RUnlock()
 		return
 	}
-	entry.issuedAt = now
-	entry.seen = true
-	entry.cookieSetAt = now
-	entry.hasPass = hasPass
-	ts.entries[token] = entry
+	node.mu.Lock()
+	node.issuedAt = now
+	node.seen = true
+	node.cookieSetAt = now
+	node.hasPass = hasPass
+	node.mu.Unlock()
+	ts.mu.RUnlock()
 }
 
 // touchLastPoll updates the lastPoll timestamp and returns the previous
 // value. Callers use this to enforce per-token poll rate limits.
 //
 // StatusHandler now uses poll, which does this as part of a single
-// locked operation; touchLastPoll remains for tests and diagnostics.
+// read-locked operation; touchLastPoll remains for tests and diagnostics.
 func (ts *tokenStore) touchLastPoll(token string) (previous time.Time, ok bool) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	entry, exists := ts.entries[token]
+	ts.mu.RLock()
+	node, exists := ts.entries[token]
 	if !exists {
+		ts.mu.RUnlock()
 		return time.Time{}, false
 	}
-	previous = entry.lastPoll
-	entry.lastPoll = time.Now()
-	ts.entries[token] = entry
+	node.mu.Lock()
+	previous = node.lastPoll
+	node.lastPoll = time.Now()
+	node.mu.Unlock()
+	ts.mu.RUnlock()
 	return previous, true
+}
+
+// promoteTicket reassigns token's ticket number to newTicket, marks it
+// promoted, and re-positions it in the order-statistic tree in O(log N).
+// Returns ok=false if the token was removed concurrently; it never inserts.
+func (ts *tokenStore) promoteTicket(token string, newTicket int64) (ticketEntry, bool) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	node, ok := ts.entries[token]
+	if !ok {
+		return ticketEntry{}, false
+	}
+	ts.tree.delete(node)
+	node.ticket = newTicket
+	node.promoted = true
+	ts.tree.insert(node)
+	return node.snapshotEntry(newTicket), true
 }
 
 // pollOutcome classifies a /queue/status poll for a token that was
@@ -424,10 +488,12 @@ type pollResult struct {
 	refreshCookie bool
 }
 
-// poll applies one /queue/status poll under a single write lock:
+// poll applies one /queue/status poll under ts.mu.RLock + node.mu (never
+// taking the global write lock on live tokens):
 //
 //  1. Unknown token, or a keyed ticket's token → pollUnknown.
-//  2. TTL elapsed → delete and return pollExpired with the entry.
+//  2. TTL elapsed → upgrade to write lock with double-check, delete, and
+//     return pollExpired with the entry.
 //  3. Otherwise keep the token alive (issuedAt = now), mark it seen and
 //     record lastPoll — on BOTH the accepted and the rate-limited path,
 //     so a client polling too fast is throttled but never reaped while
@@ -440,41 +506,68 @@ type pollResult struct {
 // edge is nowServing+cap read by the caller just before the call. The
 // window only moves forward, so a slightly stale edge can at worst skip
 // a refresh for a client that is about to be admitted anyway.
-//
-// This replaces the former deleteIfExpired + get + touchLastPoll +
-// touchIssuedAt sequence, which took the write lock three times per poll.
 func (ts *tokenStore) poll(token string, now time.Time, edge int64, minInterval, refreshEvery time.Duration) pollResult {
 	ttl := ts.ttl()
 
+	ts.mu.RLock()
+	node, ok := ts.entries[token]
+	if !ok || node.key != "" {
+		// A keyed ticket's token is never handed out, so a cookie that
+		// carries one is not its client's; treat it as unknown.
+		ts.mu.RUnlock()
+		return pollResult{outcome: pollUnknown}
+	}
+
+	node.mu.Lock()
+	if now.Sub(node.issuedAt) > ttl {
+		node.mu.Unlock()
+		ts.mu.RUnlock()
+		return ts.pollExpiredSlow(token, now, edge, minInterval, refreshEvery, ttl)
+	}
+	effTicket := effectiveTicket(node, ts.hasLazyShifts)
+	res := applyPollMuLocked(node, effTicket, now, edge, minInterval, refreshEvery)
+	node.mu.Unlock()
+	ts.mu.RUnlock()
+	return res
+}
+
+// pollExpiredSlow handles the rare expired-token poll by upgrading to
+// ts.mu.Lock and re-checking expiry to close the TOCTOU window.
+func (ts *tokenStore) pollExpiredSlow(token string, now time.Time, edge int64, minInterval, refreshEvery, ttl time.Duration) pollResult {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
-	entry, ok := ts.entries[token]
-	if !ok || entry.key != "" {
-		// A keyed ticket's token is never handed out, so a cookie that
-		// carries one is not its client's; treat it as unknown.
+	node, ok := ts.entries[token]
+	if !ok || node.key != "" {
 		return pollResult{outcome: pollUnknown}
 	}
-	if now.Sub(entry.issuedAt) > ttl {
-		ts.removeLocked(token, entry)
+	node.mu.Lock()
+	effTicket := effectiveTicket(node, ts.hasLazyShifts)
+	if now.Sub(node.issuedAt) > ttl {
+		entry := node.toEntryMuLocked(effTicket)
+		node.mu.Unlock()
+		ts.removeLocked(token, node)
 		return pollResult{outcome: pollExpired, entry: entry}
 	}
+	res := applyPollMuLocked(node, effTicket, now, edge, minInterval, refreshEvery)
+	node.mu.Unlock()
+	return res
+}
 
-	prev := entry.lastPoll
-	entry.lastPoll = now
-	entry.issuedAt = now
-	entry.seen = true
+func applyPollMuLocked(node *tokenNode, effTicket int64, now time.Time, edge int64, minInterval, refreshEvery time.Duration) pollResult {
+	prev := node.lastPoll
+	node.lastPoll = now
+	node.issuedAt = now
+	node.seen = true
 
 	res := pollResult{outcome: pollAccepted}
 	if !prev.IsZero() && now.Sub(prev) < minInterval {
 		res.outcome = pollRateLimited
-	} else if entry.ticket > edge && now.Sub(entry.cookieSetAt) >= refreshEvery {
-		entry.cookieSetAt = now
+	} else if effTicket > edge && now.Sub(node.cookieSetAt) >= refreshEvery {
+		node.cookieSetAt = now
 		res.refreshCookie = true
 	}
-
-	ts.entries[token] = entry
-	res.entry = entry
+	res.entry = node.toEntryMuLocked(effTicket)
 	return res
 }
 
@@ -493,12 +586,89 @@ func (ts *tokenStore) len() int {
 func (ts *tokenStore) isExpired(token string) bool {
 	ttl := ts.ttl()
 	ts.mu.RLock()
-	defer ts.mu.RUnlock()
-	entry, ok := ts.entries[token]
+	node, ok := ts.entries[token]
 	if !ok {
+		ts.mu.RUnlock()
 		return true
 	}
-	return time.Since(entry.issuedAt) > ttl
+	node.mu.Lock()
+	expired := time.Since(node.issuedAt) > ttl
+	node.mu.Unlock()
+	ts.mu.RUnlock()
+	return expired
+}
+
+// ageAll shifts issuedAt (and optionally lastPoll/cookieSetAt) back by d for
+// every token in the store and re-syncs the expiry heaps. Used by white-box
+// tests to simulate elapsed time deterministically without sleeping.
+func (ts *tokenStore) ageAll(d time.Duration, includePollAndCookie bool) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	for _, node := range ts.entries {
+		node.mu.Lock()
+		node.issuedAt = node.issuedAt.Add(-d)
+		if includePollAndCookie {
+			if !node.lastPoll.IsZero() {
+				node.lastPoll = node.lastPoll.Add(-d)
+			}
+			node.cookieSetAt = node.cookieSetAt.Add(-d)
+		}
+		node.ttlKey = node.issuedAt
+		node.unseenKey = node.issuedAt
+		node.mu.Unlock()
+	}
+	heap.Init(&ts.ttlHeap)
+	heap.Init(&ts.unseenHeap)
+}
+
+// ageCookieSetAtAll shifts cookieSetAt back by d for every token. White-box
+// test helper.
+func (ts *tokenStore) ageCookieSetAtAll(d time.Duration) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	for _, node := range ts.entries {
+		node.mu.Lock()
+		node.cookieSetAt = node.cookieSetAt.Add(-d)
+		node.mu.Unlock()
+	}
+}
+
+// ageKeyIssuedAt shifts issuedAt back by d for a keyed token and re-fixes its
+// heap position. White-box test helper.
+func (ts *tokenStore) ageKeyIssuedAt(key string, d time.Duration) {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	tok, ok := ts.byKey[key]
+	if !ok {
+		return
+	}
+	node := ts.entries[tok]
+	node.mu.Lock()
+	node.issuedAt = node.issuedAt.Add(-d)
+	node.ttlKey = node.issuedAt
+	node.unseenKey = node.issuedAt
+	node.mu.Unlock()
+	if node.ttlHeapIdx >= 0 {
+		heap.Fix(&ts.ttlHeap, node.ttlHeapIdx)
+	}
+	if node.unseenHeapIdx >= 0 {
+		heap.Fix(&ts.unseenHeap, node.unseenHeapIdx)
+	}
+}
+
+// ageIDViewedAt shifts viewedAt back by d for a public ticket ID. White-box
+// test helper.
+func (ts *tokenStore) ageIDViewedAt(id string, d time.Duration) {
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	tok, ok := ts.byID[id]
+	if !ok {
+		return
+	}
+	node := ts.entries[tok]
+	node.mu.Lock()
+	node.viewedAt = node.viewedAt.Add(-d)
+	node.mu.Unlock()
 }
 
 // passStore maps pass tokens (from the room_pass cookie) to their

@@ -34,24 +34,29 @@ const (
 	viewAccepted
 )
 
-// view applies one view of /queue/status/{id} under the write lock: the
-// rate limit (one accepted view per minInterval per ID) and the place.
-// It never touches issuedAt or seen, so watching a place never keeps it
-// alive: only its own client can.
+// view applies one view of /queue/status/{id} under ts.mu.RLock + node.mu:
+// the rate limit (one accepted view per minInterval per ID) and the O(log N)
+// place in line. It never touches issuedAt or seen, so watching a place never
+// keeps it alive: only its own client can.
 func (ts *tokenStore) view(id string, now time.Time, minInterval time.Duration) (viewOutcome, int64) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+	ts.mu.RLock()
 	t, ok := ts.byID[id]
 	if !ok {
+		ts.mu.RUnlock()
 		return viewUnknown, 0
 	}
-	e := ts.entries[t]
-	if !e.viewedAt.IsZero() && now.Sub(e.viewedAt) < minInterval {
+	node := ts.entries[t]
+	node.mu.Lock()
+	if !node.viewedAt.IsZero() && now.Sub(node.viewedAt) < minInterval {
+		node.mu.Unlock()
+		ts.mu.RUnlock()
 		return viewRateLimited, 0
 	}
-	e.viewedAt = now
-	ts.entries[t] = e
-	return viewAccepted, ts.placeLocked(t, e)
+	node.viewedAt = now
+	node.mu.Unlock()
+	place := ts.tree.place(node)
+	ts.mu.RUnlock()
+	return viewAccepted, place
 }
 
 // serveTicketStatus is GET /queue/status/{id}: the place of a keyed
