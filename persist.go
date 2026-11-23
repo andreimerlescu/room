@@ -57,6 +57,7 @@ type persistedLease struct {
 	Key        string    `json:"key"`
 	AcquiredAt time.Time `json:"acquired_at"`
 	RenewedAt  time.Time `json:"renewed_at"`
+	ExpiresAt  time.Time `json:"expires_at,omitempty"`
 }
 
 type persistedPass struct {
@@ -267,17 +268,26 @@ func (wr *WaitingRoom) Import(r io.Reader) (ImportStats, error) {
 		wr.nowServing.Load() != 0 || wr.ledger.len() != 0 || wr.Held() != 0 {
 		return ImportStats{}, ErrImportNotEmpty{}
 	}
+	// Filter out remote leases whose absolute signed expiry has already passed.
+	liveLeases := make([]persistedLease, 0, len(f.Leases))
+	for _, l := range f.Leases {
+		if !l.ExpiresAt.IsZero() && !now.Before(l.ExpiresAt) {
+			continue
+		}
+		liveLeases = append(liveLeases, l)
+	}
+
 	// Claim ticket numbers 1..n atomically; fails if any ticket was
 	// issued since Init.
 	// Leases take numbers 1..L, as tickets already admitted and not yet
 	// released; the line takes L+1..L+n. The window (nowServing 0, edge
 	// cap) then has exactly cap-L places free, as before the restart.
-	leaseCount := int64(len(f.Leases))
+	leaseCount := int64(len(liveLeases))
 	if !wr.nextTicket.CompareAndSwap(0, leaseCount+int64(len(kept))) {
 		return ImportStats{}, ErrImportNotEmpty{}
 	}
-	wr.restoreLeases(f.Leases, shift)
-	stats.LeasesRestored = len(f.Leases)
+	wr.restoreLeases(liveLeases, shift)
+	stats.LeasesRestored = len(liveLeases)
 
 	entries := make(map[string]ticketEntry, len(kept))
 	for i, t := range kept {
@@ -405,16 +415,22 @@ func (wr *WaitingRoom) snapshotLeases() []persistedLease {
 	})
 	out := make([]persistedLease, len(all))
 	for i, h := range all {
-		out[i] = persistedLease{Key: h.key, AcquiredAt: h.l.acquiredAt, RenewedAt: h.l.renewedAt}
+		out[i] = persistedLease{
+			Key:        h.key,
+			AcquiredAt: h.l.acquiredAt,
+			RenewedAt:  h.l.renewedAt,
+			ExpiresAt:  h.l.expiresAt,
+		}
 	}
 	return out
 }
 
 // restoreLeases installs leases as tickets 1..L, already admitted. Their
 // times move forward by the downtime, so it is not charged against a
-// lease TTL. When L exceeds the room's configured capacity, the semaphore
-// temporarily expands to absorb all L slots and immediately shrinks back
-// to cap (sema v1.2.0 preserves held slots on shrink), keeping wr.Len(),
+// lease TTL. Signed remote lease ExpiresAt values are wall-clock expiries
+// and are not shifted. When L exceeds the room's configured capacity, the
+// semaphore temporarily expands to absorb all L slots and immediately shrinks
+// back to cap (sema v1.2.0 preserves held slots on shrink), keeping wr.Len(),
 // wr.Held(), and wr.occupancy identical.
 func (wr *WaitingRoom) restoreLeases(leases []persistedLease, shift time.Duration) {
 	if len(leases) == 0 {
@@ -426,6 +442,7 @@ func (wr *WaitingRoom) restoreLeases(leases []persistedLease, shift time.Duratio
 			ticket:     int64(i + 1),
 			acquiredAt: l.AcquiredAt.Add(shift),
 			renewedAt:  l.RenewedAt.Add(shift),
+			expiresAt:  l.ExpiresAt,
 		}
 	}
 	wr.leaseMu.Unlock()

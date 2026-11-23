@@ -25,6 +25,11 @@ func TestEvent_String(t *testing.T) {
 		{EventTimeout, "Timeout"},
 		{EventPromote, "Promote"},
 		{EventRemove, "Remove"},
+		{EventRank, "Rank"},
+		{EventLease, "Lease"},
+		{EventRelease, "Release"},
+		{EventLeaseExpire, "LeaseExpire"},
+		{EventTokenRejected, "TokenRejected"},
 		{Event(255), "Unknown"},
 	}
 	for _, tc := range cases {

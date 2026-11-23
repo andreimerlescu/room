@@ -413,10 +413,10 @@
     const JITTER_MS          = 500;
     const STATUS_ENDPOINT    = "/queue/status";
 
-    // Name of the non-HttpOnly probe cookie the server sets alongside
-    // room_ticket on every waiting-room render. See setProbeCookie in
-    // room.go — its only job is to be readable from here.
-    const PROBE_COOKIE       = "room_probe";
+    // Name of the non-HttpOnly probe cookie the server sets alongside the
+    // ticket cookie on every waiting-room render. Injected via {{.ProbeCookie}}
+    // (defaults to "room_probe", or "<prefix>_probe" when SetCookiePrefix is used).
+    const PROBE_COOKIE       = "{{.ProbeCookie}}";
 
     // SkipURL is injected by the server via template substitution.
     // If the application did not call SetSkipURL, this is empty and

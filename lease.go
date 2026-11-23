@@ -1,13 +1,57 @@
 package room
 
-import "time"
+import (
+	"math"
+	"time"
+)
+
+// LeaseCeiling returns the maximum number of capacity slots that held leases
+// (local and remote signed) may occupy at the current capacity and lease
+// fraction. Unused lease headroom remains available to ordinary requests
+// (work-conserving), and total held leases plus in-flight requests never
+// exceeds Cap.
+func (wr *WaitingRoom) LeaseCeiling() int32 {
+	if !wr.initialised.Load() {
+		return 0
+	}
+	return wr.leaseCeilingFor(wr.cap.Load())
+}
+
+func (wr *WaitingRoom) leaseCeilingFor(cap int32) int32 {
+	frac := wr.LeaseFraction()
+	if frac <= 0 || cap <= 0 {
+		return 0
+	}
+	if frac >= 1.0 {
+		return cap
+	}
+	n := int32(math.Floor(float64(cap) * frac))
+	if cap >= 2 && n < 1 {
+		return 1
+	}
+	if n > cap {
+		return cap
+	}
+	return n
+}
+
+func (l leaseEntry) isExpired(now time.Time, ttl time.Duration) bool {
+	if !l.expiresAt.IsZero() && !now.Before(l.expiresAt) {
+		return true
+	}
+	if ttl > 0 && now.Sub(l.renewedAt) > ttl {
+		return true
+	}
+	return false
+}
 
 // Acquire grants key a slot held until [WaitingRoom.Release] (or lease TTL
-// expiry) if key's ticket is inside the serving window and a slot is free.
-// Otherwise key joins or stays in line (restarting its TokenTTL) and Acquire
-// returns ok=false with its 1-based place in line.
+// expiry) if key's ticket is inside the serving window, held leases are below
+// [WaitingRoom.LeaseCeiling], and a slot is free. Otherwise key joins or stays
+// in line (restarting its TokenTTL) and Acquire returns ok=false with its
+// 1-based place in line.
 //
-// Calling Acquire for a key that already holds a lease renews its TTL and
+// Calling Acquire for a key that already holds a live lease renews its TTL and
 // returns ok=true, position=0. Both the serving window and underlying
 // semaphore (sema v1.2.0) preserve held slots on [WaitingRoom.SetCap] shrink,
 // keeping Len() and Held() aligned until enough leases are released.
@@ -22,14 +66,28 @@ func (wr *WaitingRoom) Acquire(key string) (ok bool, position int64, err error) 
 	if err := validKey(key); err != nil {
 		return false, 0, err
 	}
-	now := time.Now()
+	now := wr.now()
+	ttl := time.Duration(wr.leaseTTL.Load())
 
 	wr.leaseMu.Lock()
 	if l, held := wr.leases[key]; held {
-		l.renewedAt = now
-		wr.leases[key] = l
+		if !l.isExpired(now, ttl) {
+			l.renewedAt = now
+			wr.leases[key] = l
+			wr.leaseMu.Unlock()
+			return true, 0, nil
+		}
+		delete(wr.leases, key)
 		wr.leaseMu.Unlock()
-		return true, 0, nil
+		wr.release()
+		wr.emit(EventLeaseExpire, wr.snapshotForKey(EventLeaseExpire, key))
+		wr.leaseMu.Lock()
+		if cur, still := wr.leases[key]; still && !cur.isExpired(now, ttl) {
+			cur.renewedAt = now
+			wr.leases[key] = cur
+			wr.leaseMu.Unlock()
+			return true, 0, nil
+		}
 	}
 
 	var (
@@ -44,7 +102,9 @@ func (wr *WaitingRoom) Acquire(key string) (ok bool, position int64, err error) 
 			return false, 0, err
 		}
 		place = k.place
-		if !wr.ticketReady(k.entry.ticket) || !wr.sem.TryAcquire() {
+		if int32(len(wr.leases)) >= wr.leaseCeilingFor(wr.cap.Load()) ||
+			!wr.ticketReady(k.entry.ticket) ||
+			!wr.sem.TryAcquire() {
 			break
 		}
 		claimed, won := wr.tokens.take(k.token)
@@ -133,13 +193,10 @@ func (wr *WaitingRoom) LeaseTTL() time.Duration {
 
 func (wr *WaitingRoom) reapLeases(now time.Time) {
 	ttl := time.Duration(wr.leaseTTL.Load())
-	if ttl <= 0 {
-		return
-	}
 	var expired []string
 	wr.leaseMu.Lock()
 	for key, l := range wr.leases {
-		if now.Sub(l.renewedAt) > ttl {
+		if l.isExpired(now, ttl) {
 			delete(wr.leases, key)
 			expired = append(expired, key)
 		}

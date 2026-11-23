@@ -36,7 +36,7 @@ wr.RegisterRoutes(r)
 ## Installation
 
 ```sh
-go get github.com/andreimerlescu/room@v1.7.0
+go get github.com/andreimerlescu/room@v1.8.0
 ```
 
 Requires [gin](https://github.com/gin-gonic/gin) and the Go version declared in
@@ -100,8 +100,9 @@ Supported placeholders:
 |---|---|
 | `{{.Position}}` | Client's queue position (integer) |
 | `{{.SkipURL}}` | Payment URL (HTML-escaped; empty if unset) |
+| `{{.ProbeCookie}}` | Probe cookie name (`room_probe`, or `<prefix>_probe` with `SetCookiePrefix`) |
 
-Custom pages should check `document.cookie` for `room_probe` before polling,
+Custom pages should check `document.cookie` for `{{.ProbeCookie}}` (or `room_probe`) before polling,
 poll `/queue/status` with credentials, reload when `ready: true`, and stop
 polling if `cookies_required: true`.
 
@@ -126,9 +127,14 @@ wr.SetSecureCookie(true)               // behind TLS / TLS-terminating proxy
 Every setter (`SetCap`, `SetTokenTTL`, `SetReaperInterval`, `SetFirstPollGrace`,
 `SetMaxQueueDepth`, `SetPassDuration`, `SetHTML`, `SetSkipURL`, `SetRateFunc`,
 `SetClientKeyFunc`, `SetSecureCookie`, `SetCookiePath`, `SetCookieDomain`,
-`SetTicketKeyFunc`, `SetWaitJSON`, `SetWaitResponder`, `SetStatusBaseURL`,
-`SetLeaseTTL`) is safe to call concurrently while serving traffic. Only `Init`
-and `Import` must run before serving.
+`SetCookiePrefix`, `SetScope`, `SetService`, `SetSigner`, `SetVerifier`,
+`SetSigningKey`, `SetVerifyKeys`, `SetEd25519VerifyKeys`, `SetSignedMaxTTL`,
+`SetLeaseFraction`, `SetClockSkew`, `SetTicketKeyFunc`, `SetTokenExtractor`,
+`SetWaitJSON`, `SetWaitResponder`, `SetStatusBaseURL`, `SetLeaseTTL`) is safe to
+call concurrently while serving traffic. Functional options may also be passed
+directly to `Init(cap, opts...)`. Call `wr.Validate()` (also run automatically
+by `RegisterRoutes`, which panics on misconfiguration) before serving. Only
+`Init` and `Import` must run before serving.
 
 ### Changing capacity
 
@@ -181,13 +187,13 @@ moved, _ := wr.SetTicketRank(token, 2)
 ```go
 wr.SetRateFunc(func(depth int64) float64 { return 1.00 + float64(depth)*0.05 })
 wr.SetSkipURL("/queue/purchase")
-wr.SetPassDuration(90 * time.Minute) // optional: auto-promote on re-entry
+wr.SetPassDuration(15 * time.Minute) // optional: auto-promote on re-entry (<= SignedMaxTTL when signing)
 
 cost, err := wr.QuoteCost(token, 1)
 res, err := wr.PromoteTokenToFront(token)
 if res.PassToken != "" {
 	http.SetCookie(w, &http.Cookie{
-		Name: "room_pass", Value: res.PassToken, Path: wr.CookiePath(),
+		Name: wr.PassCookieName(), Value: res.PassToken, Path: wr.CookiePath(),
 		MaxAge: int(wr.PassDuration().Seconds()), HttpOnly: true, Secure: true,
 	})
 }
@@ -235,12 +241,76 @@ wr.SetStatusBaseURL("/wait/queue/status/")
 
 Leases share the room's capacity and line FIFO with normal requests; with
 `SetTicketKeyFunc`, a lease holder's requests pass through without taking a
-second slot.
+second slot. **Per-replica lease ceiling:** when a `Signer` or `Verifier` is
+configured, held leases (local and remote signed) are bounded to `25%` of `cap`
+by default (`SetLeaseFraction`, work-conserving, clamped to at least 1 for
+`cap >= 2`, with overflow queuing at position 1 of the general line);
+unconfigured single-process rooms keep `1.0` (`100%` of `cap`), and calling
+`SetLeaseFraction(1.0)` restores that compatibility ceiling in signed mode.
 
-### One line per process
+### One line per process, verifiable capabilities across replicas
 
-Queue state lives in memory. Multiple replicas behind one load balancer keep
-independent lines and capacities.
+`room` stays strictly single-process and zero-dependency: `cap` is a per-replica
+origin-protection budget. Operators who want a single global line per service
+front it with a gateway or sidecar running `room`.
+
+When serving multiple replicas without a shared store, VIP passes and leases
+can be verified locally with cryptographic envelopes (`kid`, `kind`, `scope`,
+`key`, `iat`, `exp`) instead of in-memory pass lookups — with zero coordination
+on the hot path:
+
+- **Ed25519 split mode (recommended):** Your checkout/control-plane service
+  holds the private key via `room.NewTokenIssuer(scope, ed25519Signer)` and
+  mints short-lived passes (`MintPass`) or leases (`MintLease`). Serving
+  replicas hold only public keys (`WithEd25519VerifyKeys` / `SetEd25519VerifyKeys`)
+  so a compromised replica can verify tokens (including rotated `kid`s) but
+  cannot mint them (minting fails closed with `ErrNoSigner`).
+- **HMAC symmetric mode:** Call `SetSigningKey` / `SetVerifyKeys` (or pass
+  `WithSigningKey` / `WithVerifyKeys` to `Init`) for simple single-secret setups.
+  When neither `Signer` nor `Verifier` is configured, `room` keeps the local
+  in-memory pass store and `Export`/`Import` unchanged.
+- **Per-service isolation:** `SetScope` binds tokens to one service (required
+  whenever a `Signer` or `Verifier` is set — `Validate()` and `RegisterRoutes`
+  fail closed if empty). `SetCookiePrefix("billing")` namespaces browser cookies
+  (`billing_ticket`, `billing_pass`, `billing_probe`) independently from scope,
+  or `SetService("billing")` sets both.
+- **Short-lived signed TTLs:** Signed token lifetimes are capped by
+  `SetSignedMaxTTL` (default `15m`, hard ceiling `MaxSignedTokenTTL = 1h`,
+  zero rejected). If a `Signer` is configured and `PassDuration > SignedMaxTTL`,
+  `Validate()` and `RegisterRoutes` fail at startup naming both durations.
+- **Per-replica cap protection & bounded lease pool:** Verified passes promote
+  to position 1 of the replica's line and still acquire a local slot within
+  `cap`. Local and remote signed leases share a work-conserving ceiling
+  (`SetLeaseFraction`, defaulting to `0.25` when signing is active, `1.0`
+  otherwise for v1.x compatibility; clamped to at least 1 for `cap >= 2` when
+  positive). Unused lease slots remain usable by ordinary requests, and when
+  the lease ceiling is full, lease holders queue at position 1 of the general
+  line rather than bypassing `cap` or being rejected.
+- **Identity vs. capability & rejection events:** `TicketKeyFunc` identifies
+  the client; `SetTokenExtractor` (default `X-Room-Pass` / `X-Room-Lease`
+  headers with pass-cookie fallback) extracts capabilities. Browser cookie
+  failures fall back to normal queuing; explicit API headers fall back on
+  expiry and return `401`/`403` on tampering, wrong scope, wrong kind, or key
+  mismatch. Every rejection emits `EventTokenRejected` with `Snapshot.Reason`
+  and `Snapshot.TokenTransport`.
+
+```go
+// Issuer (checkout / control plane — holds private key):
+signer, _ := room.NewEd25519Signer("k2", ed25519PrivKey)
+issuer, _ := room.NewTokenIssuer("billing", signer)
+passTok, _  := issuer.MintPass("", 15*time.Minute)
+leaseTok, _ := issuer.MintLease("agent-42", 10*time.Minute)
+
+// Serving replica (verify-only — holds only public keys, incl. rotated k1):
+wr := &room.WaitingRoom{}
+if err := wr.Init(500,
+	room.WithService("billing"),
+	room.WithEd25519VerifyKeys(map[string]ed25519.PublicKey{"k1": oldPub, "k2": newPub}),
+	room.WithLeaseFraction(0.25),
+); err != nil {
+	log.Fatal(err)
+}
+```
 
 ---
 
@@ -254,7 +324,8 @@ wr.On(room.EventQueue, func(s room.Snapshot) { metrics.Inc("room.queue") })
 
 Events: `EventEnter`, `EventExit`, `EventFull` (edge), `EventDrain` (edge),
 `EventQueue`, `EventEvict`, `EventTimeout`, `EventPromote`, `EventRemove`,
-`EventRank`, `EventLease`, `EventRelease`, `EventLeaseExpire`. Handlers run
+`EventRank`, `EventLease`, `EventRelease`, `EventLeaseExpire`,
+`EventTokenRejected`. Handlers run
 asynchronously in their own goroutines; keep high-frequency handlers
 non-blocking.
 

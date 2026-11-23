@@ -84,6 +84,21 @@ func (wr *WaitingRoom) PromoteToken(token string, targetPosition int64) (Promote
 		return PromoteResult{}, ErrPromotionDisabled{}
 	}
 
+	if d := wr.PassDuration(); d > 0 && wr.signingEnabled() {
+		if wr.signerLoad() == nil {
+			return PromoteResult{}, ErrNoSigner{}
+		}
+		if wr.Scope() == "" {
+			return PromoteResult{}, ErrMissingScope{}
+		}
+		if maxTTL := wr.SignedMaxTTL(); d > maxTTL {
+			return PromoteResult{}, ErrPassDurationExceedsSignedMaxTTL{
+				PassDuration: d,
+				SignedMaxTTL: maxTTL,
+			}
+		}
+	}
+
 	wr.promoteMu.Lock()
 	defer wr.promoteMu.Unlock()
 
@@ -97,10 +112,15 @@ func (wr *WaitingRoom) PromoteToken(token string, targetPosition int64) (Promote
 		return PromoteResult{}, nil
 	}
 
+	passToken, err := wr.GrantPassE()
+	if err != nil {
+		return PromoteResult{}, err
+	}
+
 	wr.emit(EventPromote, wr.snapshotFor(EventPromote, token, p.entry.clientKey, false))
 	return PromoteResult{
 		Cost:      float64(p.distance) * rate,
-		PassToken: wr.GrantPass(),
+		PassToken: passToken,
 	}, nil
 }
 

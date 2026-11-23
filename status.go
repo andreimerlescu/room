@@ -3,6 +3,7 @@ package room
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"fmt"
 	"net/http"
 	"time"
 
@@ -28,12 +29,12 @@ func (wr *WaitingRoom) StatusHandler() gin.HandlerFunc {
 }
 
 func (wr *WaitingRoom) serveStatus(w http.ResponseWriter, r *http.Request) {
-	if !wr.initialised.Load() {
+	if !wr.initialised.Load() || wr.validateConfig() != nil {
 		w.WriteHeader(http.StatusInternalServerError)
 		return
 	}
 
-	cookie, err := r.Cookie(cookieName)
+	cookie, err := r.Cookie(wr.TicketCookieName())
 	if err != nil {
 		writeJSON(w, http.StatusOK, statusResponse{
 			Ready:           false,
@@ -83,7 +84,7 @@ func (wr *WaitingRoom) serveStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	hasPass := false
-	if passCookie, err := r.Cookie(passCookieName); err == nil {
+	if passCookie, err := r.Cookie(wr.PassCookieName()); err == nil {
 		hasPass = wr.HasValidPass(passCookie.Value)
 	}
 
@@ -119,11 +120,17 @@ func (wr *WaitingRoom) positionOf(ticket int64) int64 {
 	return pos
 }
 
-// RegisterRoutes registers OPTIONS /queue/status, GET /queue/status, and
-// GET /queue/status/:ticket on r, then attaches [WaitingRoom.Middleware].
-// Safe to call across multiple gin.Engines sharing one WaitingRoom (calling
-// twice on the same engine panics via gin's duplicate route check).
+// RegisterRoutes validates the WaitingRoom configuration, registers
+// OPTIONS /queue/status, GET /queue/status, and GET /queue/status/:ticket on
+// r, then attaches [WaitingRoom.Middleware]. Panics with the typed validation
+// error if [WaitingRoom.Validate] fails (for example missing Scope or
+// PassDuration exceeding SignedMaxTTL with a signer configured). Safe to call
+// across multiple gin.Engines sharing one WaitingRoom (calling twice on the
+// same engine panics via gin's duplicate route check).
 func (wr *WaitingRoom) RegisterRoutes(r *gin.Engine) {
+	if err := wr.Validate(); err != nil {
+		panic(fmt.Sprintf("room.RegisterRoutes: %v", err))
+	}
 	r.OPTIONS("/queue/status", func(c *gin.Context) {
 		c.Status(http.StatusNoContent)
 	})

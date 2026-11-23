@@ -58,24 +58,42 @@ type WaitingRoom struct {
 	ledger         *ghostLedger
 
 	// Not reset by Init.
-	ticketKeyFunc atomic.Pointer[TicketKeyFunc]
-	waitResponder atomic.Pointer[WaitResponder]
+	ticketKeyFunc  atomic.Pointer[TicketKeyFunc]
+	waitResponder  atomic.Pointer[WaitResponder]
+	tokenExtractor atomic.Pointer[TokenExtractor]
 
 	waitJSON      atomic.Bool
 	statusBaseURL atomic.Pointer[string]
+
+	// Signed token, scope, cookie prefix, and bounded lease pool config.
+	scope             atomic.Pointer[string]
+	cookiePrefix      atomic.Pointer[string]
+	ticketCookie      atomic.Pointer[string]
+	passCookie        atomic.Pointer[string]
+	probeCookie       atomic.Pointer[string]
+	signer            atomic.Pointer[Signer]
+	verifier          atomic.Pointer[Verifier]
+	signedMaxTTL      atomic.Int64 // nanoseconds; default DefaultSignedMaxTTL
+	clockSkew         atomic.Int64 // nanoseconds; default DefaultClockSkew
+	leaseFractionBits atomic.Uint64
+	leaseFractionSet  atomic.Bool
 
 	// Lock order: leaseMu -> promoteMu -> tokens.mu -> node.mu / ledger.mu.
 	// leaseMu is never held across callbacks, handlers, or response writes.
 	leaseMu  sync.RWMutex
 	leases   map[string]leaseEntry
 	leaseTTL atomic.Int64 // nanoseconds; 0 means leases last until Release
+
+	nowFn func() time.Time // nil defaults to time.Now; overridden in tests
 }
 
-// leaseEntry records one key's held slot from Acquire until Release or TTL expiry.
+// leaseEntry records one key's held slot from Acquire (or verified remote
+// signed lease reservation) until Release or expiry.
 type leaseEntry struct {
 	ticket     int64
 	acquiredAt time.Time
 	renewedAt  time.Time
+	expiresAt  time.Time // non-zero for remote signed leases; hard expiry ceiling
 }
 
 // ticketEntry is a point-in-time snapshot of a queued client's state.

@@ -33,6 +33,13 @@ func (ps *passStore) set(token string, entry passEntry) {
 // get reports whether token exists and has not expired, lazily deleting
 // expired entries on read.
 func (ps *passStore) get(token string) (passEntry, bool) {
+	entry, ok, _ := ps.lookup(token)
+	return entry, ok
+}
+
+// lookup returns the pass entry, whether it is valid, and a rejection reason
+// ("expired" or "unknown") when invalid.
+func (ps *passStore) lookup(token string) (passEntry, bool, string) {
 	now := time.Now()
 
 	ps.mu.RLock()
@@ -40,10 +47,10 @@ func (ps *passStore) get(token string) (passEntry, bool) {
 	ps.mu.RUnlock()
 
 	if !ok {
-		return passEntry{}, false
+		return passEntry{}, false, RejectReasonUnknownKey
 	}
 	if !now.After(entry.expiresAt) {
-		return entry, true
+		return entry, true, ""
 	}
 
 	ps.mu.Lock()
@@ -51,7 +58,7 @@ func (ps *passStore) get(token string) (passEntry, bool) {
 		delete(ps.entries, token)
 	}
 	ps.mu.Unlock()
-	return passEntry{}, false
+	return passEntry{}, false, RejectReasonExpired
 }
 
 func (ps *passStore) delete(token string) {

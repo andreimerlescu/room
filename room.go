@@ -15,22 +15,26 @@ import (
 var defaultWaitingRoomBytes []byte
 
 var (
-	placeholderPosition = []byte("{{.Position}}")
-	placeholderSkipURL  = []byte("{{.SkipURL}}")
+	placeholderPosition    = []byte("{{.Position}}")
+	placeholderSkipURL     = []byte("{{.SkipURL}}")
+	placeholderProbeCookie = []byte("{{.ProbeCookie}}")
 )
 
 // Middleware returns the gin.HandlerFunc that enforces the waiting room.
 //
 // Requests within the current serving window (nowServing + cap) acquire a
 // semaphore slot and proceed immediately. Excess requests are issued a queued
-// ticket (identified by the room_ticket cookie, or by an application key when
+// ticket (identified by the ticket cookie, or by an application key when
 // [WaitingRoom.SetTicketKeyFunc] matches) and aborted with the waiting page
 // or wait response until their ticket enters the serving window.
 //
 // A returning client claims its token atomically before acquiring a slot so
 // each ticket is accounted for exactly once (admitted and released, or retired
-// via the ghost ledger). Clients presenting a valid room_pass cookie are
-// auto-promoted to the front of the line.
+// via the ghost ledger). Clients presenting a valid VIP pass (cookie or
+// signed header) are auto-promoted to the front of the line while still
+// acquiring a local slot within Cap. Clients presenting a verified signed
+// lease reserve a slot in the bounded lease pool up to LeaseCeiling, queuing
+// at the front of the general line when the pool is full.
 func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		if !wr.checkInitialised(c) {
@@ -39,17 +43,26 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 
 		secure := wr.cookieSecure(c.Request)
 
-		hasPass := false
-		if passCookie, err := c.Request.Cookie(passCookieName); err == nil {
-			hasPass = wr.HasValidPass(passCookie.Value)
-		}
-
 		if key, ok := wr.ticketKey(c); ok {
-			wr.serveKeyed(c, key, hasPass)
+			if err := validKey(key); err != nil {
+				c.AbortWithStatus(http.StatusBadRequest)
+				return
+			}
+			capState, proceed := wr.resolveCapabilities(c, key)
+			if !proceed {
+				return
+			}
+			wr.serveKeyed(c, key, capState)
 			return
 		}
 
-		cookie, cookieErr := c.Request.Cookie(cookieName)
+		capState, proceed := wr.resolveCapabilities(c, "")
+		if !proceed {
+			return
+		}
+		hasPass := capState.hasPass
+
+		cookie, cookieErr := c.Request.Cookie(wr.TicketCookieName())
 		hadTicketCookie := cookieErr == nil
 		if hadTicketCookie {
 			// A keyed ticket's internal token is ignored in cookies.
@@ -185,10 +198,10 @@ func (wr *WaitingRoom) cookieSecure(r *http.Request) bool {
 	return wr.secureCookie.Load() || r.TLS != nil
 }
 
-// setTicketCookie writes the HttpOnly room_ticket cookie with MaxAge = TokenTTL.
+// setTicketCookie writes the HttpOnly ticket cookie with MaxAge = TokenTTL.
 func (wr *WaitingRoom) setTicketCookie(w http.ResponseWriter, token string, secure bool) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
+		Name:     wr.TicketCookieName(),
 		Value:    token,
 		Path:     wr.CookiePath(),
 		Domain:   wr.CookieDomain(),
@@ -199,12 +212,12 @@ func (wr *WaitingRoom) setTicketCookie(w http.ResponseWriter, token string, secu
 	})
 }
 
-// setProbeCookie writes the non-HttpOnly room_probe cookie with the same
-// attributes as room_ticket so the waiting page can detect cookie-blocking
-// browsers before polling.
+// setProbeCookie writes the non-HttpOnly probe cookie with the same
+// attributes as the ticket cookie so the waiting page can detect
+// cookie-blocking browsers before polling.
 func (wr *WaitingRoom) setProbeCookie(w http.ResponseWriter, secure bool) {
 	http.SetCookie(w, &http.Cookie{
-		Name:     probeCookieName,
+		Name:     wr.ProbeCookieName(),
 		Value:    probeCookieValue,
 		Path:     wr.CookiePath(),
 		Domain:   wr.CookieDomain(),
@@ -253,11 +266,12 @@ func (wr *WaitingRoom) resolveHTML() []byte {
 	return defaultWaitingRoomBytes
 }
 
-// injectTemplateVars substitutes {{.Position}} and HTML-escaped {{.SkipURL}}
-// into page bytes.
+// injectTemplateVars substitutes {{.Position}}, HTML-escaped {{.SkipURL}},
+// and {{.ProbeCookie}} into page bytes.
 func (wr *WaitingRoom) injectTemplateVars(page []byte, position int64) []byte {
 	result := bytes.ReplaceAll(page, placeholderPosition, strconv.AppendInt(nil, position, 10))
-	return bytes.ReplaceAll(result, placeholderSkipURL, []byte(html.EscapeString(wr.SkipURL())))
+	result = bytes.ReplaceAll(result, placeholderSkipURL, []byte(html.EscapeString(wr.SkipURL())))
+	return bytes.ReplaceAll(result, placeholderProbeCookie, []byte(wr.ProbeCookieName()))
 }
 
 // SetHTML replaces the waiting room page served to queued requests. Pass nil

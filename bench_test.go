@@ -252,3 +252,44 @@ func BenchmarkStatusPoll_Parallel_100k(b *testing.B) {
 		}
 	})
 }
+
+func BenchmarkAcquireRelease(b *testing.B) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(64); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(wr.Stop)
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		ok, _, err := wr.Acquire("bench-lease")
+		if err != nil || !ok {
+			b.Fatalf("Acquire: ok=%v err=%v", ok, err)
+		}
+		if err := wr.Release("bench-lease"); err != nil {
+			b.Fatalf("Release: %v", err)
+		}
+	}
+}
+
+func BenchmarkAcquire_Renew(b *testing.B) {
+	wr := &WaitingRoom{}
+	if err := wr.Init(64); err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(wr.Stop)
+
+	if ok, _, err := wr.Acquire("bench-lease"); err != nil || !ok {
+		b.Fatalf("setup Acquire: ok=%v err=%v", ok, err)
+	}
+
+	b.ReportAllocs()
+	b.ResetTimer()
+	for range b.N {
+		ok, _, err := wr.Acquire("bench-lease")
+		if err != nil || !ok {
+			b.Fatalf("renew Acquire: ok=%v err=%v", ok, err)
+		}
+	}
+}

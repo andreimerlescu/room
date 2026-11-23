@@ -105,7 +105,7 @@ func (wr *WaitingRoom) reap() {
 	}
 	wr.tokens.compactIfNeeded()
 	wr.passes.reap()
-	wr.reapLeases(time.Now())
+	wr.reapLeases(wr.now())
 }
 
 // reapBatch inspects up to reaperBatchSize due entries across unseenHeap and

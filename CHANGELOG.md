@@ -4,6 +4,58 @@ All notable changes to `github.com/andreimerlescu/room` are documented here.
 This project follows semantic versioning; `v1.x` releases maintain full
 exported API, cookie, HTTP endpoint, and callback backward compatibility.
 
+## v1.8.0
+
+**Ed25519 split mode for multi-replica deployments:** `room` stays single-process
+and zero-dependency — `cap` remains a per-replica origin-protection budget, and
+operators who want a single shared line front a service with a gateway or
+sidecar. Across multiple replicas, VIP passes and leases no longer depend on an
+in-memory store or a shared Redis/gossip cluster: your checkout or control-plane
+service holds the Ed25519 private key in a standalone `TokenIssuer`
+(`NewTokenIssuer`, `NewEd25519Signer`, `MintPass`, `MintLease`) and mints
+short-lived `rm1` envelopes (`kid`, `kind`, `scope`, `key`, `iat`, `exp`), while
+serving replicas hold only public verification keys (`SetEd25519VerifyKeys` /
+`WithEd25519VerifyKeys`, indexed by `kid` for zero-downtime key rotation). A
+compromised serving replica can verify tokens locally in pure crypto and cannot
+mint them — any minting attempt on a verify-only replica fails closed with
+`ErrNoSigner`.
+
+- **Pluggable `Signer`/`Verifier` & symmetric fallback:** Added `Signer` and
+  `Verifier` interfaces with built-in stdlib Ed25519 and HMAC-SHA256
+  (`SetSigningKey`, `SetVerifyKeys`, `NewHMACSigner`, `NewHMACVerifier`).
+  Verifier resolution happens dynamically at `Validate()`/verify time so
+  `SetSigner` and `SetVerifier` are completely order-independent (`ErrNoVerifier`
+  when a custom signer cannot derive one). When neither is configured, `room`
+  keeps the local `passStore` and `Export`/`Import` unchanged with zero hot-path
+  overhead (`0 B / 0 allocs` on in-memory poll and lease-renew paths).
+- **Per-replica cap protection & work-conserving bounded lease pool:** Verified
+  passes promote to position 1 of the replica's line and still acquire a local
+  slot within `cap`. Local and remote signed leases draw from a work-conserving
+  ceiling (`SetLeaseFraction`, `LeaseCeiling`) carved out of `cap` — defaulting
+  to `0.25` when a `Signer`/`Verifier` is configured (clamped to `>= 1` for
+  `cap >= 2` when positive) and `1.0` otherwise for full `v1.x` compatibility
+  (also configurable via `SetLeaseFraction(1.0)`). Overflowing lease holders
+  queue at the front of the general line rather than bypassing `cap` or being
+  rejected.
+- **Short-lived signed TTL cap (`1h` hard ceiling) & startup `Validate()`:**
+  Signed tokens enforce `SetSignedMaxTTL` (`DefaultSignedMaxTTL = 15m`, hard
+  ceiling `MaxSignedTokenTTL = 1h`, zero rejected via `ErrInvalidTokenTTL`
+  distinct from `ErrSignedTokenTTLTooLong`). Added `Init(cap, opts...)`
+  functional options and `Validate() error` (also run by `RegisterRoutes`, which
+  panics naming both values when `PassDuration > SignedMaxTTL` with a signer
+  configured, or when `Scope` is empty).
+- **Per-service isolation & cookie prefixing:** Separated token security
+  `SetScope` from browser cookie namespacing `SetCookiePrefix` (`<prefix>_ticket`,
+  `<prefix>_pass`, `<prefix>_probe`, `{{.ProbeCookie}}` injected in
+  `waiting_room.html`), with `SetService` configuring both.
+- **Identity vs. capability & rejection observability:** Added
+  `SetTokenExtractor` (default `X-Room-Pass` / `X-Room-Lease` with pass-cookie
+  fallback) separate from `TicketKeyFunc`, split-by-transport failure handling
+  (cookie failures and expired API headers fall back to the normal queue;
+  tampered, wrong-scope, wrong-kind, or key-mismatched API headers abort with
+  `401`/`403`), and `EventTokenRejected` (`Snapshot.Reason`,
+  `Snapshot.TokenTransport`).
+
 ## v1.7.0
 
 - **`O(log N)` indexed token store and ghost ledger:** Backed `tokenStore` and

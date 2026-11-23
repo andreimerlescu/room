@@ -113,12 +113,14 @@ func main() {
 	// remains valid. During this window, if the client is evicted,
 	// times out, or refreshes, they are auto-promoted to the front
 	// without paying again. Set to 0 to disable (single-use promotions).
+	// Kept at 15m so it aligns with room.DefaultSignedMaxTTL (15m; hard
+	// ceiling 1h) if a Signer is added for multi-replica deployments.
 	//
 	// Operator promotions (/admin/promote below) use AdminPromote, which
 	// does not depend on any of this.
 	wr.SetRateFunc(func(depth int64) float64 { return 2.50 })
 	wr.SetSkipURL("/queue/purchase")
-	if err := wr.SetPassDuration(90 * time.Minute); err != nil {
+	if err := wr.SetPassDuration(15 * time.Minute); err != nil {
 		log.Fatalf("room.SetPassDuration: %v", err)
 	}
 
@@ -562,7 +564,7 @@ func adminErrorStatus(err error) int {
 // Production equivalent: create a Stripe Checkout session with the
 // token as client_reference_id, then redirect to session.URL.
 func handlePurchasePage(c *gin.Context) {
-	cookie, err := c.Request.Cookie("room_ticket")
+	cookie, err := c.Request.Cookie(wr.TicketCookieName())
 	if err != nil || cookie.Value == "" {
 		c.Data(http.StatusBadRequest, "text/html; charset=utf-8", page(
 			"Error",
@@ -576,7 +578,7 @@ func handlePurchasePage(c *gin.Context) {
 	token := cookie.Value
 
 	// Check if the client already has a valid pass — no need to pay again.
-	if passCookie, err := c.Request.Cookie("room_pass"); err == nil {
+	if passCookie, err := c.Request.Cookie(wr.PassCookieName()); err == nil {
 		if wr.HasValidPass(passCookie.Value) {
 			c.Data(http.StatusOK, "text/html; charset=utf-8", page(
 				"VIP pass active",
@@ -640,9 +642,9 @@ func handlePurchasePage(c *gin.Context) {
 //
 // For this demo we skip signature verification and just promote.
 func handlePurchaseConfirm(c *gin.Context) {
-	cookie, err := c.Request.Cookie("room_ticket")
+	cookie, err := c.Request.Cookie(wr.TicketCookieName())
 	if err != nil || cookie.Value == "" {
-		c.JSON(http.StatusBadRequest, gin.H{"error": "no room_ticket cookie"})
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no queue ticket cookie"})
 		return
 	}
 
@@ -672,7 +674,7 @@ func handlePurchaseConfirm(c *gin.Context) {
 	// it Secure over plain HTTP would make some browsers drop the pass.
 	if result.PassToken != "" {
 		http.SetCookie(c.Writer, &http.Cookie{
-			Name:     "room_pass",
+			Name:     wr.PassCookieName(),
 			Value:    result.PassToken,
 			Path:     wr.CookiePath(),
 			Domain:   wr.CookieDomain(),
@@ -730,7 +732,7 @@ func homePage(c *gin.Context) {
 		  When you land in the waiting room, you'll see a
 		  <strong>"Skip the line"</strong> option — click it to test the
 		  payment flow at <strong>$2.50/position</strong>. Your VIP pass
-		  lasts <strong>90 minutes</strong>.
+		  lasts <strong>15 minutes</strong>.
 		</p>
 		<h2>Operator console (localhost only)</h2>
 		<ul>
@@ -765,7 +767,7 @@ func aboutPage(c *gin.Context) {
 		</p>
 		<p>
 		  High-priority customers can <strong>skip the line</strong> by paying
-		  a per-position fee. The VIP pass lasts 90 minutes — re-enter the
+		  a per-position fee. The VIP pass lasts 15 minutes — re-enter the
 		  queue anytime during that window and you'll be auto-promoted for free.
 		</p>
 		<a href="/">← Home</a>`,
@@ -782,7 +784,7 @@ func pricingPage(c *gin.Context) {
 		  <tbody>
 		    <tr><td>Free</td><td>100</td><td>Standard (FIFO)</td></tr>
 		    <tr><td>Pro</td><td>Unlimited</td><td>Standard (FIFO)</td></tr>
-		    <tr><td>Skip the line</td><td>—</td><td>$2.50/pos + 90 min VIP pass</td></tr>
+		    <tr><td>Skip the line</td><td>—</td><td>$2.50/pos + 15 min VIP pass</td></tr>
 		  </tbody>
 		</table>
 		<a href="/">← Home</a>`,
