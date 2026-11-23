@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// helpers
 
 // setCookies returns the Set-Cookie headers of a response keyed by name.
 func setCookies(w *httptest.ResponseRecorder) map[string]*http.Cookie {
@@ -26,27 +26,33 @@ func setCookies(w *httptest.ResponseRecorder) map[string]*http.Cookie {
 func ageEntries(ts *tokenStore, d time.Duration) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	for token, e := range ts.entries {
-		e.issuedAt = e.issuedAt.Add(-d)
-		if !e.lastPoll.IsZero() {
-			e.lastPoll = e.lastPoll.Add(-d)
+	for _, node := range ts.entries {
+		node.mu.Lock()
+		node.issuedAt = node.issuedAt.Add(-d)
+		if !node.lastPoll.IsZero() {
+			node.lastPoll = node.lastPoll.Add(-d)
 		}
-		e.cookieSetAt = e.cookieSetAt.Add(-d)
-		ts.entries[token] = e
+		node.cookieSetAt = node.cookieSetAt.Add(-d)
+		node.ttlKey = node.issuedAt
+		node.unseenKey = node.issuedAt
+		node.mu.Unlock()
 	}
+	ts.ttlHeap.init()
+	ts.unseenHeap.init()
 }
 
 // ageCookieSetAt shifts only the cookie-refresh clock back by d.
 func ageCookieSetAt(ts *tokenStore, d time.Duration) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	for token, e := range ts.entries {
-		e.cookieSetAt = e.cookieSetAt.Add(-d)
-		ts.entries[token] = e
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	for _, node := range ts.entries {
+		node.mu.Lock()
+		node.cookieSetAt = node.cookieSetAt.Add(-d)
+		node.mu.Unlock()
 	}
 }
 
-// ── Cookie lifetime: the long-wait regression ────────────────────────────────
+// Cookie lifetime: the long-wait regression
 
 // TestLongWait_CookiesOutliveTokenTTL simulates a browser cookie jar
 // through a wait three times longer than the token TTL, polling every 3s.
@@ -201,7 +207,7 @@ func TestStatusPoll_RefreshedCookiesMatchIssuedAttributes(t *testing.T) {
 	}
 }
 
-// ── Keep-alive ────────────────────────────────────────────────────────────────
+// Keep-alive
 
 // TestStatusPoll_RateLimitedPollKeepsTokenAlive covers a client that polls
 // faster than the rate limit. It receives only 429s, but it is actively
@@ -266,7 +272,7 @@ func TestStatusPoll_MarksSeen(t *testing.T) {
 	}
 }
 
-// ── Single-lock poll ──────────────────────────────────────────────────────────
+// Single-lock poll
 
 func TestTokenStorePoll_Outcomes(t *testing.T) {
 	t.Parallel()
@@ -304,7 +310,7 @@ func TestTokenStorePoll_Outcomes(t *testing.T) {
 	}
 }
 
-// ── passStore read path ───────────────────────────────────────────────────────
+// passStore read path
 
 func TestPassStore_ConcurrentGetWithExpiry(t *testing.T) {
 	t.Parallel()

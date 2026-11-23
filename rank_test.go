@@ -199,11 +199,9 @@ func TestSetTicketRank_ConcurrentKeepsNumbersExact(t *testing.T) {
 	for _, ti := range q {
 		held[ti.Ticket]++
 	}
-	wr.ledger.mu.Lock()
-	for _, g := range wr.ledger.tickets {
+	for _, g := range ghostSnapshot(wr.ledger) {
 		held[g]++
 	}
-	wr.ledger.mu.Unlock()
 	edge := wr.nowServing.Load() + int64(wr.Cap())
 	for n := edge + 1; n <= wr.nextTicket.Load(); n++ {
 		if held[n] != 1 {

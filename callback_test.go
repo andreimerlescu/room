@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// ── Event.String ─────────────────────────────────────────────────────────────
+// Event.String
 
 func TestEvent_String(t *testing.T) {
 	t.Parallel()
@@ -38,7 +38,7 @@ func TestEvent_String(t *testing.T) {
 	}
 }
 
-// ── Snapshot helpers ──────────────────────────────────────────────────────────
+// Snapshot helpers
 
 func TestSnapshot_Full(t *testing.T) {
 	t.Parallel()
@@ -64,7 +64,7 @@ func TestSnapshot_Empty(t *testing.T) {
 	}
 }
 
-// ── On / emit — basic correctness ────────────────────────────────────────────
+// On / emit — basic correctness
 
 func TestOn_SingleHandler_Called(t *testing.T) {
 	t.Parallel()
@@ -107,7 +107,7 @@ func TestOn_DifferentEvents_DoNotCross(t *testing.T) {
 	}
 }
 
-// ── Off ───────────────────────────────────────────────────────────────────────
+// Off
 
 func TestOff_RemovesAllHandlers(t *testing.T) {
 	t.Parallel()
@@ -145,7 +145,7 @@ func TestOff_DoesNotAffectOtherEvents(t *testing.T) {
 	}
 }
 
-// ── emit with no handlers ─────────────────────────────────────────────────────
+// emit with no handlers
 
 func TestEmit_NoHandlers_IsNoop(t *testing.T) {
 	t.Parallel()
@@ -154,7 +154,7 @@ func TestEmit_NoHandlers_IsNoop(t *testing.T) {
 	wr.emit(EventDrain, wr.snapshot(EventDrain))
 }
 
-// ── Snapshot payload correctness ──────────────────────────────────────────────
+// Snapshot payload correctness
 
 func TestEmit_SnapshotDeliveredCorrectly(t *testing.T) {
 	t.Parallel()
@@ -176,7 +176,7 @@ func TestEmit_SnapshotDeliveredCorrectly(t *testing.T) {
 	}
 }
 
-// ── snapshot() builds from live WaitingRoom state ────────────────────────────
+// snapshot() builds from live WaitingRoom state
 
 func TestSnapshot_ReflectsLiveState(t *testing.T) {
 	t.Parallel()
@@ -197,7 +197,7 @@ func TestSnapshot_ReflectsLiveState(t *testing.T) {
 	}
 }
 
-// ── Concurrency safety ────────────────────────────────────────────────────────
+// Concurrency safety
 
 func TestConcurrent_OnAndEmit(t *testing.T) {
 	t.Parallel()
@@ -260,7 +260,7 @@ func TestConcurrent_OnOffEmit_AllEvents(t *testing.T) {
 	wg.Wait()
 }
 
-// ── Integration: EventFull fires on transition, not every admission ──────────
+// Integration: EventFull fires on transition, not every admission
 
 func TestIntegration_EventFull_FiredWhenRoomFull(t *testing.T) {
 	t.Parallel()
@@ -324,7 +324,7 @@ func TestIntegration_EventFull_DoesNotFireRepeatedly(t *testing.T) {
 	close(release)
 }
 
-// ── Integration: EventDrain fires on full→not-full transition ─────────────────
+// Integration: EventDrain fires on full→not-full transition
 
 func TestIntegration_EventDrain_FiredAfterRelease(t *testing.T) {
 	t.Parallel()
@@ -400,7 +400,7 @@ func TestIntegration_EventDrain_OnlyFiresOnTransition(t *testing.T) {
 	}
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// helpers
 
 // newTestWR builds an initialised WaitingRoom and registers Stop on cleanup.
 func newTestWR(t *testing.T, cap int32) *WaitingRoom {

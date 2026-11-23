@@ -10,7 +10,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// helpers
 
 // cookiesByName performs a GET / and returns every Set-Cookie the response
 // carried, keyed by cookie name. Unlike serveWithCookie it does not discard
@@ -35,10 +35,15 @@ func cookiesByName(r *gin.Engine, ticket string) (*httptest.ResponseRecorder, ma
 func ageAllTokens(ts *tokenStore, d time.Duration) {
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
-	for token, entry := range ts.entries {
-		entry.issuedAt = entry.issuedAt.Add(-d)
-		ts.entries[token] = entry
+	for _, node := range ts.entries {
+		node.mu.Lock()
+		node.issuedAt = node.issuedAt.Add(-d)
+		node.ttlKey = node.issuedAt
+		node.unseenKey = node.issuedAt
+		node.mu.Unlock()
 	}
+	ts.ttlHeap.init()
+	ts.unseenHeap.init()
 }
 
 // ageOfToken returns how long ago the token's issuedAt was set. Tests use
@@ -67,7 +72,7 @@ func fillOneSlot(t *testing.T, r *gin.Engine, serving chan struct{}) {
 	}
 }
 
-// ── probe cookie ──────────────────────────────────────────────────────────────
+// probe cookie
 
 // TestProbeCookie_SetOnFirstQueueRender verifies the probe cookie accompanies
 // room_ticket on the first waiting-room render. The page cannot read
@@ -204,7 +209,7 @@ func TestProbeCookie_UsesTokenTTLForMaxAge(t *testing.T) {
 	}
 }
 
-// ── cookieless client accounting ──────────────────────────────────────────────
+// cookieless client accounting
 
 // TestCookieless_TokensDoNotAccumulateIndefinitely is the regression test for
 // the underlying leak. A client that cannot store cookies is a brand-new
@@ -310,13 +315,13 @@ func TestLiveQueueDepth_ExcludesBurnedTickets(t *testing.T) {
 	}
 }
 
-// ── SetTokenTTL ───────────────────────────────────────────────────────────────
+// SetTokenTTL
 
 func TestSetTokenTTL_DefaultIsFiveMinutes(t *testing.T) {
 	wr := newTestWR(t, 5)
 
-	if got := wr.TokenTTL(); got != defaultTokenTTL {
-		t.Errorf("expected default TTL %s, got %s", defaultTokenTTL, got)
+	if got := wr.TokenTTL(); got != DefaultTokenTTL {
+		t.Errorf("expected default TTL %s, got %s", DefaultTokenTTL, got)
 	}
 }
 
@@ -373,9 +378,6 @@ func TestSetTokenTTL_ZeroRestoresDefault(t *testing.T) {
 	}
 	if got := wr.TokenTTL(); got != DefaultTokenTTL {
 		t.Errorf("expected %s after SetTokenTTL(0), got %s", DefaultTokenTTL, got)
-	}
-	if DefaultTokenTTL != defaultTokenTTL {
-		t.Errorf("exported and internal defaults diverged: %s vs %s", DefaultTokenTTL, defaultTokenTTL)
 	}
 }
 

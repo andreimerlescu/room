@@ -37,7 +37,7 @@ func positionOfToken(t *testing.T, wr *WaitingRoom, token string) int64 {
 	return wr.positionOf(e.ticket)
 }
 
-// ── RemoveToken: errors ──────────────────────────────────────────────────────
+// RemoveToken: errors
 
 func TestRemoveToken_UnknownReturnsNotFound(t *testing.T) {
 	t.Parallel()
@@ -85,7 +85,7 @@ func TestRemoveToken_Twice_CountsOnce(t *testing.T) {
 	}
 }
 
-// ── RemoveToken: queue effects ───────────────────────────────────────────────
+// RemoveToken: queue effects
 
 // TestRemoveToken_MidQueue verifies the documented semantics: positions
 // behind the removed ticket improve at once, positions ahead are
@@ -255,7 +255,7 @@ func TestRemoveToken_RacesAdmission_AccountingHolds(t *testing.T) {
 	}
 }
 
-// ── RemoveTokensFunc ─────────────────────────────────────────────────────────
+// RemoveTokensFunc
 
 func TestRemoveTokensFunc_RemovesMatchingAndFiresOnce(t *testing.T) {
 	wr := newTestWR(t, 1)
@@ -413,7 +413,7 @@ func TestRemoveTokensFunc_PredicateMayCallBack(t *testing.T) {
 	}
 }
 
-// ── Benchmarks ────────────────────────────────────────────────────────────────
+// Benchmarks
 
 func BenchmarkRemoveToken(b *testing.B) {
 	wr := &WaitingRoom{}

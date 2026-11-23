@@ -128,7 +128,7 @@ func waitForStatus(t *testing.T, r *gin.Engine, token string, deadline time.Dura
 	}
 }
 
-// ── Constructor tests ────────────────────────────────────────────────────────
+// Constructor tests
 
 func TestNewWaitingRoom_ValidCap(t *testing.T) {
 	wr := &WaitingRoom{}
@@ -168,7 +168,47 @@ func TestNewWaitingRoom_Panics(t *testing.T) {
 	NewWaitingRoom(gin.New(), 0)
 }
 
-// ── Fast path tests ──────────────────────────────────────────────────────────
+func TestZeroValue_GettersDoNotPanic(t *testing.T) {
+	t.Parallel()
+	var wr WaitingRoom
+	if got := wr.CookiePath(); got != "/" {
+		t.Errorf("zero CookiePath() = %q, want \"/\"", got)
+	}
+	if got := wr.CookieDomain(); got != "" {
+		t.Errorf("zero CookieDomain() = %q, want \"\"", got)
+	}
+	if got := wr.SkipURL(); got != "" {
+		t.Errorf("zero SkipURL() = %q, want \"\"", got)
+	}
+	if got := wr.StatusBaseURL(); got != defaultStatusBaseURL {
+		t.Errorf("zero StatusBaseURL() = %q, want %q", got, defaultStatusBaseURL)
+	}
+}
+
+func TestInjectTemplateVars_EscapesSkipURL(t *testing.T) {
+	t.Parallel()
+	wr := newTestWR(t, 1)
+	wr.SetSkipURL(`/pay?tier=vip&next="home"<1>`)
+	got := string(wr.injectTemplateVars([]byte(`<a href="{{.SkipURL}}">{{.Position}}</a>`), 42))
+	want := `<a href="/pay?tier=vip&amp;next=&#34;home&#34;&lt;1&gt;">42</a>`
+	if got != want {
+		t.Errorf("injectTemplateVars = %q, want %q", got, want)
+	}
+}
+
+func TestNewWaitingRoom_ServesOptionsPreflight(t *testing.T) {
+	r := gin.New()
+	r.Use(NewWaitingRoom(r, 1))
+	r.GET("/", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	w := httptest.NewRecorder()
+	r.ServeHTTP(w, httptest.NewRequest(http.MethodOptions, "/queue/status", nil))
+	if w.Code != http.StatusNoContent {
+		t.Errorf("OPTIONS /queue/status: got %d, want 204", w.Code)
+	}
+}
+
+// Fast path tests
 
 func TestFastPath_RequestAdmittedImmediately(t *testing.T) {
 	wr := &WaitingRoom{}
@@ -224,7 +264,7 @@ func TestFastPath_AllSlotsFilledThenReleased(t *testing.T) {
 	close(release)
 }
 
-// ── Slow path / waiting room tests ──────────────────────────────────────────
+// Slow path / waiting room tests
 
 func TestSlowPath_WaitingRoomServedWhenFull(t *testing.T) {
 	const cap = 1
@@ -355,7 +395,7 @@ func TestSlowPath_ResumePreservesQueuePosition(t *testing.T) {
 	close(release)
 }
 
-// ── FIFO ordering tests ──────────────────────────────────────────────────────
+// FIFO ordering tests
 
 func TestFIFO_RequestsAdmittedInOrder(t *testing.T) {
 	const cap = 1
@@ -440,7 +480,7 @@ func TestFIFO_RequestsAdmittedInOrder(t *testing.T) {
 	}
 }
 
-// ── Status endpoint tests ────────────────────────────────────────────────────
+// Status endpoint tests
 
 // TestStatusEndpoint_NoCookieReportsCookiesRequired verifies that a poll
 // arriving with NO room_ticket cookie reports cookies_required rather than
@@ -603,7 +643,7 @@ func TestStatusEndpoint_RateLimitRejectsFastPolling(t *testing.T) {
 	close(release)
 }
 
-// ── MaxQueueDepth tests ──────────────────────────────────────────────────────
+// MaxQueueDepth tests
 
 func TestMaxQueueDepth_RejectsWhenFull(t *testing.T) {
 	const cap = 1
@@ -692,7 +732,7 @@ func TestMaxQueueDepth_NegativeRejected(t *testing.T) {
 	}
 }
 
-// ── Cookie configuration tests ───────────────────────────────────────────────
+// Cookie configuration tests
 
 func TestCookiePath_DefaultIsSlash(t *testing.T) {
 	wr := &WaitingRoom{}
@@ -754,7 +794,7 @@ func TestCookieDomain_DefaultIsEmpty(t *testing.T) {
 	}
 }
 
-// ── SetCap tests ─────────────────────────────────────────────────────────────
+// SetCap tests
 
 func TestSetCap_ExpandAdmitsWaiters(t *testing.T) {
 	const initialCap = 1
@@ -1195,7 +1235,7 @@ func TestSetCap_ShrinkEventDrainFiresOnce(t *testing.T) {
 	}
 }
 
-// ── SetHTML tests ────────────────────────────────────────────────────────────
+// SetHTML tests
 
 func TestSetHTML_CustomHTMLServed(t *testing.T) {
 	const cap = 1
@@ -1241,7 +1281,7 @@ func TestSetHTML_NilRevertsToDefault(t *testing.T) {
 	}
 }
 
-// ── Reaper tests ─────────────────────────────────────────────────────────────
+// Reaper tests
 // Basic reaper correctness is tested here. Full reaper coverage is in
 // reaper_test.go.
 
@@ -1254,7 +1294,7 @@ func TestReaper_EvictsExpiredTokens(t *testing.T) {
 
 	wr.tokens.set("ghost", ticketEntry{
 		ticket:   99,
-		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
+		issuedAt: time.Now().Add(-(DefaultTokenTTL + time.Minute)),
 	})
 
 	wr.reap()
@@ -1297,7 +1337,7 @@ func TestReaper_OutOfWindowGhostSkippedWhenWindowArrives(t *testing.T) {
 	wr.nextTicket.Store(10)
 	wr.tokens.set("ghost", ticketEntry{
 		ticket:   5,
-		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
+		issuedAt: time.Now().Add(-(DefaultTokenTTL + time.Minute)),
 	})
 	wr.tokens.set("live", ticketEntry{ticket: 10, issuedAt: time.Now()})
 
@@ -1348,7 +1388,7 @@ func TestReaper_AdvancesNowServingForWindowGhost(t *testing.T) {
 
 	wr.tokens.set("window-ghost", ticketEntry{
 		ticket:   1,
-		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
+		issuedAt: time.Now().Add(-(DefaultTokenTTL + time.Minute)),
 	})
 
 	before := wr.nowServing.Load()
@@ -1429,7 +1469,7 @@ func TestSetReaperInterval_ZeroRestoresDefault(t *testing.T) {
 	}
 }
 
-// ── SetSecureCookie tests ────────────────────────────────────────────────────
+// SetSecureCookie tests
 
 func TestSetSecureCookie_DefaultIsFalse(t *testing.T) {
 	wr := &WaitingRoom{}
@@ -1457,7 +1497,7 @@ func TestSetSecureCookie_DefaultIsFalse(t *testing.T) {
 		if c.Name == cookieName {
 			found = true
 			if c.Secure {
-				t.Error("expected Secure=false on cookie for plain-HTTP request with default secureCookieDefault=false")
+				t.Error("expected Secure=false on cookie for plain-HTTP request with default secureCookie=false")
 			}
 		}
 	}
@@ -1506,7 +1546,7 @@ func TestSetSecureCookie_TrueSetsCookieSecure(t *testing.T) {
 	close(release)
 }
 
-// ── Introspection tests ──────────────────────────────────────────────────────
+// Introspection tests
 
 func TestQueueDepth_AccurateWhileWaiting(t *testing.T) {
 	const cap = 1
@@ -1553,7 +1593,7 @@ func TestUtilization_BetweenZeroAndOne(t *testing.T) {
 	}
 }
 
-// ── Concurrency / race tests ─────────────────────────────────────────────────
+// Concurrency / race tests
 
 func TestConcurrent_NoRaceUnderLoad(t *testing.T) {
 	const cap = 10
@@ -1622,7 +1662,7 @@ func TestConcurrent_SetCapDuringLoad(t *testing.T) {
 	wg.Wait()
 }
 
-// ── Benchmark tests ──────────────────────────────────────────────────────────
+// Benchmark tests
 
 func BenchmarkFastPath(b *testing.B) {
 	wr := &WaitingRoom{}
@@ -1668,7 +1708,7 @@ func BenchmarkUtilizationSmoothed(b *testing.B) {
 	}
 }
 
-// ── Fuzz tests ───────────────────────────────────────────────────────────────
+// Fuzz tests
 
 func FuzzWaitingRoom(f *testing.F) {
 	f.Add(int32(1), int32(1))

@@ -28,7 +28,7 @@ func waitForNowServing(t *testing.T, wr *WaitingRoom, want int64, deadline time.
 	}
 }
 
-// ── ghostLedger unit tests ───────────────────────────────────────────────────
+// ghostLedger unit tests
 
 func TestGhostLedger_AddCountConsume(t *testing.T) {
 	t.Parallel()
@@ -73,6 +73,26 @@ func TestGhostLedger_AddCountConsume(t *testing.T) {
 	}
 }
 
+// ghostSnapshot returns all pending ghost tickets in ascending order.
+func ghostSnapshot(l *ghostLedger) []int64 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	out := make([]int64, 0, ghostSize(l.root))
+	var walk func(n *ghostNode, acc int64)
+	walk = func(n *ghostNode, acc int64) {
+		if n == nil {
+			return
+		}
+		eff := n.ticket + acc
+		childAcc := acc + n.lazy
+		walk(n.left, childAcc)
+		out = append(out, eff)
+		walk(n.right, childAcc)
+	}
+	walk(l.root, 0)
+	return out
+}
+
 func TestGhostLedger_AddManyMergesSorted(t *testing.T) {
 	t.Parallel()
 	l := newGhostLedger()
@@ -82,9 +102,7 @@ func TestGhostLedger_AddManyMergesSorted(t *testing.T) {
 	l.addMany(nil) // no-op
 
 	want := []int64{5, 10, 20, 30, 30, 40}
-	l.mu.Lock()
-	got := append([]int64(nil), l.tickets...)
-	l.mu.Unlock()
+	got := ghostSnapshot(l)
 
 	if len(got) != len(want) {
 		t.Fatalf("got %v, want %v", got, want)
@@ -111,14 +129,15 @@ func TestGhostLedger_ShrinksAfterBulkConsume(t *testing.T) {
 		t.Fatalf("consumed %d, want 5000", got)
 	}
 	l.mu.Lock()
-	c := cap(l.tickets)
+	empty := l.root == nil
 	l.mu.Unlock()
-	if c > ledgerShrinkFloor {
-		t.Errorf("backing array not released after bulk consume: cap=%d", c)
+	if !empty || l.len() != 0 || l.minTicket() != math.MaxInt64 {
+		t.Errorf("ghost tree not released after bulk consume: rootNil=%v len=%d min=%d",
+			empty, l.len(), l.minTicket())
 	}
 }
 
-// ── Regression: the queue must never freeze ──────────────────────────────────
+// Regression: the queue must never freeze
 
 // TestStall_AbandonAtReadyDoesNotFreezeQueue is the regression test for the
 // capacity leak. With cap=1: ticket 1 is served, ticket 2 is told ready and
@@ -243,7 +262,7 @@ func TestAcquireFailure_RetiresClaimedTicket(t *testing.T) {
 	waitForCount(t, &timeouts, 1, 200*time.Millisecond)
 }
 
-// ── Exactly-once accounting under concurrency ────────────────────────────────
+// Exactly-once accounting under concurrency
 
 // TestAdmitAndReapRace_EachTicketCountedOnce races resume admissions
 // against the reaper for the same expired, in-window tokens. Every ticket
@@ -331,7 +350,7 @@ func TestRetireAndAdvance_ConcurrentExactlyOnce(t *testing.T) {
 	}
 }
 
-// ── Positions, depth and SetCap with pending ghosts ──────────────────────────
+// Positions, depth and SetCap with pending ghosts
 
 func TestSetCap_GrowDrainsLedger(t *testing.T) {
 	wr := newTestWR(t, 1)
@@ -387,7 +406,7 @@ func TestPositionOf_NeverZeroForWaitingTicket(t *testing.T) {
 	}
 }
 
-// ── Benchmarks ────────────────────────────────────────────────────────────────
+// Benchmarks
 
 func BenchmarkAdvance_EmptyLedger(b *testing.B) {
 	wr := &WaitingRoom{}

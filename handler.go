@@ -14,50 +14,16 @@ import (
 //go:embed ticket_status.html
 var ticketStatusPage string
 
-// ticketStatusTmpl renders ticket_status.html. The page polls its own URL,
-// so the only value injected is the position.
 var ticketStatusTmpl = template.Must(template.New("ticket_status").Parse(ticketStatusPage))
 
-// ticketStatusResponse is the JSON body of GET /queue/status/{id}.
 type ticketStatusResponse struct {
 	Waiting    bool  `json:"waiting"`
 	Position   int64 `json:"position,omitempty"`
 	QueueDepth int64 `json:"queue_depth,omitempty"`
 }
 
-// viewOutcome classifies a view of /queue/status/{id}.
-type viewOutcome uint8
-
-const (
-	viewUnknown viewOutcome = iota
-	viewRateLimited
-	viewAccepted
-)
-
-// view applies one view of /queue/status/{id} under the write lock: the
-// rate limit (one accepted view per minInterval per ID) and the place.
-// It never touches issuedAt or seen, so watching a place never keeps it
-// alive: only its own client can.
-func (ts *tokenStore) view(id string, now time.Time, minInterval time.Duration) (viewOutcome, int64) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	t, ok := ts.byID[id]
-	if !ok {
-		return viewUnknown, 0
-	}
-	e := ts.entries[t]
-	if !e.viewedAt.IsZero() && now.Sub(e.viewedAt) < minInterval {
-		return viewRateLimited, 0
-	}
-	e.viewedAt = now
-	ts.entries[t] = e
-	return viewAccepted, ts.placeLocked(t, e)
-}
-
-// serveTicketStatus is GET /queue/status/{id}: the place of a keyed
-// ticket, by its public ID. A request that accepts text/html gets a small
-// page that updates itself; anything else gets JSON. Unknown IDs — never
-// issued, admitted, left, removed or reaped — get 404 {"waiting":false}.
+// serveTicketStatus serves GET /queue/status/{id} as HTML (when Accept
+// includes text/html) or JSON. Unknown IDs receive 404 {"waiting":false}.
 func (wr *WaitingRoom) serveTicketStatus(w http.ResponseWriter, r *http.Request, id string) {
 	if !wr.initialised.Load() {
 		w.WriteHeader(http.StatusInternalServerError)
@@ -104,40 +70,20 @@ func (wr *WaitingRoom) serveTicketStatus(w http.ResponseWriter, r *http.Request,
 	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(buf.Bytes()) // a failed write means the client went away
+	_, _ = w.Write(buf.Bytes())
 }
 
-// TicketStatusHandler returns the gin.HandlerFunc for
-// GET /queue/status/:ticket, which RegisterRoutes registers. Register it
-// yourself, before the middleware, if you register routes manually. The
-// route parameter must be named ticket.
-//
-// Related: WaitingRoom.Handler, WaitingRoom.Position
+// TicketStatusHandler returns the gin.HandlerFunc for GET /queue/status/:ticket.
+// Register before [WaitingRoom.Middleware] if wiring routes manually.
 func (wr *WaitingRoom) TicketStatusHandler() gin.HandlerFunc {
 	return func(c *gin.Context) {
 		wr.serveTicketStatus(c.Writer, c.Request, c.Param("ticket"))
 	}
 }
 
-// Handler returns the room's status routes as an http.Handler, for servers
-// that are not built on gin:
-//
-//	OPTIONS /queue/status       CORS preflight (204)
-//	GET     /queue/status       a cookie client's status (see StatusHandler)
-//	GET     /queue/status/{id}  a keyed ticket's place, by public ID
-//
-// Mount it at the root, or under a prefix with http.StripPrefix and point
-// SetStatusBaseURL at the prefixed path:
-//
-//	mux.Handle("/wait/", http.StripPrefix("/wait", wr.Handler()))
-//	wr.SetStatusBaseURL("https://example.com/wait/queue/status/")
-//
-// A net/http server drives the line with Enter, Position and Leave (or
-// Acquire and Release); the middleware itself is gin-only.
-//
-// Each call returns a new handler over the same room.
-//
-// Related: WaitingRoom.RegisterRoutes, WaitingRoom.Enter
+// Handler returns the status routes (OPTIONS /queue/status, GET /queue/status,
+// GET /queue/status/{id}) as a standard net/http Handler. Mount under a prefix
+// with http.StripPrefix and configure [WaitingRoom.SetStatusBaseURL] to match.
 func (wr *WaitingRoom) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("OPTIONS /queue/status", func(w http.ResponseWriter, r *http.Request) {
