@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// ── reap() — basic eviction ──────────────────────────────────────────────────
+// reap() — basic eviction
 
 func TestReap_EmptyTokenStore_IsNoop(t *testing.T) {
 	wr := newTestWR(t, 5)
@@ -38,7 +38,7 @@ func TestReap_AllLive_NoneEvicted(t *testing.T) {
 
 func TestReap_AllExpired_AllEvicted(t *testing.T) {
 	wr := newTestWR(t, 5)
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
+	expired := time.Now().Add(-(DefaultTokenTTL + time.Minute))
 
 	for i := 0; i < 10; i++ {
 		wr.tokens.set(fmt.Sprintf("tok-%d", i), ticketEntry{
@@ -56,7 +56,7 @@ func TestReap_AllExpired_AllEvicted(t *testing.T) {
 
 func TestReap_MixedExpiredAndLive(t *testing.T) {
 	wr := newTestWR(t, 5)
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
+	expired := time.Now().Add(-(DefaultTokenTTL + time.Minute))
 
 	wr.tokens.set("live-1", ticketEntry{ticket: 1, issuedAt: time.Now()})
 	wr.tokens.set("live-2", ticketEntry{ticket: 2, issuedAt: time.Now()})
@@ -79,13 +79,13 @@ func TestReap_MixedExpiredAndLive(t *testing.T) {
 	}
 }
 
-// ── reap() — nowServing advancement ──────────────────────────────────────────
+// reap() — nowServing advancement
 
-// ── reap() — multi-batch looping ─────────────────────────────────────────────
+// reap() — multi-batch looping
 
 func TestReap_ClearsMoreThanOneBatch(t *testing.T) {
 	wr := newTestWR(t, 1)
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
+	expired := time.Now().Add(-(DefaultTokenTTL + time.Minute))
 
 	// Insert more than reaperBatchSize expired tokens.
 	total := reaperBatchSize + 500
@@ -107,7 +107,7 @@ func TestReap_ClearsMoreThanOneBatch(t *testing.T) {
 	}
 }
 
-// ── reap() — EventEvict callback ─────────────────────────────────────────────
+// reap() — EventEvict callback
 
 func TestReap_FiresEventEvict(t *testing.T) {
 	wr := newTestWR(t, 5)
@@ -115,7 +115,7 @@ func TestReap_FiresEventEvict(t *testing.T) {
 	var evictCount atomic.Int32
 	wr.On(EventEvict, func(s Snapshot) { evictCount.Add(1) })
 
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
+	expired := time.Now().Add(-(DefaultTokenTTL + time.Minute))
 	wr.tokens.set("ghost", ticketEntry{ticket: 100, issuedAt: expired})
 
 	wr.reap()
@@ -158,7 +158,7 @@ func TestReap_DoesNotFireEventEvictWhenNothingExpired(t *testing.T) {
 func TestReap_RetiresInWindowNowAndOutOfWindowViaLedger(t *testing.T) {
 	// cap=2, nowServing=0 → window is tickets [1..2].
 	wr := newTestWR(t, 2)
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
+	expired := time.Now().Add(-(DefaultTokenTTL + time.Minute))
 
 	wr.nextTicket.Store(25)
 	wr.tokens.set("inside", ticketEntry{ticket: 1, issuedAt: expired})
@@ -194,7 +194,7 @@ func TestReap_RetiresInWindowNowAndOutOfWindowViaLedger(t *testing.T) {
 func TestReap_AdvancesNowServingForWindowTickets(t *testing.T) {
 	// cap=10, nowServing=0 → window is tickets [1..10].
 	wr := newTestWR(t, 10)
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
+	expired := time.Now().Add(-(DefaultTokenTTL + time.Minute))
 
 	for i := int64(1); i <= 5; i++ {
 		wr.tokens.set(fmt.Sprintf("win-%d", i), ticketEntry{
@@ -226,7 +226,7 @@ func TestReap_FiresEventEvictForWindowOnlyEvictions(t *testing.T) {
 	var evictCount atomic.Int32
 	wr.On(EventEvict, func(s Snapshot) { evictCount.Add(1) })
 
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
+	expired := time.Now().Add(-(DefaultTokenTTL + time.Minute))
 	wr.tokens.set("win-ghost", ticketEntry{ticket: 1, issuedAt: expired})
 
 	wr.reap()
@@ -234,34 +234,36 @@ func TestReap_FiresEventEvictForWindowOnlyEvictions(t *testing.T) {
 	waitForCount(t, &evictCount, 1, 200*time.Millisecond)
 }
 
-// ── reapBatch() — TOCTOU double-check ────────────────────────────────────────
+// reapBatch() — TOCTOU double-check
 
 func TestReapBatch_DoubleCheckPreventsRaceEviction(t *testing.T) {
 	// Simulate a token that was expired during the read-lock scan but
 	// was refreshed (touchIssuedAt) before the write-lock eviction.
 	wr := newTestWR(t, 5)
 
-	almostExpired := time.Now().Add(-(cookieTTL - 10*time.Millisecond))
+	// Refresh borderline token right before crossing the TTL boundary.
+	almostExpired := time.Now().Add(-(DefaultTokenTTL - 100*time.Millisecond))
 	wr.tokens.set("borderline", ticketEntry{
 		ticket:   100,
 		issuedAt: almostExpired,
 	})
 
-	// Sleep until the token has just crossed the TTL boundary.
-	time.Sleep(15 * time.Millisecond)
+	// Client polls before TTL elapses, advancing issuedAt while ttlKey stays
+	// at almostExpired; then wait past the original ttlKey cutoff.
+	if res := wr.tokens.poll("borderline", time.Now(), 5, statusPollMinInterval, DefaultTokenTTL); res.outcome != pollAccepted {
+		t.Fatalf("expected pollAccepted, got %v", res.outcome)
+	}
+	time.Sleep(115 * time.Millisecond)
 
-	// Simulate the client refreshing the token right before eviction.
-	wr.tokens.touchIssuedAt("borderline")
-
-	// Now reap — the token should survive because touchIssuedAt refreshed it.
+	// Now reap — the token must survive because poll refreshed issuedAt.
 	wr.reap()
 
 	if _, ok := wr.tokens.get("borderline"); !ok {
-		t.Error("borderline token should have survived reap after touchIssuedAt refresh")
+		t.Error("borderline token should have survived reap after poll refresh")
 	}
 }
 
-// ── SetReaperInterval — reaper restarts with new interval ────────────────────
+// SetReaperInterval — reaper restarts with new interval
 
 func TestSetReaperInterval_RestartSignalSent(t *testing.T) {
 	wr := newTestWR(t, 5)
@@ -312,11 +314,11 @@ func TestSetReaperInterval_DuplicateSignalDoesNotBlock(t *testing.T) {
 	}
 }
 
-// ── Concurrency: reap under concurrent token mutations ───────────────────────
+// Concurrency: reap under concurrent token mutations
 
 func TestReap_ConcurrentWithTokenStoreWrites(t *testing.T) {
 	wr := newTestWR(t, 5)
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
+	expired := time.Now().Add(-(DefaultTokenTTL + time.Minute))
 
 	// Pre-populate some expired tokens.
 	for i := 0; i < 100; i++ {
@@ -375,7 +377,7 @@ func TestReap_ConcurrentWithTokenStoreWrites(t *testing.T) {
 	}
 }
 
-// ── startReaper — shutdown via context cancellation ──────────────────────────
+// startReaper — shutdown via context cancellation
 
 func TestStartReaper_StopsOnContextCancel(t *testing.T) {
 	wr := &WaitingRoom{}
@@ -394,7 +396,7 @@ func TestStartReaper_StopsOnContextCancel(t *testing.T) {
 	wr.Stop()
 }
 
-// ── tokenStore.len() ─────────────────────────────────────────────────────────
+// tokenStore.len()
 
 func TestTokenStore_Len(t *testing.T) {
 	ts := newTokenStore()
@@ -410,50 +412,14 @@ func TestTokenStore_Len(t *testing.T) {
 		t.Errorf("expected len 2, got %d", ts.len())
 	}
 
-	ts.delete("a")
+	ts.take("a")
 
 	if ts.len() != 1 {
 		t.Errorf("expected len 1, got %d", ts.len())
 	}
 }
 
-// ── tokenStore.touchLastPoll() ───────────────────────────────────────────────
-
-func TestTokenStore_TouchLastPoll(t *testing.T) {
-	ts := newTokenStore()
-
-	// Non-existent token.
-	if _, ok := ts.touchLastPoll("missing"); ok {
-		t.Error("expected ok=false for missing token")
-	}
-
-	ts.set("tok", ticketEntry{ticket: 1, issuedAt: time.Now()})
-
-	// First touch — previous should be zero.
-	prev, ok := ts.touchLastPoll("tok")
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if !prev.IsZero() {
-		t.Errorf("expected zero time on first touch, got %v", prev)
-	}
-
-	time.Sleep(5 * time.Millisecond)
-
-	// Second touch — previous should be recent.
-	prev2, ok := ts.touchLastPoll("tok")
-	if !ok {
-		t.Fatal("expected ok=true")
-	}
-	if prev2.IsZero() {
-		t.Error("expected non-zero time on second touch")
-	}
-	if time.Since(prev2) > time.Second {
-		t.Errorf("previous lastPoll too old: %v", prev2)
-	}
-}
-
-// ── passStore — basic operations ─────────────────────────────────────────────
+// passStore — basic operations
 
 func TestPassStore_SetAndGet(t *testing.T) {
 	ps := newPassStore()
@@ -535,7 +501,7 @@ func TestPassStore_Len(t *testing.T) {
 	}
 }
 
-// ── passStore.reap() ─────────────────────────────────────────────────────────
+// passStore.reap()
 
 func TestPassStore_Reap_RemovesExpired(t *testing.T) {
 	ps := newPassStore()
@@ -595,7 +561,7 @@ func TestPassStore_Reap_AllExpired(t *testing.T) {
 	}
 }
 
-// ── reap() sweeps pass store alongside token store ───────────────────────────
+// reap() sweeps pass store alongside token store
 
 func TestReap_AlsoSweepsPassStore(t *testing.T) {
 	wr := newTestWR(t, 5)
@@ -619,7 +585,7 @@ func TestReap_AlsoSweepsPassStore(t *testing.T) {
 
 func TestReap_PassSweepConcurrentWithTokenReap(t *testing.T) {
 	wr := newTestWR(t, 5)
-	expired := time.Now().Add(-(cookieTTL + time.Minute))
+	expired := time.Now().Add(-(DefaultTokenTTL + time.Minute))
 
 	// Expired tokens.
 	for i := 0; i < 50; i++ {

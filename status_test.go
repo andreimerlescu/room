@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// helpers
 
 // setCookies returns the Set-Cookie headers of a response keyed by name.
 func setCookies(w *httptest.ResponseRecorder) map[string]*http.Cookie {
@@ -24,15 +24,35 @@ func setCookies(w *httptest.ResponseRecorder) map[string]*http.Cookie {
 // lastPoll and cookieSetAt, so simulated polls are neither rate limited
 // nor mistaken for fresh cookie issuance.
 func ageEntries(ts *tokenStore, d time.Duration) {
-	ts.ageAll(d, true)
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+	for _, node := range ts.entries {
+		node.mu.Lock()
+		node.issuedAt = node.issuedAt.Add(-d)
+		if !node.lastPoll.IsZero() {
+			node.lastPoll = node.lastPoll.Add(-d)
+		}
+		node.cookieSetAt = node.cookieSetAt.Add(-d)
+		node.ttlKey = node.issuedAt
+		node.unseenKey = node.issuedAt
+		node.mu.Unlock()
+	}
+	ts.ttlHeap.init()
+	ts.unseenHeap.init()
 }
 
 // ageCookieSetAt shifts only the cookie-refresh clock back by d.
 func ageCookieSetAt(ts *tokenStore, d time.Duration) {
-	ts.ageCookieSetAtAll(d)
+	ts.mu.RLock()
+	defer ts.mu.RUnlock()
+	for _, node := range ts.entries {
+		node.mu.Lock()
+		node.cookieSetAt = node.cookieSetAt.Add(-d)
+		node.mu.Unlock()
+	}
 }
 
-// ── Cookie lifetime: the long-wait regression ────────────────────────────────
+// Cookie lifetime: the long-wait regression
 
 // TestLongWait_CookiesOutliveTokenTTL simulates a browser cookie jar
 // through a wait three times longer than the token TTL, polling every 3s.
@@ -187,7 +207,7 @@ func TestStatusPoll_RefreshedCookiesMatchIssuedAttributes(t *testing.T) {
 	}
 }
 
-// ── Keep-alive ────────────────────────────────────────────────────────────────
+// Keep-alive
 
 // TestStatusPoll_RateLimitedPollKeepsTokenAlive covers a client that polls
 // faster than the rate limit. It receives only 429s, but it is actively
@@ -252,7 +272,7 @@ func TestStatusPoll_MarksSeen(t *testing.T) {
 	}
 }
 
-// ── Single-lock poll ──────────────────────────────────────────────────────────
+// Single-lock poll
 
 func TestTokenStorePoll_Outcomes(t *testing.T) {
 	t.Parallel()
@@ -290,7 +310,7 @@ func TestTokenStorePoll_Outcomes(t *testing.T) {
 	}
 }
 
-// ── passStore read path ───────────────────────────────────────────────────────
+// passStore read path
 
 func TestPassStore_ConcurrentGetWithExpiry(t *testing.T) {
 	t.Parallel()

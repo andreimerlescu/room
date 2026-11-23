@@ -13,7 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// helpers
 
 func exportRoom(t *testing.T, wr *WaitingRoom) *bytes.Buffer {
 	t.Helper()
@@ -41,7 +41,7 @@ func within(a, b time.Time, d time.Duration) bool {
 	return diff <= d
 }
 
-// ── round trip ────────────────────────────────────────────────────────────────
+// round trip
 
 func TestExportImport_RoundTripPreservesLine(t *testing.T) {
 	a := newTestWR(t, 1)
@@ -233,7 +233,7 @@ func TestExportImport_EmptyRoom(t *testing.T) {
 	}
 }
 
-// ── staleness and downtime ────────────────────────────────────────────────────
+// staleness and downtime
 
 func TestImport_DropsTicketsDeadAtExport(t *testing.T) {
 	t.Parallel()
@@ -325,7 +325,7 @@ func TestImport_PassesKeepAbsoluteExpiry(t *testing.T) {
 	}
 }
 
-// ── refusals ──────────────────────────────────────────────────────────────────
+// refusals
 
 func TestImport_RefusesUsedRoom(t *testing.T) {
 	a := newTestWR(t, 1)
@@ -393,7 +393,7 @@ func TestExportImport_Uninitialised(t *testing.T) {
 	}
 }
 
-// ── concurrency ───────────────────────────────────────────────────────────────
+// concurrency
 
 func TestExport_ConcurrentWithTraffic(t *testing.T) {
 	a := newTestWR(t, 1)

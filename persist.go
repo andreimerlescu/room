@@ -121,8 +121,6 @@ type ImportStats struct {
 //
 // Returns ErrNotInitialised on an uninitialised WaitingRoom, or the
 // writer's error wrapped.
-//
-// Related: WaitingRoom.Import
 func (wr *WaitingRoom) Export(w io.Writer) error {
 	if !wr.initialised.Load() {
 		return ErrNotInitialised{}
@@ -211,8 +209,6 @@ func (wr *WaitingRoom) Export(w io.Writer) error {
 // No events fire during Import.
 //
 // Returns ErrNotInitialised, ErrImportFormat or ErrImportNotEmpty.
-//
-// Related: WaitingRoom.Export, ImportStats
 func (wr *WaitingRoom) Import(r io.Reader) (ImportStats, error) {
 	var stats ImportStats
 	if !wr.initialised.Load() {
@@ -384,28 +380,6 @@ func validatePersistFile(f *persistFile) error {
 		}
 	}
 	return nil
-}
-
-// setMany inserts many entries under one write lock.
-func (ts *tokenStore) setMany(entries map[string]ticketEntry) {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
-	for token, e := range entries {
-		ts.putLocked(token, e)
-	}
-}
-
-// snapshotLive returns every pass that has not expired at now.
-func (ps *passStore) snapshotLive(now time.Time) []persistedPass {
-	ps.mu.RLock()
-	defer ps.mu.RUnlock()
-	out := make([]persistedPass, 0, len(ps.entries))
-	for token, e := range ps.entries {
-		if now.Before(e.expiresAt) {
-			out = append(out, persistedPass{Token: token, ExpiresAt: e.expiresAt})
-		}
-	}
-	return out
 }
 
 // snapshotLeases copies the held leases, in the order they were granted.

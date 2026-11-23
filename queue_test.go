@@ -50,7 +50,7 @@ func nextSnapshot(t *testing.T, ch chan Snapshot) Snapshot {
 	}
 }
 
-// ── Queue / Ticket ────────────────────────────────────────────────────────────
+// Queue / Ticket
 
 func TestQueue_OrderAndPositions(t *testing.T) {
 	wr := newTestWR(t, 1)
@@ -208,7 +208,7 @@ func TestTicket_LookupAndStableIssuedAt(t *testing.T) {
 	}
 }
 
-// ── Client keys ───────────────────────────────────────────────────────────────
+// Client keys
 
 func TestClientKeyFunc_RecordedAndUsableForRemoval(t *testing.T) {
 	wr := newTestWR(t, 1)
@@ -303,7 +303,7 @@ func TestTicketInfo_HasPass(t *testing.T) {
 	}
 }
 
-// ── Event payloads ────────────────────────────────────────────────────────────
+// Event payloads
 
 func TestEventQueue_CarriesTokenKeyAndStaleFlag(t *testing.T) {
 	wr := newTestWR(t, 1)
@@ -360,7 +360,7 @@ func TestEventRemove_CarriesTokenForSingleRemoval(t *testing.T) {
 	}
 }
 
-// ── Concurrency ───────────────────────────────────────────────────────────────
+// Concurrency
 
 func TestQueue_ConcurrentWithTraffic(t *testing.T) {
 	wr := newTestWR(t, 1)
@@ -396,7 +396,7 @@ func TestQueue_ConcurrentWithTraffic(t *testing.T) {
 	}
 }
 
-// ── Benchmark ─────────────────────────────────────────────────────────────────
+// Benchmark
 
 func BenchmarkQueue_100of100k(b *testing.B) {
 	wr := &WaitingRoom{}

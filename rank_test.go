@@ -199,7 +199,7 @@ func TestSetTicketRank_ConcurrentKeepsNumbersExact(t *testing.T) {
 	for _, ti := range q {
 		held[ti.Ticket]++
 	}
-	for _, g := range wr.ledger.snapshot() {
+	for _, g := range ghostSnapshot(wr.ledger) {
 		held[g]++
 	}
 	edge := wr.nowServing.Load() + int64(wr.Cap())

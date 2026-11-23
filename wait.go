@@ -12,99 +12,55 @@ import (
 )
 
 // WaitResponder writes the response for a queued request in place of the
-// default (the waiting-room page, or the JSON wait response). t describes
-// the request's ticket, with Place filled in. For a keyed ticket t.Token is
-// empty: a keyed ticket's token is never handed out.
-//
-// The middleware has already set the room's cookies on a cookie request,
-// and aborts the chain after fn returns; fn must write a complete
-// response. It runs outside every room lock and may call back into the
-// room.
-//
-// Related: WaitingRoom.SetWaitResponder
+// default waiting-room page or JSON wait response. For keyed tickets t.Token
+// is empty. Runs outside all room locks; the middleware aborts after fn returns.
 type WaitResponder func(c *gin.Context, t TicketInfo)
 
-type waitResponderHolder struct {
-	fn WaitResponder
-}
-
-// SetWaitResponder lets the application write the response for every
-// queued request, cookie and keyed. Pass nil to restore the defaults:
-// the waiting-room page for cookie requests, and the JSON wait response
-// for keyed requests (and, with SetWaitJSON, for cookie requests that do
-// not accept text/html). Like SetClientKeyFunc, it is not reset by Init.
-//
-// Safe to call at any time.
-//
-// Related: WaitResponder, WaitingRoom.SetWaitJSON, WaitingRoom.SetTicketKeyFunc
+// SetWaitResponder overrides the queued response for both cookie and keyed
+// requests. Pass nil to restore defaults. Not reset by [WaitingRoom.Init].
 func (wr *WaitingRoom) SetWaitResponder(fn WaitResponder) {
 	if fn == nil {
-		wr.waitResponder.Store((*waitResponderHolder)(nil))
+		wr.waitResponder.Store(nil)
 		return
 	}
-	wr.waitResponder.Store(&waitResponderHolder{fn: fn})
+	wr.waitResponder.Store(&fn)
 }
 
 func (wr *WaitingRoom) waitResponderLoad() WaitResponder {
-	h, _ := wr.waitResponder.Load().(*waitResponderHolder)
-	if h == nil {
-		return nil
+	if p := wr.waitResponder.Load(); p != nil {
+		return *p
 	}
-	return h.fn
+	return nil
 }
 
-// SetWaitJSON opts cookie requests into the JSON wait response when they
-// do not accept text/html — API clients and fetch() calls rather than
-// page loads. It is off by default, so every cookie request gets the
-// waiting-room page exactly as before. Keyed requests (SetTicketKeyFunc)
-// always get the JSON response.
-//
-// A request accepts text/html when its Accept header lists text/html or
-// application/xhtml+xml with a non-zero quality. A missing Accept header
-// or a bare */* does not count, so with this on, curl and most HTTP
-// libraries get JSON; browsers navigating to a page always send text/html.
-//
-// A cookie request answered with JSON still receives the room_ticket and
-// room_probe cookies, and polls GET /queue/status as before.
-//
-// Safe to call at any time. Reset to false by Init.
-//
-// Related: WaitingRoom.SetWaitResponder
+// SetWaitJSON opts cookie requests that do not accept text/html into the JSON
+// wait response (503, Retry-After). Off by default; reset to false by Init.
 func (wr *WaitingRoom) SetWaitJSON(on bool) {
 	wr.waitJSON.Store(on)
 }
 
-// WaitJSON reports whether SetWaitJSON is on.
+// WaitJSON reports whether SetWaitJSON is enabled.
 func (wr *WaitingRoom) WaitJSON() bool {
 	return wr.waitJSON.Load()
 }
 
-// SetStatusBaseURL sets the prefix to which a keyed ticket's ID is appended
-// to form the status_url in a JSON wait response. The default is
-// "/queue/status/", where RegisterRoutes and Handler serve it. Set it to
-// an absolute URL ("https://example.com/wait/queue/status/") when the
-// status endpoint is mounted elsewhere or behind a proxy, since room cannot
-// know the public scheme and host. An empty value restores the default.
-//
-// Safe to call at any time. Reset by Init.
+// SetStatusBaseURL sets the prefix prepended to a keyed ticket's public ID in
+// status_url (empty restores "/queue/status/"). Reset by Init.
 func (wr *WaitingRoom) SetStatusBaseURL(base string) {
 	if base == "" {
 		base = defaultStatusBaseURL
 	}
-	wr.statusBaseURL.Store(base)
+	wr.statusBaseURL.Store(&base)
 }
 
 // StatusBaseURL returns the current status_url prefix.
 func (wr *WaitingRoom) StatusBaseURL() string {
-	s, _ := wr.statusBaseURL.Load().(string)
-	if s == "" {
-		return defaultStatusBaseURL
+	if p := wr.statusBaseURL.Load(); p != nil && *p != "" {
+		return *p
 	}
-	return s
+	return defaultStatusBaseURL
 }
 
-// acceptsHTML reports whether the request's Accept header lists text/html
-// or application/xhtml+xml with a non-zero quality.
 func acceptsHTML(r *http.Request) bool {
 	for _, part := range strings.Split(r.Header.Get("Accept"), ",") {
 		mt, params, err := mime.ParseMediaType(strings.TrimSpace(part))
@@ -121,7 +77,6 @@ func acceptsHTML(r *http.Request) bool {
 	return false
 }
 
-// waitResponse is the JSON wait response.
 type waitResponse struct {
 	Waiting    bool   `json:"waiting"`
 	Position   int64  `json:"position"`
@@ -130,8 +85,6 @@ type waitResponse struct {
 	RetryAfter int    `json:"retry_after"`
 }
 
-// writeJSON writes v as JSON with the given status, as gin's c.JSON does
-// (encoding/json, no trailing newline).
 func writeJSON(w http.ResponseWriter, code int, v any) {
 	b, err := json.Marshal(v)
 	if err != nil {
@@ -140,10 +93,9 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	}
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(code)
-	_, _ = w.Write(b) // a failed write means the client went away
+	_, _ = w.Write(b)
 }
 
-// writeWaitJSON sends 503 with Retry-After and the JSON wait response.
 func (wr *WaitingRoom) writeWaitJSON(w http.ResponseWriter, position int64, statusURL string) {
 	secs := int(waitRetryAfter / time.Second)
 	w.Header().Set("Retry-After", strconv.Itoa(secs))
@@ -157,10 +109,6 @@ func (wr *WaitingRoom) writeWaitJSON(w http.ResponseWriter, position int64, stat
 	})
 }
 
-// respondCookieWait answers a queued cookie request through the wait
-// responder or the opt-in JSON response. It reports false when neither
-// applies and the caller should render the waiting-room page. position is
-// the window-relative position the page and /queue/status report.
 func (wr *WaitingRoom) respondCookieWait(c *gin.Context, token string, position int64) bool {
 	if fn := wr.waitResponderLoad(); fn != nil {
 		e, ok := wr.tokens.get(token)
@@ -180,9 +128,6 @@ func (wr *WaitingRoom) respondCookieWait(c *gin.Context, token string, position 
 	return false
 }
 
-// respondKeyedWait answers a queued keyed request: through the wait
-// responder if one is set, otherwise with the JSON wait response, whose
-// position is the key's place in line (as Enter reports it).
 func (wr *WaitingRoom) respondKeyedWait(c *gin.Context, token string, e ticketEntry, place int64) {
 	if fn := wr.waitResponderLoad(); fn != nil {
 		ti := wr.ticketInfo(token, e)
@@ -196,20 +141,16 @@ func (wr *WaitingRoom) respondKeyedWait(c *gin.Context, token string, e ticketEn
 	c.Abort()
 }
 
-// keyedAction is what serveKeyed decided under the lease lock.
 type keyedAction uint8
 
 const (
-	keyedPass  keyedAction = iota // key holds a lease: run the handler
-	keyedAdmit                    // admit ticket (claimed or fresh)
-	keyedWait                     // queued: answer with the wait response
-	keyedFull                     // breaker tripped
-	keyedError                    // could not issue a ticket
+	keyedPass keyedAction = iota
+	keyedAdmit
+	keyedWait
+	keyedFull
+	keyedError
 )
 
-// serveKeyed is the middleware for a request SetTicketKeyFunc recognised.
-// It mirrors the cookie flow — resume, breaker, fast path, slow path —
-// with the key as the ticket's identity and no cookies.
 func (wr *WaitingRoom) serveKeyed(c *gin.Context, key string, hasPass bool) {
 	if err := validKey(key); err != nil {
 		c.AbortWithStatus(http.StatusBadRequest)
@@ -247,9 +188,6 @@ func (wr *WaitingRoom) serveKeyed(c *gin.Context, key string, hasPass bool) {
 	wr.respondKeyedWait(c, k.token, k.entry, k.place)
 }
 
-// decideKeyed runs the part of serveKeyed that must see a consistent lease
-// table: whether the key holds a lease, resumes its ticket, or gets a new
-// one. It holds wr.leaseMu for reading and never calls the handler.
 func (wr *WaitingRoom) decideKeyed(key, clientKey string, now time.Time) (keyedAction, int64, keyedEntry) {
 	wr.leaseMu.RLock()
 	defer wr.leaseMu.RUnlock()
@@ -260,15 +198,12 @@ func (wr *WaitingRoom) decideKeyed(key, clientKey string, now time.Time) (keyedA
 
 	if token, e, ok := wr.tokens.lookupKey(key); ok {
 		if wr.ticketReady(e.ticket) {
-			// Claim before acquiring, exactly as the cookie path does.
 			if claimed, won := wr.tokens.take(token); won {
 				return keyedAdmit, claimed.ticket, keyedEntry{}
 			}
-			// Reaped or removed in between: a new arrival.
 		} else if k := wr.tokens.enterKey(key, "", ticketEntry{}, nil, now); k.token != "" {
 			return keyedWait, 0, k
 		}
-		// Gone between the lookup and the refresh: a new arrival.
 	}
 
 	if _, full := wr.queueFull(); full {
@@ -288,8 +223,6 @@ func (wr *WaitingRoom) decideKeyed(key, clientKey string, now time.Time) (keyedA
 	fresh.clientKey = clientKey
 	k := wr.tokens.enterKey(key, token, fresh, func() int64 { return ticket }, now)
 	if !k.created {
-		// A concurrent request with this key queued first; this number
-		// will never be admitted.
 		wr.retire(ticket)
 	}
 	return keyedWait, 0, k

@@ -3,7 +3,6 @@ package room
 import (
 	"context"
 	"fmt"
-	"math"
 	"net/http"
 	"time"
 
@@ -11,56 +10,29 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// NewWaitingRoom returns a gin.HandlerFunc that enforces a FIFO waiting room
-// with the given capacity. It is the simplest way to add a waiting room to
-// an existing gin application.
+// NewWaitingRoom constructs an initialised WaitingRoom, registers the status
+// routes on r, and returns its middleware. It panics if cap < 1.
 //
-// cap is the maximum number of requests actively served at any moment.
-// Any value between 1 and math.MaxInt32 is valid.
-//
-// # Goroutine lifecycle
-//
-// NewWaitingRoom starts a background reaper goroutine whose lifetime is tied
-// to the process. The caller has no reference to the underlying WaitingRoom
-// and therefore cannot call Stop(). This is acceptable for long-lived server
-// processes where the goroutine is intentional and the process exit cleans up.
-// For tests, embedded servers, or any scenario requiring explicit shutdown,
-// construct a WaitingRoom manually and call Stop() via defer:
-//
-//	wr := &room.WaitingRoom{}
-//	wr.Init(500)
-//	defer wr.Stop()
-//	wr.RegisterRoutes(r)
-//
-// Each call creates a new WaitingRoom with its own reaper. To share one
-// queue across several engines, construct a single WaitingRoom and call
-// RegisterRoutes on each engine instead.
-//
-// Related: WaitingRoom.RegisterRoutes, WaitingRoom.Middleware
+// Because the caller receives no *WaitingRoom handle, its background reaper
+// goroutine lives for the process lifetime. For explicit shutdown or runtime
+// configuration, construct a WaitingRoom manually with [WaitingRoom.Init],
+// [WaitingRoom.RegisterRoutes], and [WaitingRoom.Stop].
 func NewWaitingRoom(r *gin.Engine, cap int32) gin.HandlerFunc {
 	wr := &WaitingRoom{}
 	if err := wr.Init(cap); err != nil {
 		panic(fmt.Sprintf("room.NewWaitingRoom: %v", err))
 	}
+	r.OPTIONS("/queue/status", func(c *gin.Context) {
+		c.Status(http.StatusNoContent)
+	})
 	r.GET("/queue/status", wr.StatusHandler())
 	r.GET("/queue/status/:ticket", wr.TicketStatusHandler())
 	return wr.Middleware()
 }
 
-// NewWaitingRoomFromStruct returns a gin.HandlerFunc from a fully configured
-// WaitingRoom. Use this when you need to retain a handle to the WaitingRoom
-// after initialisation.
+// NewWaitingRoomFromStruct returns wr.Middleware(), panicking if wr is nil.
 //
-// Usage:
-//
-//	wr := &room.WaitingRoom{}
-//	if err := wr.Init(500); err != nil {
-//	    log.Fatal(err)
-//	}
-//	defer wr.Stop()
-//	wr.RegisterRoutes(r)
-//
-// Related: NewWaitingRoom, WaitingRoom.RegisterRoutes
+// Deprecated: call wr.Middleware() directly.
 func NewWaitingRoomFromStruct(wr *WaitingRoom) gin.HandlerFunc {
 	if wr == nil {
 		panic("room.NewWaitingRoomFromStruct: nil WaitingRoom")
@@ -68,53 +40,40 @@ func NewWaitingRoomFromStruct(wr *WaitingRoom) gin.HandlerFunc {
 	return wr.Middleware()
 }
 
-// Init initialises the WaitingRoom with the given capacity and starts the
-// background reaper. It must be called before Middleware or RegisterRoutes
-// when constructing a WaitingRoom manually.
+// Init initialises the WaitingRoom with capacity cap (>= 1) and starts its
+// background reaper goroutine. Call Init once before serving traffic; use
+// [WaitingRoom.SetCap] and other setters for runtime reconfiguration.
 //
-// Init is not safe for concurrent use. Call it once during setup before
-// any goroutines start serving traffic. For runtime capacity changes use
-// SetCap; for runtime reaper changes use SetReaperInterval.
-//
-// The WaitingRoom is marked initialised only after every field has been
-// set and the reaper has started, so a request that observes it as
-// initialised never sees a partially constructed room.
-//
-// Returns ErrInvalidCap if cap < 1.
-//
-// Related: WaitingRoom.Stop, WaitingRoom.SetCap
+// Returns [ErrInvalidCap] if cap < 1.
 func (wr *WaitingRoom) Init(cap int32) error {
 	if cap < 1 {
 		return ErrInvalidCap{Given: cap}
 	}
 
-	// Wait for any previous reaper to exit before replacing the state it
-	// reads.
 	wr.haltReaper()
 
 	wr.cap.Store(cap)
 	wr.sem = sema.Must(int(cap))
 	wr.tokens = newTokenStore()
-	wr.tokens.setTTL(defaultTokenTTL)
+	wr.tokens.setTTL(DefaultTokenTTL)
 	wr.passes = newPassStore()
 	wr.ledger = newGhostLedger()
 	wr.reaperRestart = make(chan struct{}, 1)
 	wr.nowServing.Store(0)
 	wr.nextTicket.Store(0)
 	wr.occupancy.Store(0)
-	wr.reaperInterval.Store(int64(reaperInterval))
-	wr.firstPollGrace.Store(int64(defaultFirstPollGrace))
-	wr.secureCookie.Store(secureCookieDefault)
-	wr.maxQueueDepth.Store(defaultMaxQueueDepth)
-	wr.cookiePath.Store("/")
-	wr.cookieDomain.Store("")
-	wr.rateFunc.Store((*rateFuncHolder)(nil))
-	wr.promoteInsert.Store(math.MaxInt64)
-	wr.skipURL.Store("")
-	wr.passDuration.Store(int64(defaultPassDuration))
+	wr.reaperInterval.Store(int64(DefaultReaperInterval))
+	wr.firstPollGrace.Store(0)
+	wr.secureCookie.Store(false)
+	wr.maxQueueDepth.Store(0)
+	wr.SetCookiePath("/")
+	wr.SetCookieDomain("")
+	wr.rateFunc.Store(nil)
+	wr.SetSkipURL("")
+	wr.passDuration.Store(0)
 	wr.callbacks = newCallbackRegistry()
 	wr.waitJSON.Store(false)
-	wr.statusBaseURL.Store(defaultStatusBaseURL)
+	wr.SetStatusBaseURL(defaultStatusBaseURL)
 	wr.leaseTTL.Store(0)
 	wr.leaseMu.Lock()
 	wr.leases = make(map[string]leaseEntry)
@@ -125,64 +84,26 @@ func (wr *WaitingRoom) Init(cap int32) error {
 	wr.startReaper(ctx)
 
 	wr.initialised.Store(true)
-
 	return nil
 }
 
-// Stop shuts down the background reaper goroutine and waits for it to
-// exit, so no reaper pass runs after Stop returns. Call it when your
-// application is shutting down to ensure a clean exit with no leaked
-// goroutines. Calling it more than once is harmless.
-//
-// Related: WaitingRoom.Init, WaitingRoom.startReaper
+// Stop cancels the background reaper goroutine and waits for it to exit.
+// Calling Stop more than once is harmless.
 func (wr *WaitingRoom) Stop() {
 	wr.haltReaper()
 }
 
-// SetSecureCookie controls whether the waiting-room session cookie is
-// issued with the Secure flag. The default is false so that plain-HTTP
-// local development works without configuration.
-//
-// Call SetSecureCookie(true) in any production deployment served over
-// HTTPS — either directly or via a TLS-terminating proxy (Cloudflare,
-// nginx, AWS ALB, etc.) where c.Request.TLS may be nil even though the
-// end-user connection is encrypted.
-//
-// Note that setting this to true on a deployment that is NOT fully HTTPS
-// causes browsers to silently discard the session cookie, which puts
-// every client into the cookie-disabled failure mode. The waiting room
-// page detects and reports that condition rather than looping, but the
-// clients still cannot be admitted — verify your TLS terminator before
-// enabling this.
-//
-// Safe to call at any time before or after traffic starts.
+// SetSecureCookie forces the Secure flag on waiting-room cookies when true.
+// When false (the default), Secure is set only on requests arriving directly
+// over TLS (r.TLS != nil). Call SetSecureCookie(true) behind TLS-terminating
+// proxies. Safe to call at any time.
 func (wr *WaitingRoom) SetSecureCookie(secure bool) {
 	wr.secureCookie.Store(secure)
 }
 
-// SetTokenTTL sets the sliding-window lifetime of a queued client's
-// token. The window is reset on every poll and every waiting-page render,
-// so an actively waiting client is never reaped no matter how long it
-// waits; the TTL governs only how long an ABANDONED token lingers.
-//
-// Lower values reclaim ghost tickets faster and keep QueueDepth honest —
-// which matters because QueueDepth drives displayed positions, surge
-// pricing via RateFunc, and the SetMaxQueueDepth circuit breaker. Higher
-// values let a client close the tab and return to the same position.
-// For clients that never come back at all, SetFirstPollGrace reclaims
-// their tickets much sooner than any TTL.
-//
-// The token TTL is also used as the MaxAge of the room_ticket and
-// room_probe cookies, which are re-sent during the wait so they never
-// expire while the client is still polling.
-//
-// Passing 0 restores DefaultTokenTTL. Otherwise the valid range is
-// 30s – 24h; values outside it (including negative values) return
-// ErrTokenTTL.
-//
-// Safe to call at any time.
-//
-// Related: TokenTTL, DefaultTokenTTL, SetReaperInterval, SetFirstPollGrace, SetMaxQueueDepth
+// SetTokenTTL sets the sliding-window lifetime of an abandoned queued token.
+// Passing 0 restores [DefaultTokenTTL]; otherwise valid values are 30s–24h
+// (returns [ErrTokenTTL] outside that range). Safe to call at any time.
 func (wr *WaitingRoom) SetTokenTTL(d time.Duration) error {
 	if d == 0 {
 		d = DefaultTokenTTL
@@ -195,30 +116,13 @@ func (wr *WaitingRoom) SetTokenTTL(d time.Duration) error {
 }
 
 // TokenTTL returns the current sliding-window token lifetime.
-//
-// Related: SetTokenTTL
 func (wr *WaitingRoom) TokenTTL() time.Duration {
 	return wr.tokens.ttl()
 }
 
-// SetMaxQueueDepth sets the maximum number of requests that may wait in the
-// queue simultaneously. When the queue is at this depth, new arrivals
-// receive a 503 Service Unavailable immediately instead of being queued.
-//
-// A value of 0 disables the limit (unlimited queue depth). This is the
-// default. Negative values return ErrInvalidMaxQueueDepth.
-//
-// The limit trips when EITHER of two measures reaches it — the ticket-
-// counter QueueDepth or the live token count — so the higher of the two
-// always wins and the breaker is deliberately pessimistic. Abandoned and
-// cookieless arrivals count toward both until they are reaped; enable
-// SetFirstPollGrace to reclaim clients that never come back within
-// seconds, tighten SetReaperInterval and SetTokenTTL to reclaim the rest
-// faster, or remove known-bad clients immediately with RemoveToken.
-// Clients that already hold a live room_ticket are never rejected by the
-// breaker.
-//
-// Safe to call at any time including while requests are in flight.
+// SetMaxQueueDepth sets the maximum waiting queue depth before new arrivals
+// receive 503 Service Unavailable. Zero disables the limit (default); negative
+// values return [ErrInvalidMaxQueueDepth]. Safe to call at any time.
 func (wr *WaitingRoom) SetMaxQueueDepth(max int64) error {
 	if max < 0 {
 		return ErrInvalidMaxQueueDepth{Given: max}
@@ -227,93 +131,67 @@ func (wr *WaitingRoom) SetMaxQueueDepth(max int64) error {
 	return nil
 }
 
-// MaxQueueDepth returns the current maximum queue depth. Zero means unlimited.
+// MaxQueueDepth returns the current maximum queue depth (0 means unlimited).
 func (wr *WaitingRoom) MaxQueueDepth() int64 {
 	return wr.maxQueueDepth.Load()
 }
 
-// LiveQueueDepth returns the number of queued clients that currently hold
-// a token in the token store. Unlike QueueDepth, which is derived from the
-// monotonic ticket counter, this reflects only clients the server can
-// still admit (including ones already told ready that have not reloaded).
-//
-// Prefer this for dashboards where an inflated number would be misleading.
-//
-// Related: WaitingRoom.QueueDepth, WaitingRoom.SetTokenTTL
+// LiveQueueDepth returns the number of live tokens currently in the store
+// (including clients told ready that have not reloaded yet).
 func (wr *WaitingRoom) LiveQueueDepth() int64 {
 	return int64(wr.tokens.len())
 }
 
-// SetCookiePath sets the Path attribute of the waiting-room session cookie.
-// The default is "/". Use this to scope the cookie to a specific route
-// prefix in multi-app deployments sharing a domain.
-//
-// Safe to call at any time.
+// SetCookiePath sets the Path attribute for waiting-room cookies (empty
+// restores "/"). Safe to call at any time.
 func (wr *WaitingRoom) SetCookiePath(path string) {
 	if path == "" {
 		path = "/"
 	}
-	wr.cookiePath.Store(path)
+	wr.cookiePath.Store(&path)
 }
 
-// CookiePath returns the current cookie Path setting.
+// CookiePath returns the current cookie Path setting ("/" if unset).
 func (wr *WaitingRoom) CookiePath() string {
-	return wr.cookiePath.Load().(string)
+	if p := wr.cookiePath.Load(); p != nil && *p != "" {
+		return *p
+	}
+	return "/"
 }
 
-// SetCookieDomain sets the Domain attribute of the waiting-room session
-// cookie. The default is empty (browser uses the request host). Set this
-// to restrict or expand cookie scope in multi-subdomain deployments.
-//
+// SetCookieDomain sets the Domain attribute for waiting-room cookies.
 // Safe to call at any time.
 func (wr *WaitingRoom) SetCookieDomain(domain string) {
-	wr.cookieDomain.Store(domain)
+	wr.cookieDomain.Store(&domain)
 }
 
-// CookieDomain returns the current cookie Domain setting.
+// CookieDomain returns the current cookie Domain setting (empty if unset).
 func (wr *WaitingRoom) CookieDomain() string {
-	return wr.cookieDomain.Load().(string)
+	if p := wr.cookieDomain.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
-// SetSkipURL sets the URL that the waiting room "Pay to skip" button
-// navigates to. This is typically a payment page (Stripe Checkout,
-// crypto invoice, etc.) that your application hosts.
-//
-// The handler at this URL can read the room_ticket cookie to identify
-// which queued client is paying. After payment verification, call
-// PromoteTokenToFront to move them to the front of the queue.
-//
-// If empty (the default), the skip-the-line offer is never shown on
-// the waiting room page, even if a RateFunc is configured. Both
-// SetRateFunc and SetSkipURL must be set for the offer to appear.
-//
-// Safe to call at any time.
-//
-// Related: SetRateFunc, PromoteToken, PromoteTokenToFront
+// SetSkipURL sets the payment URL for the "Pay to skip" button on the waiting
+// room page. Both [WaitingRoom.SetRateFunc] and SetSkipURL must be configured
+// for the offer to appear. Safe to call at any time.
 func (wr *WaitingRoom) SetSkipURL(url string) {
-	wr.skipURL.Store(url)
+	wr.skipURL.Store(&url)
 }
 
-// SkipURL returns the current skip-the-line payment URL.
+// SkipURL returns the current skip-the-line payment URL (empty if unset).
 func (wr *WaitingRoom) SkipURL() string {
-	return wr.skipURL.Load().(string)
+	if p := wr.skipURL.Load(); p != nil {
+		return *p
+	}
+	return ""
 }
 
-// SetPassDuration sets the lifetime of VIP passes issued by GrantPass.
-// After a client pays to skip the line, they receive a pass that
-// auto-promotes them for this duration on any subsequent queue entry,
-// without requiring another payment.
-//
-// A value of 0 disables passes (the default). When disabled, promotions
-// are single-use: the client is promoted once and must pay again if they
-// re-enter the queue.
-//
-// Valid range when non-zero: 1m – 24h. Values outside this range return
-// ErrPassDuration.
-//
-// Safe to call at any time.
-//
-// Related: GrantPass, HasValidPass, PassDuration
+// SetPassDuration sets the lifetime of VIP passes issued by [WaitingRoom.GrantPass]
+// and [WaitingRoom.PromoteToken]. Zero disables passes (default); non-zero
+// values must lie in 1m–24h (otherwise returns [ErrPassDuration]). Safe to
+// call at any time.
 func (wr *WaitingRoom) SetPassDuration(d time.Duration) error {
 	if d == 0 {
 		wr.passDuration.Store(0)
@@ -326,62 +204,27 @@ func (wr *WaitingRoom) SetPassDuration(d time.Duration) error {
 	return nil
 }
 
-// PassDuration returns the current VIP pass lifetime. Zero means passes
-// are disabled (single-use promotions only).
+// PassDuration returns the current VIP pass lifetime (0 means disabled).
 func (wr *WaitingRoom) PassDuration() time.Duration {
 	return time.Duration(wr.passDuration.Load())
 }
 
-// GrantPass creates a time-limited VIP pass and returns the pass token.
-// The caller is responsible for setting the room_pass cookie on the
-// HTTP response with this token value.
-//
-// The pass expires after PassDuration from now. If PassDuration is 0
-// (passes disabled), GrantPass returns an empty string and no pass is
-// created.
-//
-// PromoteToken and PromoteTokenToFront already call GrantPass and return
-// the token in PromoteResult.PassToken; call GrantPass directly only when
-// issuing a pass outside a promotion. Typical usage in your payment
-// confirmation handler:
-//
-//	result, err := wr.PromoteTokenToFront(ticketToken)
-//	if err != nil { ... }
-//	if result.PassToken != "" {
-//	    http.SetCookie(w, &http.Cookie{
-//	        Name:     "room_pass",
-//	        Value:    result.PassToken,
-//	        Path:     wr.CookiePath(),
-//	        MaxAge:   int(wr.PassDuration().Seconds()),
-//	        HttpOnly: true,
-//	        Secure:   true,
-//	    })
-//	}
-//
-// Related: SetPassDuration, HasValidPass, PromoteTokenToFront
+// GrantPass creates a time-limited VIP pass token, or returns "" if passes
+// are disabled. Set the returned token as the room_pass cookie on the response.
 func (wr *WaitingRoom) GrantPass() string {
 	d := wr.PassDuration()
 	if d == 0 {
 		return ""
 	}
-
 	token, err := generateToken()
 	if err != nil {
 		return ""
 	}
-
-	wr.passes.set(token, passEntry{
-		expiresAt: time.Now().Add(d),
-	})
-
+	wr.passes.set(token, passEntry{expiresAt: time.Now().Add(d)})
 	return token
 }
 
-// HasValidPass reports whether the given pass token exists and has not
-// expired. Use this in your middleware or handlers to check if a client
-// should be auto-promoted.
-//
-// Related: GrantPass, SetPassDuration
+// HasValidPass reports whether passToken exists and has not expired.
 func (wr *WaitingRoom) HasValidPass(passToken string) bool {
 	if passToken == "" {
 		return false
@@ -390,9 +233,7 @@ func (wr *WaitingRoom) HasValidPass(passToken string) bool {
 	return ok
 }
 
-// checkInitialised aborts the request with 500 and returns false if the
-// WaitingRoom has not been initialised. Prevents nil pointer dereferences
-// on zero-value WaitingRoom structs.
+// checkInitialised aborts with 500 and returns false if Init was not called.
 func (wr *WaitingRoom) checkInitialised(c *gin.Context) bool {
 	if !wr.initialised.Load() {
 		c.AbortWithStatus(http.StatusInternalServerError)

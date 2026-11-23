@@ -1,122 +1,145 @@
 package room
 
 import (
-	"container/heap"
 	"slices"
+	"time"
 )
 
 // tokenStoreCompactFloor is the minimum high-water mark before reap()
 // reallocates tokenStore maps and heap slices to reclaim post-spike memory.
 const tokenStoreCompactFloor = 4096
 
-// ttlMinHeap is an intrusive min-heap of live *tokenNode ordered by ttlKey
-// (the last-seen issuedAt recorded in the heap). Storing issuedAt rather than
-// issuedAt+TTL lets runtime SetTokenTTL changes take effect immediately with
-// zero heap rebuild, while poll() never touches the heap.
+// nodeHeap is a typed intrusive min-heap over *tokenNode keyed by recorded
+// issuedAt (either ttlKey/ttlHeapIdx or unseenKey/unseenHeapIdx). Keying by
+// issuedAt rather than issuedAt+TTL lets runtime SetTokenTTL and
+// SetFirstPollGrace changes apply immediately with zero rebuild, while poll()
+// never touches the heap.
 //
 // All methods require the caller to hold ts.mu.Lock.
-type ttlMinHeap []*tokenNode
+type nodeHeap struct {
+	nodes  []*tokenNode
+	unseen bool
+}
 
-func (h ttlMinHeap) Len() int           { return len(h) }
-func (h ttlMinHeap) Less(i, j int) bool { return h[i].ttlKey.Before(h[j].ttlKey) }
-func (h ttlMinHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].ttlHeapIdx = i
-	h[j].ttlHeapIdx = j
+func (h *nodeHeap) len() int { return len(h.nodes) }
+
+func (h *nodeHeap) peek() *tokenNode { return h.nodes[0] }
+
+func (h *nodeHeap) key(n *tokenNode) time.Time {
+	if h.unseen {
+		return n.unseenKey
+	}
+	return n.ttlKey
 }
-func (h *ttlMinHeap) Push(x any) {
-	n := x.(*tokenNode)
-	n.ttlHeapIdx = len(*h)
-	*h = append(*h, n)
+
+func (h *nodeHeap) idx(n *tokenNode) int {
+	if h.unseen {
+		return n.unseenHeapIdx
+	}
+	return n.ttlHeapIdx
 }
-func (h *ttlMinHeap) Pop() any {
-	old := *h
-	last := len(old) - 1
-	n := old[last]
-	old[last] = nil
-	n.ttlHeapIdx = -1
-	*h = old[:last]
+
+func (h *nodeHeap) setIdx(n *tokenNode, i int) {
+	if h.unseen {
+		n.unseenHeapIdx = i
+	} else {
+		n.ttlHeapIdx = i
+	}
+}
+
+func (h *nodeHeap) swap(i, j int) {
+	h.nodes[i], h.nodes[j] = h.nodes[j], h.nodes[i]
+	h.setIdx(h.nodes[i], i)
+	h.setIdx(h.nodes[j], j)
+}
+
+func (h *nodeHeap) less(i, j int) bool {
+	return h.key(h.nodes[i]).Before(h.key(h.nodes[j]))
+}
+
+func (h *nodeHeap) push(n *tokenNode) {
+	i := len(h.nodes)
+	h.setIdx(n, i)
+	h.nodes = append(h.nodes, n)
+	h.siftUp(i)
+}
+
+func (h *nodeHeap) pop() *tokenNode {
+	n := h.nodes[0]
+	h.removeAt(0)
 	return n
 }
 
-// unseenMinHeap is an intrusive min-heap of never-seen *tokenNode ordered by
-// unseenKey (issuance issuedAt). Storing issuedAt lets runtime
-// SetFirstPollGrace changes apply immediately with zero rebuild. Nodes are
-// lazily dropped from this heap once seen becomes true, or removed immediately
-// on admission/eviction via unseenHeapIdx.
-//
-// All methods require the caller to hold ts.mu.Lock.
-type unseenMinHeap []*tokenNode
-
-func (h unseenMinHeap) Len() int           { return len(h) }
-func (h unseenMinHeap) Less(i, j int) bool { return h[i].unseenKey.Before(h[j].unseenKey) }
-func (h unseenMinHeap) Swap(i, j int) {
-	h[i], h[j] = h[j], h[i]
-	h[i].unseenHeapIdx = i
-	h[j].unseenHeapIdx = j
-}
-func (h *unseenMinHeap) Push(x any) {
-	n := x.(*tokenNode)
-	n.unseenHeapIdx = len(*h)
-	*h = append(*h, n)
-}
-func (h *unseenMinHeap) Pop() any {
-	old := *h
-	last := len(old) - 1
-	n := old[last]
-	old[last] = nil
-	n.unseenHeapIdx = -1
-	*h = old[:last]
-	return n
-}
-
-func (ts *tokenStore) removeFromHeapsLocked(n *tokenNode) {
-	if n.ttlHeapIdx >= 0 {
-		heap.Remove(&ts.ttlHeap, n.ttlHeapIdx)
-	}
-	if n.unseenHeapIdx >= 0 {
-		heap.Remove(&ts.unseenHeap, n.unseenHeapIdx)
+func (h *nodeHeap) remove(n *tokenNode) {
+	if i := h.idx(n); i >= 0 {
+		h.removeAt(i)
 	}
 }
 
-// compactIfNeeded reclaims Go map bucket arrays and heap slice backing arrays
-// after a traffic spike subsides (live count drops below 25% of highWater,
-// above tokenStoreCompactFloor). Also clears hasLazyShifts once empty.
-func (ts *tokenStore) compactIfNeeded() {
-	ts.mu.Lock()
-	defer ts.mu.Unlock()
+func (h *nodeHeap) removeAt(i int) {
+	last := len(h.nodes) - 1
+	if i != last {
+		h.swap(i, last)
+	}
+	removed := h.nodes[last]
+	h.nodes[last] = nil
+	h.setIdx(removed, -1)
+	h.nodes = h.nodes[:last]
+	if i < last {
+		if !h.siftDown(i) {
+			h.siftUp(i)
+		}
+	}
+}
 
-	cur := len(ts.entries)
-	if cur == 0 {
-		ts.hasLazyShifts = false
+func (h *nodeHeap) fix(n *tokenNode) {
+	if i := h.idx(n); i >= 0 {
+		if !h.siftDown(i) {
+			h.siftUp(i)
+		}
 	}
-	if ts.highWater < tokenStoreCompactFloor || cur*4 >= ts.highWater {
-		return
-	}
+}
 
-	entries := make(map[string]*tokenNode, cur)
-	for k, v := range ts.entries {
-		entries[k] = v
+func (h *nodeHeap) init() {
+	for i := len(h.nodes)/2 - 1; i >= 0; i-- {
+		h.siftDown(i)
 	}
-	ts.entries = entries
+}
 
-	byKey := make(map[string]string, len(ts.byKey))
-	for k, v := range ts.byKey {
-		byKey[k] = v
+func (h *nodeHeap) compact(floor int) {
+	if cap(h.nodes) > floor && len(h.nodes)*4 < cap(h.nodes) {
+		h.nodes = slices.Clone(h.nodes)
 	}
-	ts.byKey = byKey
+}
 
-	byID := make(map[string]string, len(ts.byID))
-	for k, v := range ts.byID {
-		byID[k] = v
+func (h *nodeHeap) siftUp(j int) {
+	for {
+		i := (j - 1) / 2
+		if i == j || !h.less(j, i) {
+			break
+		}
+		h.swap(i, j)
+		j = i
 	}
-	ts.byID = byID
+}
 
-	if cap(ts.ttlHeap) > tokenStoreCompactFloor && len(ts.ttlHeap)*4 < cap(ts.ttlHeap) {
-		ts.ttlHeap = slices.Clone(ts.ttlHeap)
+func (h *nodeHeap) siftDown(i0 int) bool {
+	i := i0
+	n := len(h.nodes)
+	for {
+		j1 := 2*i + 1
+		if j1 >= n || j1 < 0 {
+			break
+		}
+		j := j1
+		if j2 := j1 + 1; j2 < n && h.less(j2, j1) {
+			j = j2
+		}
+		if !h.less(j, i) {
+			break
+		}
+		h.swap(i, j)
+		i = j
 	}
-	if cap(ts.unseenHeap) > tokenStoreCompactFloor && len(ts.unseenHeap)*4 < cap(ts.unseenHeap) {
-		ts.unseenHeap = slices.Clone(ts.unseenHeap)
-	}
-	ts.highWater = cur
+	return i > i0
 }

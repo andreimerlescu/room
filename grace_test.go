@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// ── SetFirstPollGrace: configuration ─────────────────────────────────────────
+// SetFirstPollGrace: configuration
 
 func TestSetFirstPollGrace_DefaultDisabled(t *testing.T) {
 	t.Parallel()
@@ -65,7 +65,7 @@ func TestSetFirstPollGrace_ZeroDisables(t *testing.T) {
 	}
 }
 
-// ── Reaper cadence ────────────────────────────────────────────────────────────
+// Reaper cadence
 
 func TestEffectiveReaperInterval(t *testing.T) {
 	t.Parallel()
@@ -122,7 +122,7 @@ func TestSetFirstPollGrace_SignalsReaperRestart(t *testing.T) {
 	}
 }
 
-// ── Reaping never-seen tickets ───────────────────────────────────────────────
+// Reaping never-seen tickets
 
 func TestReap_FirstPollGrace_EvictsOnlyNeverSeenPastGrace(t *testing.T) {
 	wr := newTestWR(t, 1)
@@ -231,7 +231,7 @@ func TestFirstPollGrace_CookielessFloodReclaimed(t *testing.T) {
 	}
 }
 
-// ── Concurrency ───────────────────────────────────────────────────────────────
+// Concurrency
 
 func TestFirstPollGrace_ConcurrentSetAndReap(t *testing.T) {
 	wr := newTestWR(t, 1)

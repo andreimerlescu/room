@@ -13,7 +13,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ── RateFunc / SetRateFunc ───────────────────────────────────────────────────
+// RateFunc / SetRateFunc
 
 func TestSetRateFunc_NilDisablesPromotions(t *testing.T) {
 	t.Parallel()
@@ -51,7 +51,7 @@ func TestRateFuncLoad_DefaultIsNil(t *testing.T) {
 	}
 }
 
-// ── QuoteCost ────────────────────────────────────────────────────────────────
+// QuoteCost
 
 func TestQuoteCost_NoRateFunc_ReturnsDisabled(t *testing.T) {
 	t.Parallel()
@@ -215,7 +215,7 @@ func TestQuoteCost_DoesNotMutateState(t *testing.T) {
 	}
 }
 
-// ── PromoteToken ─────────────────────────────────────────────────────────────
+// PromoteToken
 
 func TestPromoteToken_NoRateFunc_ReturnsDisabled(t *testing.T) {
 	t.Parallel()
@@ -386,7 +386,7 @@ func TestPromoteToken_ReturnsCost(t *testing.T) {
 	}
 }
 
-// ── PromoteToken — EventPromote callback ─────────────────────────────────────
+// PromoteToken — EventPromote callback
 
 func TestPromoteToken_FiresEventPromote(t *testing.T) {
 	t.Parallel()
@@ -435,7 +435,7 @@ func TestPromoteToken_NoEventOnError(t *testing.T) {
 	}
 }
 
-// ── PromoteTokenToFront ──────────────────────────────────────────────────────
+// PromoteTokenToFront
 
 func TestPromoteTokenToFront_JumpsToPositionOne(t *testing.T) {
 	t.Parallel()
@@ -460,7 +460,7 @@ func TestPromoteTokenToFront_JumpsToPositionOne(t *testing.T) {
 	}
 }
 
-// ── Serialization: concurrent promotions ─────────────────────────────────────
+// Serialization: concurrent promotions
 
 // TestPromoteToken_ConcurrentPromotions_AllLandAtTarget replaces
 // TestPromoteToken_ConcurrentPromotions_NoCollision. Concurrent promotions
@@ -594,7 +594,7 @@ func TestPromoteToken_TargetAccountsForGhosts(t *testing.T) {
 	}
 }
 
-// ── AdminPromote ──────────────────────────────────────────────────────────────
+// AdminPromote
 
 func TestAdminPromote_WorksWithoutRateFunc(t *testing.T) {
 	t.Parallel()
@@ -719,7 +719,7 @@ func TestPromote_RaceWithRemove_NoResurrection(t *testing.T) {
 	}
 }
 
-// ── Integration: promoted token is admitted via status polling ────────────────
+// Integration: promoted token is admitted via status polling
 
 func TestIntegration_PromotedToken_AdmittedOnNextPoll(t *testing.T) {
 	t.Parallel()
@@ -816,7 +816,7 @@ func TestIntegration_PromotedToken_ServesRequestSuccessfully(t *testing.T) {
 	}
 }
 
-// ── Integration: status endpoint includes pricing ────────────────────────────
+// Integration: status endpoint includes pricing
 
 func TestIntegration_StatusEndpoint_IncludesPricing(t *testing.T) {
 	t.Parallel()
@@ -968,7 +968,7 @@ func TestIntegration_StatusEndpoint_HidesPricingWhenPassActive(t *testing.T) {
 	close(release)
 }
 
-// ── Edge cases ───────────────────────────────────────────────────────────────
+// Edge cases
 
 func TestPromoteToken_QueueMovedBetweenQuoteAndPromote(t *testing.T) {
 	t.Parallel()
@@ -1020,7 +1020,7 @@ func TestPromoteToken_ExpiredPromotedToken_Reaped(t *testing.T) {
 
 	wr.tokens.set("tok", ticketEntry{
 		ticket:   11,
-		issuedAt: time.Now().Add(-(cookieTTL + time.Minute)),
+		issuedAt: time.Now().Add(-(DefaultTokenTTL + time.Minute)),
 	})
 
 	entry, _ := wr.tokens.get("tok")
@@ -1035,7 +1035,7 @@ func TestPromoteToken_ExpiredPromotedToken_Reaped(t *testing.T) {
 	}
 }
 
-// ── Pass system ──────────────────────────────────────────────────────────────
+// Pass system
 
 func TestSetPassDuration_Zero_DisablesPasses(t *testing.T) {
 	t.Parallel()
@@ -1299,7 +1299,7 @@ func TestAutoPromote_MissingToken(t *testing.T) {
 	wr.autoPromote("nonexistent")
 }
 
-// ── Benchmark ────────────────────────────────────────────────────────────────
+// Benchmark
 
 func BenchmarkQuoteCost(b *testing.B) {
 	wr := &WaitingRoom{}

@@ -2,58 +2,19 @@ package room
 
 import "time"
 
-// Leases.
+// Acquire grants key a slot held until [WaitingRoom.Release] (or lease TTL
+// expiry) if key's ticket is inside the serving window and a slot is free.
+// Otherwise key joins or stays in line (restarting its TokenTTL) and Acquire
+// returns ok=false with its 1-based place in line.
 //
-// A request admitted by the middleware holds its slot until its handler
-// returns. A lease holds a slot for a key until the application releases
-// it — across any number of requests, for minutes or hours — which is what
-// a server needs when the thing it rations is sessions or passes rather
-// than requests.
+// Calling Acquire for a key that already holds a lease renews its TTL and
+// returns ok=true, position=0. Both the serving window and underlying
+// semaphore (sema v1.2.0) preserve held slots on [WaitingRoom.SetCap] shrink,
+// keeping Len() and Held() aligned until enough leases are released.
 //
-// # How a lease is accounted
-//
-// Acquire puts the key in line (or finds it there) exactly like Enter. When
-// the key's ticket is inside the serving window, the ticket is claimed and
-// admitted just as the middleware admits one, and its slot is kept until
-// Release (or until the lease TTL runs out), whose release advances the
-// window. Leases and requests therefore share one capacity and one line,
-// first come, first served, and every ticket is still accounted for
-// exactly once.
-//
-// # Capacity changes
-//
-// Both the serving window and the underlying semaphore (sema v1.2.0)
-// preserve held slots when shrunk below Held (see sema.Semaphore.SetCap),
-// keeping Len() and Held() aligned at every step. SetCap below Held
-// revokes nothing, and grants no new slot — to a lease or a request —
-// until enough leases have been released to bring occupancy under the new
-// capacity.
-//
-// # Requests from a key that holds a lease
-//
-// With SetTicketKeyFunc, a request whose key holds a lease passes through
-// the middleware to the handler without taking another slot. A request
-// that arrives at the moment its lease is released may still pass.
-
-// Acquire takes a slot for key if key's place in line has reached the
-// serving window and a slot is free; the slot is then held until
-// Release(key), not until any handler returns. Otherwise key is put in
-// line (or stays there, keeping its place and restarting its TokenTTL) and
-// ok is false, with position its place in line, 1 being the front: the
-// caller asks again later.
-//
-// Acquire for a key that already holds a lease returns ok=true and renews
-// the lease (see SetLeaseTTL). position is 0 whenever ok is true.
-//
-// Returns ErrNotInitialised, ErrInvalidKey, ErrQueueFull when
-// SetMaxQueueDepth is reached for a key not yet in line, or an error from
-// crypto/rand. Fires EventLease, EventEnter and (on the edge) EventFull
-// when a slot is granted; EventQueue, with Snapshot.Key set, when the key
-// joins the line.
-//
-// Acquire calls are serialized with each other and with Release.
-//
-// Related: WaitingRoom.Release, WaitingRoom.Held, WaitingRoom.Enter
+// Fires [EventLease], [EventEnter], and (on edge) [EventFull] when granted, or
+// [EventQueue] with Snapshot.Key when joining the line. Returns
+// [ErrNotInitialised], [ErrInvalidKey], [ErrQueueFull], or a crypto/rand error.
 func (wr *WaitingRoom) Acquire(key string) (ok bool, position int64, err error) {
 	if !wr.initialised.Load() {
 		return false, 0, ErrNotInitialised{}
@@ -76,9 +37,6 @@ func (wr *WaitingRoom) Acquire(key string) (ok bool, position int64, err error) 
 		filled  bool
 		place   int64
 	)
-	// Two attempts: the first may find the key's ticket reaped or removed
-	// between entering the line and claiming it, in which case the key is
-	// a new arrival and enters again.
 	for attempt := 0; attempt < 2 && !granted; attempt++ {
 		k, err := wr.enterLine(key, now)
 		if err != nil {
@@ -91,8 +49,6 @@ func (wr *WaitingRoom) Acquire(key string) (ok bool, position int64, err error) 
 		}
 		claimed, won := wr.tokens.take(k.token)
 		if !won {
-			// The slot was taken here a moment ago, so this release
-			// cannot exceed the count.
 			_ = wr.sem.Release()
 			continue
 		}
@@ -113,15 +69,9 @@ func (wr *WaitingRoom) Acquire(key string) (ok bool, position int64, err error) 
 	return true, 0, nil
 }
 
-// Release returns key's slot. The serving window moves forward by one, so
-// the next client in line can be admitted (a keyed client on its next
-// Acquire, a browser on its next poll).
-//
-// Returns ErrNotInitialised, ErrInvalidKey, or ErrNoLease for a key that
-// holds no lease — including one whose lease already expired. Fires
-// EventRelease, EventExit and (on the edge) EventDrain.
-//
-// Related: WaitingRoom.Acquire
+// Release returns key's leased slot, advancing the serving window by one.
+// Fires [EventRelease], [EventExit], and (on edge) [EventDrain]. Returns
+// [ErrNotInitialised], [ErrInvalidKey], or [ErrNoLease].
 func (wr *WaitingRoom) Release(key string) error {
 	if !wr.initialised.Load() {
 		return ErrNotInitialised{}
@@ -138,13 +88,12 @@ func (wr *WaitingRoom) Release(key string) error {
 	if !held {
 		return ErrNoLease{}
 	}
-	wr.release("")
+	wr.release()
 	wr.emit(EventRelease, wr.snapshotForKey(EventRelease, key))
 	return nil
 }
 
-// Held returns the number of slots held by leases. Like Len, it counts
-// slots in use, but only those held by leases.
+// Held returns the number of slots currently held by leases.
 func (wr *WaitingRoom) Held() int32 {
 	if !wr.initialised.Load() {
 		return 0
@@ -154,7 +103,7 @@ func (wr *WaitingRoom) Held() int32 {
 	return int32(len(wr.leases))
 }
 
-// HasLease reports whether key holds a lease.
+// HasLease reports whether key currently holds a lease.
 func (wr *WaitingRoom) HasLease(key string) bool {
 	if !wr.initialised.Load() {
 		return false
@@ -165,19 +114,10 @@ func (wr *WaitingRoom) HasLease(key string) bool {
 	return held
 }
 
-// SetLeaseTTL sets how long a lease lasts after it was granted or last
-// renewed by Acquire. When it runs out the reaper releases the slot, as
-// Release would, and fires EventLeaseExpire. A lease is a slot nobody
-// else can use, so a TTL is the safety net for a holder that crashes or
-// forgets to call Release.
-//
-// 0, the default, means leases last until Release. Otherwise the valid
-// range is 1m–720h (30 days); values outside it return ErrLeaseTTL. A
-// change applies to leases already held, from the next reaper pass.
-//
-// Safe to call at any time. Reset to 0 by Init.
-//
-// Related: WaitingRoom.Acquire, WaitingRoom.SetReaperInterval
+// SetLeaseTTL sets how long a lease lasts without renewal via
+// [WaitingRoom.Acquire]. Zero disables expiry (default); otherwise valid
+// values are 1m–720h (returns [ErrLeaseTTL] outside that range). Reset to 0
+// by Init. Safe to call at any time.
 func (wr *WaitingRoom) SetLeaseTTL(d time.Duration) error {
 	if d != 0 && (d < leaseTTLMin || d > leaseTTLMax) {
 		return ErrLeaseTTL{Given: d, Min: leaseTTLMin, Max: leaseTTLMax}
@@ -186,12 +126,11 @@ func (wr *WaitingRoom) SetLeaseTTL(d time.Duration) error {
 	return nil
 }
 
-// LeaseTTL returns the current lease TTL; 0 means leases do not expire.
+// LeaseTTL returns the current lease TTL (0 means leases do not expire).
 func (wr *WaitingRoom) LeaseTTL() time.Duration {
 	return time.Duration(wr.leaseTTL.Load())
 }
 
-// reapLeases releases every lease not renewed for the lease TTL.
 func (wr *WaitingRoom) reapLeases(now time.Time) {
 	ttl := time.Duration(wr.leaseTTL.Load())
 	if ttl <= 0 {
@@ -207,7 +146,7 @@ func (wr *WaitingRoom) reapLeases(now time.Time) {
 	}
 	wr.leaseMu.Unlock()
 	for _, key := range expired {
-		wr.release("")
+		wr.release()
 		wr.emit(EventLeaseExpire, wr.snapshotForKey(EventLeaseExpire, key))
 	}
 }

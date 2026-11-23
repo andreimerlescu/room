@@ -14,7 +14,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+// helpers
 
 // keyedRouter is newTestRouter with SetTicketKeyFunc reading X-Key.
 func keyedRouter(wr *WaitingRoom, serving, release chan struct{}) *gin.Engine {
@@ -91,7 +91,7 @@ func assertIndexes(t *testing.T, ts *tokenStore) {
 	}
 }
 
-// ── Enter / Position / Leave ─────────────────────────────────────────────────
+// Enter / Position / Leave
 
 func TestEnter_SameKeyKeepsTicketAndPlace(t *testing.T) {
 	wr := newTestWR(t, 1)
@@ -248,7 +248,18 @@ func TestEnter_ReapedAfterTTL(t *testing.T) {
 		ids[k] = id
 	}
 	// Only "gone" stops asking.
-	wr.tokens.ageKeyIssuedAt("gone", 2*time.Minute)
+	wr.tokens.mu.Lock()
+	if tok, ok := wr.tokens.byKey["gone"]; ok {
+		node := wr.tokens.entries[tok]
+		node.mu.Lock()
+		node.issuedAt = node.issuedAt.Add(-2 * time.Minute)
+		node.ttlKey = node.issuedAt
+		node.unseenKey = node.issuedAt
+		node.mu.Unlock()
+		wr.tokens.ttlHeap.fix(node)
+		wr.tokens.unseenHeap.fix(node)
+	}
+	wr.tokens.mu.Unlock()
 
 	wr.reap()
 
@@ -288,7 +299,7 @@ func TestPosition_DoesNotKeepAlive(t *testing.T) {
 	}
 }
 
-// ── Middleware: keyed requests ───────────────────────────────────────────────
+// Middleware: keyed requests
 
 // TestKeyedRequest_KeepsPlaceWithoutCookies: no Set-Cookie, the same place
 // across requests, a 503 with Retry-After and JSON, a status URL that
@@ -420,7 +431,7 @@ func TestKeyedRequest_LeaseHolderPassesWithoutASlot(t *testing.T) {
 	}
 }
 
-// ── Wait responses ───────────────────────────────────────────────────────────
+// Wait responses
 
 // TestWaitJSON_OffByDefault is the compatibility guarantee: without
 // SetWaitJSON, an API client still gets the waiting-room page.
@@ -531,7 +542,7 @@ func TestSetWaitResponder(t *testing.T) {
 	}
 }
 
-// ── Leases ───────────────────────────────────────────────────────────────────
+// Leases
 
 // TestAcquire_ExactlyCapSucceed is the PR's cap-25, 1,000-key case.
 func TestAcquire_ExactlyCapSucceed(t *testing.T) {
@@ -768,7 +779,7 @@ func TestLeaseTTL_ExpiresAndRenews(t *testing.T) {
 	assertAccounting(t, wr)
 }
 
-// ── Export / Import ──────────────────────────────────────────────────────────
+// Export / Import
 
 func TestExportImport_KeepsLeasesAndLineOrder(t *testing.T) {
 	a := newTestWR(t, 2)
@@ -859,7 +870,7 @@ func TestImport_RejectsBadKeyedData(t *testing.T) {
 	}
 }
 
-// ── net/http Handler ─────────────────────────────────────────────────────────
+// net/http Handler
 
 func TestHandler_ServesStatusRoutes(t *testing.T) {
 	wr := newTestWR(t, 1)
@@ -919,7 +930,14 @@ func TestHandler_ServesStatusRoutes(t *testing.T) {
 	}
 
 	// Let the rate limit pass without sleeping: move the last view back.
-	wr.tokens.ageIDViewedAt(id, 2*statusPollMinInterval)
+	wr.tokens.mu.RLock()
+	if tok, ok := wr.tokens.byID[id]; ok {
+		node := wr.tokens.entries[tok]
+		node.mu.Lock()
+		node.viewedAt = node.viewedAt.Add(-2 * statusPollMinInterval)
+		node.mu.Unlock()
+	}
+	wr.tokens.mu.RUnlock()
 
 	resp, body = get("/wait/queue/status/"+id, "text/html")
 	if resp.StatusCode != http.StatusOK || !strings.HasPrefix(resp.Header.Get("Content-Type"), "text/html") ||
@@ -957,7 +975,7 @@ func TestRegisterRoutes_TicketStatusRoute(t *testing.T) {
 	}
 }
 
-// ── Invariants under concurrency ─────────────────────────────────────────────
+// Invariants under concurrency
 
 // TestKeyed_ConcurrentMixKeepsAccounting runs Enter, Leave, Acquire,
 // Release, keyed requests and reaps together; afterwards every ticket is

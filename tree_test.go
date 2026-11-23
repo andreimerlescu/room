@@ -99,7 +99,7 @@ func assertStoreInvariants(t *testing.T, ts *tokenStore) {
 
 	// Verify place() matches 1..N in-order rank for every node.
 	var idx int64
-	ts.tree.walkInOrder(func(n *tokenNode, _ int64) {
+	ts.tree.walk(-1, func(n *tokenNode, _ int64) {
 		idx++
 		if p := ts.tree.place(n); p != idx {
 			t.Fatalf("node %q: place()=%d, want %d", n.token, p, idx)
@@ -107,10 +107,10 @@ func assertStoreInvariants(t *testing.T, ts *tokenStore) {
 	})
 
 	// Verify ttlHeap.
-	if len(ts.ttlHeap) != len(ts.entries) {
-		t.Fatalf("len(ttlHeap)=%d != len(entries)=%d", len(ts.ttlHeap), len(ts.entries))
+	if ts.ttlHeap.len() != len(ts.entries) {
+		t.Fatalf("ttlHeap.len()=%d != len(entries)=%d", ts.ttlHeap.len(), len(ts.entries))
 	}
-	for i, n := range ts.ttlHeap {
+	for i, n := range ts.ttlHeap.nodes {
 		if n.ttlHeapIdx != i {
 			t.Fatalf("ttlHeap[%d] (%q): ttlHeapIdx=%d", i, n.token, n.ttlHeapIdx)
 		}
@@ -119,14 +119,14 @@ func assertStoreInvariants(t *testing.T, ts *tokenStore) {
 		}
 		if i > 0 {
 			p := (i - 1) / 2
-			if n.ttlKey.Before(ts.ttlHeap[p].ttlKey) {
+			if n.ttlKey.Before(ts.ttlHeap.nodes[p].ttlKey) {
 				t.Fatalf("ttlHeap order violated at %d vs parent %d", i, p)
 			}
 		}
 	}
 
 	// Verify unseenHeap.
-	for i, n := range ts.unseenHeap {
+	for i, n := range ts.unseenHeap.nodes {
 		if n.unseenHeapIdx != i {
 			t.Fatalf("unseenHeap[%d] (%q): unseenHeapIdx=%d", i, n.token, n.unseenHeapIdx)
 		}
@@ -135,7 +135,7 @@ func assertStoreInvariants(t *testing.T, ts *tokenStore) {
 		}
 		if i > 0 {
 			p := (i - 1) / 2
-			if n.unseenKey.Before(ts.unseenHeap[p].unseenKey) {
+			if n.unseenKey.Before(ts.unseenHeap.nodes[p].unseenKey) {
 				t.Fatalf("unseenHeap order violated at %d vs parent %d", i, p)
 			}
 		}
@@ -356,7 +356,7 @@ func TestTree_DifferentialOracle(t *testing.T) {
 
 			// Verify ghostLedger exact contents.
 			sort.Slice(refGhosts, func(i, j int) bool { return refGhosts[i] < refGhosts[j] })
-			gotGhosts := wr.ledger.snapshot()
+			gotGhosts := ghostSnapshot(wr.ledger)
 			if len(gotGhosts) != len(refGhosts) {
 				t.Fatalf("step %d: ledger len=%d, want %d", step, len(gotGhosts), len(refGhosts))
 			}
@@ -536,7 +536,7 @@ func TestReap_LazyRekeyOverBatchSize(t *testing.T) {
 		t.Errorf("reap evicted active tokens during lazy rollover: len=%d, want %d", got, total)
 	}
 	wr.tokens.mu.RLock()
-	unseenLen := len(wr.tokens.unseenHeap)
+	unseenLen := wr.tokens.unseenHeap.len()
 	wr.tokens.mu.RUnlock()
 	if unseenLen != 0 {
 		t.Errorf("seen tokens were not drained from unseenHeap: len=%d, want 0", unseenLen)
@@ -576,8 +576,8 @@ func TestCompact_ReclaimsAfterSpike(t *testing.T) {
 		t.Fatalf("len=%d, want %d", wr.tokens.len(), keep)
 	}
 	wr.tokens.mu.RLock()
-	ttlCap := cap(wr.tokens.ttlHeap)
-	unseenCap := cap(wr.tokens.unseenHeap)
+	ttlCap := cap(wr.tokens.ttlHeap.nodes)
+	unseenCap := cap(wr.tokens.unseenHeap.nodes)
 	hw := wr.tokens.highWater
 	wr.tokens.mu.RUnlock()
 

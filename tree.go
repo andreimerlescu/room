@@ -1,50 +1,22 @@
 package room
 
 import (
-	"crypto/rand"
-	"encoding/binary"
-	"math"
+	"math/rand/v2"
 	"sync"
 	"time"
 )
 
-// splitMix64 is a lightweight, lock-free per-tree PRNG used solely for
-// randomized treap heap priorities so that monotonic ticket arrivals
-// (1, 2, 3, …) always produce O(log N) expected tree height.
-type splitMix64 uint64
-
-func newSplitMix64() splitMix64 {
-	var b [8]byte
-	if _, err := rand.Read(b[:]); err == nil {
-		return splitMix64(binary.LittleEndian.Uint64(b[:]))
-	}
-	return splitMix64(time.Now().UnixNano())
-}
-
-func (s *splitMix64) next() uint64 {
-	*s += 0x9e3779b97f4a7c15
-	z := uint64(*s)
-	z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9
-	z = (z ^ (z >> 27)) * 0x94d049bb133111eb
-	return z ^ (z >> 31)
-}
-
-// ── tokenNode & ticketTree ───────────────────────────────────────────────────
-
 // tokenNode is one live queued ticket inside tokenStore.
 //
 // Field ownership and lock hierarchy:
-//
-//   - Immutable fields (token, createdAt, clientKey, key, id): never change
-//     after insertion; safe to read under ts.mu.RLock or ts.mu.Lock.
+//   - Immutable fields (token, createdAt, clientKey, key, id) never change
+//     after insertion and are safe to read under ts.mu.RLock or ts.mu.Lock.
 //   - Tree fields (ticket, lazy, rank, maxRank, promoted, prio, size, parent,
 //     left, right) and intrusive heap fields (ttlKey, unseenKey, ttlHeapIdx,
-//     unseenHeapIdx): mutated ONLY under ts.mu.Lock. Read-only queries under
-//     ts.mu.RLock (effectiveTicket, place, firstN, walkInOrder) never mutate
-//     tree pointers or push down lazy deltas.
+//     unseenHeapIdx) are mutated only under ts.mu.Lock. Read-only queries under
+//     ts.mu.RLock never mutate pointers or push down lazy deltas.
 //   - Poll-mutable fields (issuedAt, lastPoll, cookieSetAt, viewedAt, seen,
-//     hasPass): guarded by mu, which is ALWAYS acquired AFTER ts.mu and is a
-//     leaf lock (never acquires any other lock).
+//     hasPass) are guarded by mu, a leaf lock always acquired after ts.mu.
 type tokenNode struct {
 	// Immutable identity fields.
 	token     string
@@ -53,7 +25,7 @@ type tokenNode struct {
 	key       string
 	id        string
 
-	// Tree-managed ordering & metadata fields (guarded by ts.mu).
+	// Tree ordering and metadata fields (guarded by ts.mu).
 	// Invariant: ticket already includes lazy; lazy is the pending delta
 	// owed to left and right subtrees only.
 	ticket   int64
@@ -70,10 +42,10 @@ type tokenNode struct {
 	// Intrusive expiry-heap fields (guarded by ts.mu.Lock).
 	ttlKey        time.Time
 	unseenKey     time.Time
-	ttlHeapIdx    int // -1 when not in ttlHeap
-	unseenHeapIdx int // -1 when not in unseenHeap
+	ttlHeapIdx    int // -1 when absent
+	unseenHeapIdx int // -1 when absent
 
-	// Poll-mutable fields (guarded by mu; always acquired after ts.mu).
+	// Poll-mutable fields (guarded by mu; leaf lock acquired after ts.mu).
 	mu          sync.Mutex
 	issuedAt    time.Time
 	lastPoll    time.Time
@@ -83,7 +55,7 @@ type tokenNode struct {
 	hasPass     bool
 }
 
-func newTokenNode(token string, e ticketEntry, prio uint64) *tokenNode {
+func newTokenNode(token string, e ticketEntry) *tokenNode {
 	return &tokenNode{
 		token:         token,
 		createdAt:     e.createdAt,
@@ -94,7 +66,7 @@ func newTokenNode(token string, e ticketEntry, prio uint64) *tokenNode {
 		rank:          e.rank,
 		maxRank:       e.rank,
 		promoted:      e.promoted,
-		prio:          prio,
+		prio:          rand.Uint64(),
 		size:          1,
 		ttlKey:        e.issuedAt,
 		unseenKey:     e.issuedAt,
@@ -109,9 +81,8 @@ func newTokenNode(token string, e ticketEntry, prio uint64) *tokenNode {
 	}
 }
 
-// toEntryMuLocked snapshots this node into a ticketEntry using the
-// already-resolved effectiveTicket. Caller holds ts.mu (RLock or Lock)
-// AND n.mu.
+// toEntryMuLocked snapshots this node into a ticketEntry using the resolved
+// effectiveTicket. Caller holds ts.mu (RLock or Lock) and n.mu.
 func (n *tokenNode) toEntryMuLocked(effectiveTicket int64) ticketEntry {
 	return ticketEntry{
 		ticket:      effectiveTicket,
@@ -130,7 +101,7 @@ func (n *tokenNode) toEntryMuLocked(effectiveTicket int64) ticketEntry {
 	}
 }
 
-// snapshotEntry acquires n.mu and returns a ticketEntry value copy.
+// snapshotEntry acquires n.mu and returns a value copy of this node.
 // Caller holds ts.mu (RLock or Lock).
 func (n *tokenNode) snapshotEntry(effectiveTicket int64) ticketEntry {
 	n.mu.Lock()
@@ -191,8 +162,8 @@ func (n *tokenNode) detach() {
 	n.maxRank = n.rank
 }
 
-// lessTicketKey defines the exact line order matching lessQueued:
-// ticket number ascending, then createdAt ascending, then token ascending.
+// lessTicketKey defines the total line order: ticket number ascending, then
+// issue time ascending, then token ascending.
 func lessTicketKey(tA int64, cA time.Time, tokA string, tB int64, cB time.Time, tokB string) bool {
 	if tA != tB {
 		return tA < tB
@@ -208,15 +179,6 @@ func lessTicketKey(tA int64, cA time.Time, tokA string, tB int64, cB time.Time, 
 // parent pointers, and lazy ticket range-add.
 type ticketTree struct {
 	root *tokenNode
-	rng  splitMix64
-}
-
-func newTicketTree() ticketTree {
-	return ticketTree{rng: newSplitMix64()}
-}
-
-func (t *ticketTree) nextPrio() uint64 {
-	return t.rng.next()
 }
 
 func (t *ticketTree) len() int {
@@ -227,7 +189,7 @@ func (t *ticketTree) len() int {
 }
 
 // effectiveTicket returns n's true ticket number without mutating the tree.
-// Safe under ts.mu.RLock. When hasLazy is false, runs in O(1).
+// Safe under ts.mu.RLock; O(1) when hasLazy is false, O(log N) otherwise.
 func effectiveTicket(n *tokenNode, hasLazy bool) int64 {
 	v := n.ticket
 	if !hasLazy {
@@ -240,7 +202,7 @@ func effectiveTicket(n *tokenNode, hasLazy bool) int64 {
 }
 
 // place returns n's 1-based place in line order without mutating the tree.
-// Safe under ts.mu.RLock; runs in O(log N).
+// Safe under ts.mu.RLock; O(log N).
 func (t *ticketTree) place(n *tokenNode) int64 {
 	if n == nil {
 		return 0
@@ -262,7 +224,6 @@ func (t *ticketTree) place(n *tokenNode) int64 {
 }
 
 // setRank updates n.rank and propagates maxRank up to the root in O(log N).
-// Caller holds ts.mu.Lock.
 func (t *ticketTree) setRank(n *tokenNode, rank int) {
 	n.rank = rank
 	for cur := n; cur != nil; cur = cur.parent {
@@ -271,7 +232,6 @@ func (t *ticketTree) setRank(n *tokenNode, rank int) {
 }
 
 // insert places a detached node into the treap in O(log N).
-// Caller holds ts.mu.Lock.
 func (t *ticketTree) insert(n *tokenNode) {
 	n.detach()
 	t.root = ticketInsertNode(t.root, n)
@@ -286,8 +246,7 @@ func ticketInsertNode(root, n *tokenNode) *tokenNode {
 }
 
 // delete removes n from the treap in O(log N) and detaches it with its
-// exact effective ticket materialized in n.ticket (n.lazy == 0).
-// Caller holds ts.mu.Lock.
+// effective ticket materialized in n.ticket.
 func (t *ticketTree) delete(n *tokenNode) {
 	eff := effectiveTicket(n, true)
 	left, midRight := splitByKey(t.root, eff, n.createdAt, n.token, false)
@@ -300,54 +259,33 @@ func (t *ticketTree) delete(n *tokenNode) {
 	n.detach()
 }
 
-// splitByKey splits root by full key (ticket, createdAt, token).
-// If inclusive is true, left contains keys <= target; otherwise keys < target.
-func splitByKey(n *tokenNode, ticket int64, createdAt time.Time, token string, inclusive bool) (l, r *tokenNode) {
-	if n == nil {
-		return nil, nil
-	}
-	n.pushDown()
-	var goLeft bool
-	if inclusive {
-		goLeft = !lessTicketKey(ticket, createdAt, token, n.ticket, n.createdAt, n.token)
-	} else {
-		goLeft = lessTicketKey(n.ticket, n.createdAt, n.token, ticket, createdAt, token)
-	}
-	if goLeft {
-		l, r = splitByKey(n.right, ticket, createdAt, token, inclusive)
-		n.right = l
-		n.pullUp()
-		if r != nil {
-			r.parent = nil
-		}
-		n.parent = nil
-		return n, r
-	}
-	l, r = splitByKey(n.left, ticket, createdAt, token, inclusive)
-	n.left = r
-	n.pullUp()
-	if l != nil {
-		l.parent = nil
-	}
-	n.parent = nil
-	return l, n
+func splitByTicket(n *tokenNode, limit int64, inclusive bool) (l, r *tokenNode) {
+	return splitTree(n, limit, time.Time{}, "", false, inclusive)
 }
 
-// splitByTicket splits root by ticket number alone.
-// If inclusive is true, left contains ticket <= limit; otherwise ticket < limit.
-func splitByTicket(n *tokenNode, limit int64, inclusive bool) (l, r *tokenNode) {
+func splitByKey(n *tokenNode, ticket int64, createdAt time.Time, token string, inclusive bool) (l, r *tokenNode) {
+	return splitTree(n, ticket, createdAt, token, true, inclusive)
+}
+
+func splitTree(n *tokenNode, ticket int64, createdAt time.Time, token string, fullKey, inclusive bool) (l, r *tokenNode) {
 	if n == nil {
 		return nil, nil
 	}
 	n.pushDown()
 	var goLeft bool
-	if inclusive {
-		goLeft = n.ticket <= limit
+	if fullKey {
+		if inclusive {
+			goLeft = !lessTicketKey(ticket, createdAt, token, n.ticket, n.createdAt, n.token)
+		} else {
+			goLeft = lessTicketKey(n.ticket, n.createdAt, n.token, ticket, createdAt, token)
+		}
+	} else if inclusive {
+		goLeft = n.ticket <= ticket
 	} else {
-		goLeft = n.ticket < limit
+		goLeft = n.ticket < ticket
 	}
 	if goLeft {
-		l, r = splitByTicket(n.right, limit, inclusive)
+		l, r = splitTree(n.right, ticket, createdAt, token, fullKey, inclusive)
 		n.right = l
 		n.pullUp()
 		if r != nil {
@@ -356,7 +294,7 @@ func splitByTicket(n *tokenNode, limit int64, inclusive bool) (l, r *tokenNode) 
 		n.parent = nil
 		return n, r
 	}
-	l, r = splitByTicket(n.left, limit, inclusive)
+	l, r = splitTree(n.left, ticket, createdAt, token, fullKey, inclusive)
 	n.left = r
 	n.pullUp()
 	if l != nil {
@@ -391,29 +329,13 @@ func ticketMerge(a, b *tokenNode) *tokenNode {
 	return b
 }
 
-// leftmostTicket returns the minimum effective ticket in subtree n (pushing
-// lazy deltas along the left spine). Caller holds ts.mu.Lock.
-func leftmostTicket(n *tokenNode) (int64, bool) {
-	if n == nil {
-		return 0, false
-	}
-	cur := n
-	for cur.left != nil {
-		cur.pushDown()
-		cur = cur.left
-	}
-	cur.pushDown()
-	return cur.ticket, true
-}
-
-// maxTicketWithRankAtLeast returns the maximum ticket in subtree n whose
-// node has rank >= minRank, in O(log N). Caller holds ts.mu.Lock.
+// maxTicketWithRankAtLeast returns the maximum ticket in subtree n whose node
+// has rank >= minRank, in O(log N).
 func maxTicketWithRankAtLeast(n *tokenNode, minRank int) (int64, bool) {
 	if n == nil || n.maxRank < minRank {
 		return 0, false
 	}
-	cur := n
-	for cur != nil {
+	for cur := n; cur != nil; {
 		cur.pushDown()
 		if cur.right != nil && cur.right.maxRank >= minRank {
 			cur = cur.right
@@ -427,9 +349,9 @@ func maxTicketWithRankAtLeast(n *tokenNode, minRank int) (int64, bool) {
 }
 
 // mergeWithBoundaryTie merges toShift (tickets <= boundary) and rest
-// (tickets >= boundary). When rest has promoted tie(s) sitting at ticket ==
-// boundary, the two tie groups at boundary are merged by full
-// (ticket, createdAt, token) key so secondary tie-breaker order stays exact.
+// (tickets >= boundary). When rest contains promoted tie(s) at ticket ==
+// boundary, the two tie groups are merged by full (ticket, createdAt, token)
+// order so BST tie-breaker invariants remain exact.
 func mergeWithBoundaryTie(toShift, rest *tokenNode, boundary int64) *tokenNode {
 	if toShift == nil {
 		return rest
@@ -437,8 +359,13 @@ func mergeWithBoundaryTie(toShift, rest *tokenNode, boundary int64) *tokenNode {
 	if rest == nil {
 		return toShift
 	}
-	minRest, ok := leftmostTicket(rest)
-	if !ok || minRest > boundary {
+	cur := rest
+	for cur.left != nil {
+		cur.pushDown()
+		cur = cur.left
+	}
+	cur.pushDown()
+	if cur.ticket > boundary {
 		return ticketMerge(toShift, rest)
 	}
 	shiftBelow, shiftAt := splitByTicket(toShift, boundary, false)
@@ -446,31 +373,16 @@ func mergeWithBoundaryTie(toShift, rest *tokenNode, boundary int64) *tokenNode {
 		return ticketMerge(shiftBelow, rest)
 	}
 	restAt, restAbove := splitByTicket(rest, boundary, true)
-	mergedAt := mergeTieSubtrees(shiftAt, restAt)
-	return ticketMerge(ticketMerge(shiftBelow, mergedAt), restAbove)
-}
-
-// mergeTieSubtrees inserts every node from the smaller subtree into the
-// larger subtree using full key ordering. Both subtrees share one ticket
-// number (almost always 1–2 nodes).
-func mergeTieSubtrees(a, b *tokenNode) *tokenNode {
-	if a == nil {
-		return b
+	if shiftAt.size > restAt.size {
+		shiftAt, restAt = restAt, shiftAt
 	}
-	if b == nil {
-		return a
-	}
-	if a.size > b.size {
-		a, b = b, a
-	}
-	// Collect detached nodes from the smaller subtree a, then insert into b.
-	nodes := make([]*tokenNode, 0, a.size)
-	collectDetached(a, &nodes)
-	res := b
+	nodes := make([]*tokenNode, 0, shiftAt.size)
+	collectDetached(shiftAt, &nodes)
+	mergedAt := restAt
 	for _, n := range nodes {
-		res = ticketInsertNode(res, n)
+		mergedAt = ticketInsertNode(mergedAt, n)
 	}
-	return res
+	return ticketMerge(ticketMerge(shiftBelow, mergedAt), restAbove)
 }
 
 func collectDetached(n *tokenNode, out *[]*tokenNode) {
@@ -485,234 +397,30 @@ func collectDetached(n *tokenNode, out *[]*tokenNode) {
 	collectDetached(r, out)
 }
 
-// firstN invokes visit on the first limit nodes in line order, passing each
-// node's effective ticket. Read-only; safe under ts.mu.RLock; O(log N + limit).
-func (t *ticketTree) firstN(limit int, visit func(n *tokenNode, effTicket int64)) {
-	if limit <= 0 || t.root == nil {
+// walk visits up to limit nodes in line order (limit < 0 visits all), passing
+// each node's effective ticket. Read-only; safe under ts.mu.RLock.
+func (t *ticketTree) walk(limit int, visit func(n *tokenNode, effTicket int64)) {
+	if limit == 0 || t.root == nil {
 		return
 	}
 	count := 0
-	walkPrefix(t.root, 0, limit, &count, visit)
+	walkNodes(t.root, 0, limit, &count, visit)
 }
 
-func walkPrefix(n *tokenNode, accLazy int64, limit int, count *int, visit func(*tokenNode, int64)) {
-	if n == nil || *count >= limit {
+func walkNodes(n *tokenNode, accLazy int64, limit int, count *int, visit func(*tokenNode, int64)) {
+	if n == nil || (limit > 0 && *count >= limit) {
 		return
 	}
 	eff := n.ticket + accLazy
 	childLazy := accLazy + n.lazy
-	walkPrefix(n.left, childLazy, limit, count, visit)
-	if *count >= limit {
+	walkNodes(n.left, childLazy, limit, count, visit)
+	if limit > 0 && *count >= limit {
 		return
 	}
 	visit(n, eff)
 	*count++
-	if *count >= limit {
+	if limit > 0 && *count >= limit {
 		return
 	}
-	walkPrefix(n.right, childLazy, limit, count, visit)
-}
-
-// walkInOrder invokes visit on every node in line order. Read-only; safe under
-// ts.mu.RLock; O(N).
-func (t *ticketTree) walkInOrder(visit func(n *tokenNode, effTicket int64)) {
-	if t.root == nil {
-		return
-	}
-	walkAll(t.root, 0, visit)
-}
-
-func walkAll(n *tokenNode, accLazy int64, visit func(*tokenNode, int64)) {
-	if n == nil {
-		return
-	}
-	eff := n.ticket + accLazy
-	childLazy := accLazy + n.lazy
-	walkAll(n.left, childLazy, visit)
-	visit(n, eff)
-	walkAll(n.right, childLazy, visit)
-}
-
-// ── ghostNode & ghostTree ────────────────────────────────────────────────────
-
-// ghostNode is one retired ticket number inside ghostLedger. Duplicates are
-// permitted (matching ghostLedger's contract).
-type ghostNode struct {
-	ticket int64
-	lazy   int64
-	prio   uint64
-	size   int64
-	left   *ghostNode
-	right  *ghostNode
-}
-
-func (n *ghostNode) applyDelta(d int64) {
-	if n == nil || d == 0 {
-		return
-	}
-	n.ticket += d
-	n.lazy += d
-}
-
-func (n *ghostNode) pushDown() {
-	if n == nil || n.lazy == 0 {
-		return
-	}
-	d := n.lazy
-	n.lazy = 0
-	if n.left != nil {
-		n.left.applyDelta(d)
-	}
-	if n.right != nil {
-		n.right.applyDelta(d)
-	}
-}
-
-func (n *ghostNode) pullUp() {
-	s := int64(1)
-	if n.left != nil {
-		s += n.left.size
-	}
-	if n.right != nil {
-		s += n.right.size
-	}
-	n.size = s
-}
-
-func ghostSize(n *ghostNode) int64 {
-	if n == nil {
-		return 0
-	}
-	return n.size
-}
-
-// ghostTree is a randomized order-statistic treap for ghostLedger with O(log G)
-// insert, consumeUpTo, countBelow, and shiftRange.
-type ghostTree struct {
-	root *ghostNode
-	rng  splitMix64
-}
-
-func newGhostTree() ghostTree {
-	return ghostTree{rng: newSplitMix64()}
-}
-
-func (g *ghostTree) add(ticket int64) {
-	node := &ghostNode{ticket: ticket, prio: g.rng.next(), size: 1}
-	left, right := ghostSplit(g.root, ticket, true)
-	g.root = ghostMerge(ghostMerge(left, node), right)
-}
-
-func (g *ghostTree) consumeUpTo(limit int64) int64 {
-	consumed, rest := ghostSplit(g.root, limit, true)
-	if consumed == nil {
-		return 0
-	}
-	g.root = rest
-	return consumed.size
-}
-
-func (g *ghostTree) countBelow(ticket int64) int64 {
-	var count int64
-	var accLazy int64
-	for cur := g.root; cur != nil; {
-		eff := cur.ticket + accLazy
-		childLazy := accLazy + cur.lazy
-		if eff < ticket {
-			count += ghostSize(cur.left) + 1
-			cur = cur.right
-		} else {
-			cur = cur.left
-		}
-		accLazy = childLazy
-	}
-	return count
-}
-
-func (g *ghostTree) shiftRange(lo, hi int64) {
-	if g.root == nil || lo >= hi {
-		return
-	}
-	a, bc := ghostSplit(g.root, lo, false)
-	b, c := ghostSplit(bc, hi, false)
-	if b != nil {
-		b.applyDelta(1)
-	}
-	g.root = ghostMerge(ghostMerge(a, b), c)
-}
-
-func (g *ghostTree) minTicket() int64 {
-	if g.root == nil {
-		return math.MaxInt64
-	}
-	var accLazy int64
-	cur := g.root
-	for cur.left != nil {
-		accLazy += cur.lazy
-		cur = cur.left
-	}
-	return cur.ticket + accLazy
-}
-
-func (g *ghostTree) snapshot() []int64 {
-	n := ghostSize(g.root)
-	if n == 0 {
-		return nil
-	}
-	out := make([]int64, 0, n)
-	var walk func(node *ghostNode, accLazy int64)
-	walk = func(node *ghostNode, accLazy int64) {
-		if node == nil {
-			return
-		}
-		eff := node.ticket + accLazy
-		childLazy := accLazy + node.lazy
-		walk(node.left, childLazy)
-		out = append(out, eff)
-		walk(node.right, childLazy)
-	}
-	walk(g.root, 0)
-	return out
-}
-
-func ghostSplit(n *ghostNode, limit int64, inclusive bool) (l, r *ghostNode) {
-	if n == nil {
-		return nil, nil
-	}
-	n.pushDown()
-	var goLeft bool
-	if inclusive {
-		goLeft = n.ticket <= limit
-	} else {
-		goLeft = n.ticket < limit
-	}
-	if goLeft {
-		l, r = ghostSplit(n.right, limit, inclusive)
-		n.right = l
-		n.pullUp()
-		return n, r
-	}
-	l, r = ghostSplit(n.left, limit, inclusive)
-	n.left = r
-	n.pullUp()
-	return l, n
-}
-
-func ghostMerge(a, b *ghostNode) *ghostNode {
-	if a == nil {
-		return b
-	}
-	if b == nil {
-		return a
-	}
-	if a.prio > b.prio {
-		a.pushDown()
-		a.right = ghostMerge(a.right, b)
-		a.pullUp()
-		return a
-	}
-	b.pushDown()
-	b.left = ghostMerge(a, b.left)
-	b.pullUp()
-	return b
+	walkNodes(n.right, childLazy, limit, count, visit)
 }
