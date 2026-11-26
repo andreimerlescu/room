@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -299,6 +300,290 @@ func TestImport_DowntimeNotCharged(t *testing.T) {
 	if _, ok := b.Ticket("tok"); !ok {
 		t.Error("downtime was charged: the restored ticket was reaped")
 	}
+}
+
+func TestImport_DropsStaleIdleAndReadyGrace(t *testing.T) {
+	t.Parallel()
+
+	newClockWR := func(t *testing.T, cap int32, start time.Time) (*WaitingRoom, *atomic.Int64) {
+		t.Helper()
+		var ns atomic.Int64
+		ns.Store(start.UnixNano())
+		wr := &WaitingRoom{
+			nowFn: func() time.Time { return time.Unix(0, ns.Load()).UTC() },
+		}
+		if err := wr.Init(cap); err != nil {
+			t.Fatalf("Init(%d): %v", cap, err)
+		}
+		t.Cleanup(wr.Stop)
+		if err := wr.SetReaperInterval(time.Hour); err != nil {
+			t.Fatalf("SetReaperInterval: %v", err)
+		}
+		return wr, &ns
+	}
+
+	t.Run("ImportDropsStaleAndShiftsReadyAt", func(t *testing.T) {
+		t.Parallel()
+		exportedAt := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+		downtime := 10 * time.Minute
+		importedAt := exportedAt.Add(downtime)
+
+		f := persistFile{
+			Version:    persistFormatVersion,
+			ExportedAt: exportedAt,
+			Tickets: []persistedTicket{
+				{
+					Token:     "idle-expired",
+					CreatedAt: exportedAt.Add(-time.Minute),
+					LastSeen:  exportedAt.Add(-31 * time.Second), // > 30s IdlePollTTL, < 5m TokenTTL
+					Seen:      true,
+				},
+				{
+					Token:     "idle-ok",
+					CreatedAt: exportedAt.Add(-time.Minute),
+					LastSeen:  exportedAt.Add(-20 * time.Second), // <= 30s IdlePollTTL
+					Seen:      true,
+				},
+				{
+					Token:     "ready-expired",
+					CreatedAt: exportedAt.Add(-time.Minute),
+					LastSeen:  exportedAt.Add(-5 * time.Second),
+					ReadyAt:   exportedAt.Add(-16 * time.Second), // > 15s ReadyGrace
+					Seen:      true,
+				},
+				{
+					Token:     "ready-ok",
+					CreatedAt: exportedAt.Add(-time.Minute),
+					LastSeen:  exportedAt.Add(-5 * time.Second),
+					ReadyAt:   exportedAt.Add(-10 * time.Second), // <= 15s ReadyGrace
+					Seen:      true,
+				},
+				{
+					Token:          "ready-skip",
+					CreatedAt:      exportedAt.Add(-time.Minute),
+					LastSeen:       exportedAt.Add(-5 * time.Second),
+					ReadyAt:        exportedAt.Add(-25 * time.Second), // > 15s ReadyGrace, but SkipReadyGrace=true
+					SkipReadyGrace: true,
+					Seen:           true,
+				},
+				{
+					Token:     "ready-zero",
+					CreatedAt: exportedAt.Add(-time.Minute),
+					LastSeen:  exportedAt.Add(-5 * time.Second),
+					Seen:      true,
+				},
+			},
+		}
+
+		b, bClock := newClockWR(t, 5, importedAt)
+		if err := b.SetIdlePollTTL(30 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.SetReadyGrace(15 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+
+		stats, err := b.Import(encodeFile(t, f))
+		if err != nil {
+			t.Fatalf("Import: %v", err)
+		}
+		if stats.Restored != 4 || stats.DroppedStale != 2 {
+			t.Fatalf("stats = %+v, want Restored=4 DroppedStale=2", stats)
+		}
+
+		wantPresent := map[string]bool{
+			"idle-expired":  false,
+			"ready-expired": false,
+			"idle-ok":       true,
+			"ready-ok":      true,
+			"ready-skip":    true,
+			"ready-zero":    true,
+		}
+		for tok, want := range wantPresent {
+			if _, ok := b.Ticket(tok); ok != want {
+				t.Errorf("%s: present=%v, want %v", tok, ok, want)
+			}
+		}
+
+		readyOK, ok := b.Ticket("ready-ok")
+		if !ok {
+			t.Fatal("ready-ok missing")
+		}
+		wantReadyAt := importedAt.Add(-10 * time.Second)
+		if !readyOK.ReadyAt.Equal(wantReadyAt) {
+			t.Errorf("ready-ok.ReadyAt = %v, want %v (shifted by downtime)", readyOK.ReadyAt, wantReadyAt)
+		}
+
+		readySkipEntry, ok := b.tokens.get("ready-skip")
+		if !ok {
+			t.Fatal("ready-skip missing")
+		}
+		if !readySkipEntry.skipReadyGrace {
+			t.Error("ready-skip did not preserve skipReadyGrace=true")
+		}
+		if want := importedAt.Add(-25 * time.Second); !readySkipEntry.readyAt.Equal(want) {
+			t.Errorf("ready-skip.readyAt = %v, want %v", readySkipEntry.readyAt, want)
+		}
+
+		readyZero, ok := b.Ticket("ready-zero")
+		if !ok {
+			t.Fatal("ready-zero missing")
+		}
+		if !readyZero.ReadyAt.IsZero() {
+			t.Errorf("ready-zero.ReadyAt = %v, want zero", readyZero.ReadyAt)
+		}
+
+		// Reaping right after import keeps all 4 restored tickets: downtime
+		// was not charged against ReadyGrace or IdlePollTTL, and ready-skip
+		// is exempt from ReadyGrace.
+		b.reap()
+		for _, tok := range []string{"idle-ok", "ready-ok", "ready-skip", "ready-zero"} {
+			if _, ok := b.Ticket(tok); !ok {
+				t.Errorf("ticket %q was unexpectedly reaped immediately after import", tok)
+			}
+		}
+
+		// Advancing 6s pushes ready-ok to 16s past its shifted ReadyAt (> 15s),
+		// while ready-skip remains exempt.
+		bClock.Store(importedAt.Add(6 * time.Second).UnixNano())
+		b.reap()
+		if _, ok := b.Ticket("ready-ok"); ok {
+			t.Error("ready-ok should have been evicted once remaining ReadyGrace elapsed")
+		}
+		if _, ok := b.Ticket("ready-skip"); !ok {
+			t.Error("ready-skip must remain exempt from ReadyGrace after import")
+		}
+	})
+
+	t.Run("RoundTripExportImportRestoresShiftedReadyAtAndSkipFlag", func(t *testing.T) {
+		t.Parallel()
+		t0 := time.Date(2026, 6, 1, 14, 0, 0, 0, time.UTC)
+
+		a, aClock := newClockWR(t, 3, t0)
+		if err := a.SetIdlePollTTL(30 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if err := a.SetReadyGrace(15 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+
+		ra := gin.New()
+		a.RegisterRoutes(ra)
+		ra.GET("/", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+		// Ticket 1: in-window cookie ticket; poll at t0+5s stamps readyAt = t0+5s.
+		a.tokens.set("rt-ready", ticketEntry{
+			ticket:    1,
+			createdAt: t0,
+			issuedAt:  t0,
+			seen:      true,
+		})
+		// Ticket 2: skipReadyGrace=true with readyAt older than ReadyGrace.
+		a.tokens.set("rt-skip", ticketEntry{
+			ticket:         2,
+			createdAt:      t0.Add(-20 * time.Second),
+			issuedAt:       t0.Add(5 * time.Second),
+			readyAt:        t0.Add(-20 * time.Second),
+			skipReadyGrace: true,
+			seen:           true,
+		})
+		// Ticket 3: ready past ReadyGrace at export time -> dropped on import.
+		a.tokens.set("rt-ready-stale", ticketEntry{
+			ticket:    3,
+			createdAt: t0.Add(-20 * time.Second),
+			issuedAt:  t0.Add(5 * time.Second),
+			readyAt:   t0.Add(-15 * time.Second),
+			seen:      true,
+		})
+		// Ticket 4: idle past IdlePollTTL at export time -> dropped on import.
+		a.tokens.set("rt-idle-stale", ticketEntry{
+			ticket:    4,
+			createdAt: t0.Add(-30 * time.Second),
+			issuedAt:  t0.Add(-25 * time.Second),
+			seen:      true,
+		})
+		a.nextTicket.Store(4)
+
+		aClock.Store(t0.Add(5 * time.Second).UnixNano())
+		if resp := pollStatus(ra, "rt-ready"); !resp.Ready {
+			t.Fatalf("expected rt-ready to be ready on poll, got %+v", resp)
+		}
+
+		// Export at t0+10s using wr.now():
+		//   rt-ready:       readyAt = t0+5s  (5s old <= 15s) -> kept
+		//   rt-skip:        readyAt = t0-20s (30s old, skip) -> kept
+		//   rt-ready-stale: readyAt = t0-15s (25s old > 15s) -> dropped
+		//   rt-idle-stale:  lastSeen = t0-25s (35s old > 30s) -> dropped
+		tExport := t0.Add(10 * time.Second)
+		aClock.Store(tExport.UnixNano())
+		buf := exportRoom(t, a)
+
+		// Verify exported JSON contains ready_at and skip_ready_grace.
+		var decoded persistFile
+		if err := json.Unmarshal(buf.Bytes(), &decoded); err != nil {
+			t.Fatalf("unmarshal exported JSON: %v", err)
+		}
+		if !decoded.ExportedAt.Equal(tExport) {
+			t.Errorf("ExportedAt = %v, want %v (Export must use wr.now())", decoded.ExportedAt, tExport)
+		}
+
+		// Import into room b after 12 minutes of downtime.
+		downtime := 12 * time.Minute
+		tImport := tExport.Add(downtime)
+		b, bClock := newClockWR(t, 3, tImport)
+		if err := b.SetIdlePollTTL(30 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+		if err := b.SetReadyGrace(15 * time.Second); err != nil {
+			t.Fatal(err)
+		}
+
+		stats, err := b.Import(buf)
+		if err != nil {
+			t.Fatalf("Import: %v", err)
+		}
+		if stats.Restored != 2 || stats.DroppedStale != 2 {
+			t.Fatalf("round-trip stats = %+v, want Restored=2 DroppedStale=2", stats)
+		}
+
+		ti, ok := b.Ticket("rt-ready")
+		if !ok {
+			t.Fatal("rt-ready not restored")
+		}
+		wantReadyAt := tImport.Add(-5 * time.Second)
+		if !ti.ReadyAt.Equal(wantReadyAt) {
+			t.Errorf("rt-ready.ReadyAt = %v, want %v", ti.ReadyAt, wantReadyAt)
+		}
+
+		skipEntry, ok := b.tokens.get("rt-skip")
+		if !ok {
+			t.Fatal("rt-skip not restored")
+		}
+		if !skipEntry.skipReadyGrace {
+			t.Error("rt-skip lost skipReadyGrace across Export->Import")
+		}
+		if _, ok := b.Ticket("rt-ready-stale"); ok {
+			t.Error("rt-ready-stale should have been dropped")
+		}
+		if _, ok := b.Ticket("rt-idle-stale"); ok {
+			t.Error("rt-idle-stale should have been dropped")
+		}
+
+		// At tImport, rt-ready has 10s of ReadyGrace left.
+		b.reap()
+		if _, ok := b.Ticket("rt-ready"); !ok {
+			t.Error("rt-ready evicted too early after round-trip import")
+		}
+		// At tImport+11s (16s after shifted readyAt), rt-ready is evicted while rt-skip survives.
+		bClock.Store(tImport.Add(11 * time.Second).UnixNano())
+		b.reap()
+		if _, ok := b.Ticket("rt-ready"); ok {
+			t.Error("rt-ready should be evicted after remaining ReadyGrace expires")
+		}
+		if _, ok := b.Ticket("rt-skip"); !ok {
+			t.Error("rt-skip must survive ReadyGrace eviction after round-trip import")
+		}
+	})
 }
 
 func TestImport_PassesKeepAbsoluteExpiry(t *testing.T) {

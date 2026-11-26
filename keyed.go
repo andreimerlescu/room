@@ -74,13 +74,15 @@ func (wr *WaitingRoom) enterLine(key string, now time.Time) (keyedEntry, error) 
 	if k := wr.tokens.enterKey(key, "", ticketEntry{}, nil, now); k.token != "" {
 		return k, nil
 	}
-	if max, full := wr.queueFull(); full {
+	if max, full := wr.queueFullWithReap(now); full {
+		wr.emit(EventReject, wr.snapshotForKey(EventReject, key))
 		return keyedEntry{}, ErrQueueFull{Max: max}
 	}
 	token, fresh, err := wr.newKeyedEntry(key, now)
 	if err != nil {
 		return keyedEntry{}, err
 	}
+	fresh.skipReadyGrace = true
 	k := wr.tokens.enterKey(key, token, fresh, wr.reserveTicket, now)
 	if !k.created {
 		return k, nil
@@ -109,7 +111,7 @@ func (wr *WaitingRoom) Enter(key string) (ticket string, position int64, err err
 	if _, held := wr.leases[key]; held {
 		return "", 0, ErrLeaseHeld{}
 	}
-	k, err := wr.enterLine(key, time.Now())
+	k, err := wr.enterLine(key, wr.now())
 	if err != nil {
 		return "", 0, err
 	}

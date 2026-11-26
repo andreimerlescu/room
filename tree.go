@@ -9,21 +9,23 @@ import (
 // tokenNode is one live queued ticket inside tokenStore.
 //
 // Field ownership and lock hierarchy:
-//   - Immutable fields (token, createdAt, clientKey, key, id) never change
-//     after insertion and are safe to read under ts.mu.RLock or ts.mu.Lock.
+//   - Immutable fields (token, createdAt, clientKey, key, id, skipReadyGrace)
+//     never change after insertion and are safe to read under ts.mu.RLock or
+//     ts.mu.Lock.
 //   - Tree fields (ticket, lazy, rank, maxRank, promoted, prio, size, parent,
 //     left, right) and intrusive heap fields (ttlKey, unseenKey, ttlHeapIdx,
 //     unseenHeapIdx) are mutated only under ts.mu.Lock. Read-only queries under
 //     ts.mu.RLock never mutate pointers or push down lazy deltas.
-//   - Poll-mutable fields (issuedAt, lastPoll, cookieSetAt, viewedAt, seen,
-//     hasPass) are guarded by mu, a leaf lock always acquired after ts.mu.
+//   - Poll-mutable fields (issuedAt, lastPoll, readyAt, cookieSetAt, viewedAt,
+//     seen, hasPass) are guarded by mu, a leaf lock always acquired after ts.mu.
 type tokenNode struct {
 	// Immutable identity fields.
-	token     string
-	createdAt time.Time
-	clientKey string
-	key       string
-	id        string
+	token          string
+	createdAt      time.Time
+	clientKey      string
+	key            string
+	id             string
+	skipReadyGrace bool
 
 	// Tree ordering and metadata fields (guarded by ts.mu).
 	// Invariant: ticket already includes lazy; lazy is the pending delta
@@ -49,6 +51,7 @@ type tokenNode struct {
 	mu          sync.Mutex
 	issuedAt    time.Time
 	lastPoll    time.Time
+	readyAt     time.Time
 	cookieSetAt time.Time
 	viewedAt    time.Time
 	seen        bool
@@ -57,27 +60,29 @@ type tokenNode struct {
 
 func newTokenNode(token string, e ticketEntry) *tokenNode {
 	return &tokenNode{
-		token:         token,
-		createdAt:     e.createdAt,
-		clientKey:     e.clientKey,
-		key:           e.key,
-		id:            e.id,
-		ticket:        e.ticket,
-		rank:          e.rank,
-		maxRank:       e.rank,
-		promoted:      e.promoted,
-		prio:          rand.Uint64(),
-		size:          1,
-		ttlKey:        e.issuedAt,
-		unseenKey:     e.issuedAt,
-		ttlHeapIdx:    -1,
-		unseenHeapIdx: -1,
-		issuedAt:      e.issuedAt,
-		lastPoll:      e.lastPoll,
-		cookieSetAt:   e.cookieSetAt,
-		viewedAt:      e.viewedAt,
-		seen:          e.seen,
-		hasPass:       e.hasPass,
+		token:          token,
+		createdAt:      e.createdAt,
+		clientKey:      e.clientKey,
+		key:            e.key,
+		id:             e.id,
+		skipReadyGrace: e.skipReadyGrace,
+		ticket:         e.ticket,
+		rank:           e.rank,
+		maxRank:        e.rank,
+		promoted:       e.promoted,
+		prio:           rand.Uint64(),
+		size:           1,
+		ttlKey:         e.issuedAt,
+		unseenKey:      e.issuedAt,
+		ttlHeapIdx:     -1,
+		unseenHeapIdx:  -1,
+		issuedAt:       e.issuedAt,
+		lastPoll:       e.lastPoll,
+		readyAt:        e.readyAt,
+		cookieSetAt:    e.cookieSetAt,
+		viewedAt:       e.viewedAt,
+		seen:           e.seen,
+		hasPass:        e.hasPass,
 	}
 }
 
@@ -85,19 +90,21 @@ func newTokenNode(token string, e ticketEntry) *tokenNode {
 // effectiveTicket. Caller holds ts.mu (RLock or Lock) and n.mu.
 func (n *tokenNode) toEntryMuLocked(effectiveTicket int64) ticketEntry {
 	return ticketEntry{
-		ticket:      effectiveTicket,
-		createdAt:   n.createdAt,
-		issuedAt:    n.issuedAt,
-		lastPoll:    n.lastPoll,
-		cookieSetAt: n.cookieSetAt,
-		clientKey:   n.clientKey,
-		seen:        n.seen,
-		promoted:    n.promoted,
-		hasPass:     n.hasPass,
-		rank:        n.rank,
-		key:         n.key,
-		id:          n.id,
-		viewedAt:    n.viewedAt,
+		ticket:         effectiveTicket,
+		createdAt:      n.createdAt,
+		issuedAt:       n.issuedAt,
+		lastPoll:       n.lastPoll,
+		readyAt:        n.readyAt,
+		cookieSetAt:    n.cookieSetAt,
+		clientKey:      n.clientKey,
+		seen:           n.seen,
+		promoted:       n.promoted,
+		hasPass:        n.hasPass,
+		skipReadyGrace: n.skipReadyGrace,
+		rank:           n.rank,
+		key:            n.key,
+		id:             n.id,
+		viewedAt:       n.viewedAt,
 	}
 }
 
@@ -423,4 +430,29 @@ func walkNodes(n *tokenNode, accLazy int64, limit int, count *int, visit func(*t
 		return
 	}
 	walkNodes(n.right, childLazy, limit, count, visit)
+}
+
+// walkWhile visits nodes in line order, passing each node's effective ticket,
+// and stops immediately as soon as visit returns false. Read-only; safe under
+// ts.mu.RLock or ts.mu.Lock.
+func (t *ticketTree) walkWhile(visit func(n *tokenNode, effTicket int64) bool) {
+	if t.root == nil {
+		return
+	}
+	walkNodesWhile(t.root, 0, visit)
+}
+
+func walkNodesWhile(n *tokenNode, accLazy int64, visit func(*tokenNode, int64) bool) bool {
+	if n == nil {
+		return true
+	}
+	eff := n.ticket + accLazy
+	childLazy := accLazy + n.lazy
+	if !walkNodesWhile(n.left, childLazy, visit) {
+		return false
+	}
+	if !visit(n, eff) {
+		return false
+	}
+	return walkNodesWhile(n.right, childLazy, visit)
 }

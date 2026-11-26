@@ -135,6 +135,29 @@ func WithTokenExtractor(fn TokenExtractor) Option {
 	}
 }
 
+// WithReadyGrace configures the ready-claim deadline during Init.
+func WithReadyGrace(d time.Duration) Option {
+	return func(wr *WaitingRoom) error {
+		return wr.SetReadyGrace(d)
+	}
+}
+
+// WithIdlePollTTL configures the independent idle-poll TTL during Init.
+func WithIdlePollTTL(d time.Duration) Option {
+	return func(wr *WaitingRoom) error {
+		return wr.SetIdlePollTTL(d)
+	}
+}
+
+// WithFullResponder sets the custom response writer for maxQueueDepth
+// rejections during Init.
+func WithFullResponder(fn FullResponder) Option {
+	return func(wr *WaitingRoom) error {
+		wr.SetFullResponder(fn)
+		return nil
+	}
+}
+
 // NewWaitingRoom constructs an initialised WaitingRoom, registers the status
 // routes on r, and returns its middleware. It panics if cap < 1.
 //
@@ -193,6 +216,9 @@ func (wr *WaitingRoom) Init(cap int32, opts ...Option) error {
 	wr.occupancy.Store(0)
 	wr.reaperInterval.Store(int64(DefaultReaperInterval))
 	wr.firstPollGrace.Store(0)
+	wr.readyGrace.Store(0)
+	wr.idlePollTTL.Store(0)
+	wr.lastForceReap.Store(0)
 	wr.secureCookie.Store(false)
 	wr.maxQueueDepth.Store(0)
 	wr.SetCookiePath("/")

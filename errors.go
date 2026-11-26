@@ -125,6 +125,36 @@ func (e ErrFirstPollGrace) Error() string {
 	)
 }
 
+// ErrReadyGrace is returned by SetReadyGrace when a non-zero duration falls
+// outside [readyGraceMin, readyGraceMax].
+type ErrReadyGrace struct {
+	Given time.Duration
+	Min   time.Duration
+	Max   time.Duration
+}
+
+func (e ErrReadyGrace) Error() string {
+	return fmt.Sprintf(
+		"room: ready grace %s out of range [%s, %s] (0 disables)",
+		e.Given, e.Min, e.Max,
+	)
+}
+
+// ErrIdlePollTTL is returned by SetIdlePollTTL when a non-zero duration falls
+// outside [idlePollTTLMin, idlePollTTLMax].
+type ErrIdlePollTTL struct {
+	Given time.Duration
+	Min   time.Duration
+	Max   time.Duration
+}
+
+func (e ErrIdlePollTTL) Error() string {
+	return fmt.Sprintf(
+		"room: idle-poll TTL %s out of range [%s, %s] (0 disables)",
+		e.Given, e.Min, e.Max,
+	)
+}
+
 // ErrImportNotEmpty is returned by Import when the WaitingRoom has already
 // issued a ticket or holds a pass. Import must run on a freshly
 // initialised room, before it serves traffic.

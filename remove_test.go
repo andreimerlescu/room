@@ -413,6 +413,366 @@ func TestRemoveTokensFunc_PredicateMayCallBack(t *testing.T) {
 	}
 }
 
+// ClearQueue and ClearStale
+
+func TestClearQueue_EmptiesLineAdvancesWindowAndPreservesLeasesAndPasses(t *testing.T) {
+	var uninit WaitingRoom
+	if n := uninit.ClearQueue(); n != 0 {
+		t.Errorf("uninitialised ClearQueue: got %d, want 0", n)
+	}
+
+	wr := newTestWR(t, 3)
+	if err := wr.SetPassDuration(time.Hour); err != nil {
+		t.Fatal(err)
+	}
+	pass := wr.GrantPass()
+
+	var removes, evicts atomic.Int32
+	wr.On(EventRemove, func(Snapshot) { removes.Add(1) })
+	wr.On(EventEvict, func(Snapshot) { evicts.Add(1) })
+
+	if n := wr.ClearQueue(); n != 0 {
+		t.Fatalf("empty ClearQueue: got %d, want 0", n)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := removes.Load(); got != 0 {
+		t.Fatalf("empty ClearQueue fired EventRemove %d times, want 0", got)
+	}
+
+	// Ticket 1: held lease.
+	if ok, _, err := wr.Acquire("lease-1"); err != nil || !ok {
+		t.Fatalf("Acquire(lease-1): ok=%v err=%v", ok, err)
+	}
+
+	// Tickets 2 and 3: active HTTP handlers on separate release gates.
+	servingA, releaseA := make(chan struct{}, 1), make(chan struct{})
+	servingB, releaseB := make(chan struct{}, 1), make(chan struct{})
+	r := gin.New()
+	wr.RegisterRoutes(r)
+	r.GET("/a", func(c *gin.Context) {
+		servingA <- struct{}{}
+		<-releaseA
+		c.Status(http.StatusOK)
+	})
+	r.GET("/b", func(c *gin.Context) {
+		servingB <- struct{}{}
+		<-releaseB
+		c.Status(http.StatusOK)
+	})
+	r.GET("/", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	var activeWG sync.WaitGroup
+	startSlot := func(path string, serving chan struct{}) {
+		activeWG.Add(1)
+		go func() {
+			defer activeWG.Done()
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			r.ServeHTTP(httptest.NewRecorder(), req)
+		}()
+		select {
+		case <-serving:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("timed out waiting for %s to enter handler", path)
+		}
+	}
+	startSlot("/a", servingA)
+	startSlot("/b", servingB)
+	defer func() {
+		select {
+		case <-releaseB:
+		default:
+			close(releaseB)
+		}
+		activeWG.Wait()
+	}()
+
+	// Tickets 4, 5, 6, 7: queued waiting tickets.
+	queueTokens(t, r, 4)
+
+	// Release slot A so nowServing advances to 1 (edge = 4): ticket 4 is now
+	// inside the serving window, while tickets 5, 6, 7 wait behind it.
+	close(releaseA)
+	waitForNowServing(t, wr, 1, 2*time.Second)
+
+	n := wr.ClearQueue()
+	if n != 4 {
+		t.Fatalf("ClearQueue: got %d, want 4", n)
+	}
+	if live := wr.LiveQueueDepth(); live != 0 {
+		t.Errorf("LiveQueueDepth = %d, want 0", live)
+	}
+	if depth := wr.QueueDepth(); depth != 0 {
+		t.Errorf("QueueDepth = %d, want 0", depth)
+	}
+	if ns := wr.nowServing.Load(); ns != 5 {
+		t.Errorf("nowServing = %d, want 5 (in-window cascade across tickets 4..7)", ns)
+	}
+	if l := wr.ledger.len(); l != 0 {
+		t.Errorf("ledger.len() = %d, want 0", l)
+	}
+	if held := wr.Held(); held != 1 {
+		t.Errorf("Held() = %d, want 1 (lease must be preserved)", held)
+	}
+	if active := wr.Len(); active != 2 {
+		t.Errorf("Len() = %d, want 2 (1 lease + 1 active request untouched)", active)
+	}
+	if !wr.HasValidPass(pass) {
+		t.Error("VIP pass must be preserved across ClearQueue")
+	}
+
+	waitForCount(t, &removes, 1, 200*time.Millisecond)
+	if n2 := wr.ClearQueue(); n2 != 0 {
+		t.Errorf("second ClearQueue on empty room: got %d, want 0", n2)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := removes.Load(); got != 1 {
+		t.Errorf("EventRemove count = %d, want 1", got)
+	}
+	if got := evicts.Load(); got != 0 {
+		t.Errorf("ClearQueue must not fire EventEvict, got %d", got)
+	}
+
+	// Finish the active request and release the lease; verify exact accounting.
+	close(releaseB)
+	activeWG.Wait()
+	assertAccounting(t, wr)
+
+	if err := wr.Release("lease-1"); err != nil {
+		t.Fatalf("Release(lease-1): %v", err)
+	}
+	if wr.Len() != 0 || wr.Held() != 0 {
+		t.Fatalf("expected 0 active/held after release, got Len=%d Held=%d", wr.Len(), wr.Held())
+	}
+	accounted := wr.nowServing.Load() + wr.ledger.len() + int64(wr.tokens.len())
+	if issued := wr.nextTicket.Load(); accounted != issued {
+		t.Errorf("ticket accounting broken: nowServing(%d)+ledger(%d)+live(%d)=%d, issued=%d",
+			wr.nowServing.Load(), wr.ledger.len(), wr.tokens.len(), accounted, issued)
+	}
+	if w, tok := serveWithCookie(r, ""); w.Code != http.StatusOK || tok != "" {
+		t.Errorf("expected next arrival on fast path after ClearQueue, got code=%d tok=%q", w.Code, tok)
+	}
+}
+
+func TestClearStale_RemovesOnlyIdleTickets(t *testing.T) {
+	var uninit WaitingRoom
+	if n := uninit.ClearStale(time.Minute); n != 0 {
+		t.Errorf("uninitialised ClearStale: got %d, want 0", n)
+	}
+
+	base := time.Date(2026, 6, 1, 12, 0, 0, 0, time.UTC)
+	var clockNs atomic.Int64
+	clockNs.Store(base.UnixNano())
+
+	wr := &WaitingRoom{
+		nowFn: func() time.Time { return time.Unix(0, clockNs.Load()).UTC() },
+	}
+	if err := wr.Init(1); err != nil {
+		t.Fatalf("Init: %v", err)
+	}
+	t.Cleanup(wr.Stop)
+	if err := wr.SetReaperInterval(time.Hour); err != nil {
+		t.Fatal(err)
+	}
+
+	var removes, evicts atomic.Int32
+	wr.On(EventRemove, func(Snapshot) { removes.Add(1) })
+	wr.On(EventEvict, func(Snapshot) { evicts.Add(1) })
+
+	r := gin.New()
+	wr.RegisterRoutes(r)
+	r.GET("/", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	// Occupy the sole slot with a lease (ticket 1) so queued tickets stay outside the window.
+	if ok, _, err := wr.Acquire("holder"); err != nil || !ok {
+		t.Fatalf("Acquire(holder): ok=%v err=%v", ok, err)
+	}
+
+	// Queue 4 tickets (tickets 2..5).
+	wr.tokens.set("stale-1", ticketEntry{ticket: 2, createdAt: base, issuedAt: base, seen: true})
+	wr.tokens.set("refreshed", ticketEntry{ticket: 3, createdAt: base, issuedAt: base, seen: true})
+	wr.tokens.set("stale-2", ticketEntry{ticket: 4, createdAt: base, issuedAt: base, seen: true})
+	wr.tokens.set("boundary", ticketEntry{
+		ticket:    5,
+		createdAt: base.Add(30 * time.Second),
+		issuedAt:  base.Add(30 * time.Second),
+		seen:      true,
+	})
+	wr.nextTicket.Store(5)
+
+	// Poll "refreshed" at base+40s so its issuedAt moves forward while its
+	// lazy ttlHeap key remains at base (verifies takeStale fixes the heap).
+	clockNs.Store(base.Add(40 * time.Second).UnixNano())
+	resp := pollStatus(r, "refreshed")
+	if resp.Ready || resp.CookiesRequired {
+		t.Fatalf("expected refreshed to remain waiting, got %+v", resp)
+	}
+
+	// Advance clock to base+60s:
+	//   stale-1:   idle 60s (> 30s)  -> removed
+	//   refreshed: idle 20s (<= 30s) -> survives (heap fixed)
+	//   stale-2:   idle 60s (> 30s)  -> removed
+	//   boundary:  idle 30s (== 30s) -> survives (strict >)
+	clockNs.Store(base.Add(60 * time.Second).UnixNano())
+
+	if n := wr.ClearStale(0); n != 0 {
+		t.Errorf("ClearStale(0) = %d, want 0", n)
+	}
+	if n := wr.ClearStale(-5 * time.Second); n != 0 {
+		t.Errorf("ClearStale(-5s) = %d, want 0", n)
+	}
+	if n := wr.ClearStale(2 * time.Minute); n != 0 {
+		t.Errorf("ClearStale(2m) = %d, want 0", n)
+	}
+	time.Sleep(30 * time.Millisecond)
+	if got := removes.Load(); got != 0 {
+		t.Fatalf("non-removing ClearStale calls fired EventRemove %d times", got)
+	}
+
+	n := wr.ClearStale(30 * time.Second)
+	if n != 2 {
+		t.Fatalf("ClearStale(30s) = %d, want 2", n)
+	}
+	for tok, wantPresent := range map[string]bool{
+		"stale-1":   false,
+		"stale-2":   false,
+		"refreshed": true,
+		"boundary":  true,
+	} {
+		if _, ok := wr.Ticket(tok); ok != wantPresent {
+			t.Errorf("ticket %q present=%v, want %v", tok, ok, wantPresent)
+		}
+	}
+	if live := wr.LiveQueueDepth(); live != 2 {
+		t.Errorf("LiveQueueDepth = %d, want 2", live)
+	}
+	if depth := wr.QueueDepth(); depth != 2 {
+		t.Errorf("QueueDepth = %d, want 2", depth)
+	}
+	waitForCount(t, &removes, 1, 200*time.Millisecond)
+	time.Sleep(30 * time.Millisecond)
+	if got := removes.Load(); got != 1 {
+		t.Errorf("EventRemove count = %d, want 1", got)
+	}
+	if got := evicts.Load(); got != 0 {
+		t.Errorf("ClearStale must not fire EventEvict, got %d", got)
+	}
+	assertAccounting(t, wr)
+
+	// Advance 1s so "boundary" is now idle 31s (> 30s) while "refreshed" is idle 21s.
+	clockNs.Store(base.Add(61 * time.Second).UnixNano())
+	if n := wr.ClearStale(30 * time.Second); n != 1 {
+		t.Fatalf("second ClearStale(30s) = %d, want 1", n)
+	}
+	if _, ok := wr.Ticket("boundary"); ok {
+		t.Error("boundary should have been removed after crossing maxIdle")
+	}
+	if _, ok := wr.Ticket("refreshed"); !ok {
+		t.Error("refreshed should still survive")
+	}
+	waitForCount(t, &removes, 2, 200*time.Millisecond)
+
+	// Release holder and confirm ticket accounting invariant holds.
+	if err := wr.Release("holder"); err != nil {
+		t.Fatalf("Release(holder): %v", err)
+	}
+	accounted := wr.nowServing.Load() + wr.ledger.len() + int64(wr.tokens.len())
+	if issued := wr.nextTicket.Load(); accounted != issued {
+		t.Errorf("ticket accounting broken: nowServing(%d)+ledger(%d)+live(%d)=%d, issued=%d",
+			wr.nowServing.Load(), wr.ledger.len(), wr.tokens.len(), accounted, issued)
+	}
+}
+
+func TestClearQueueAndClearStale_ConcurrentWithArrivalsAndPolls(t *testing.T) {
+	wr := newTestWR(t, 2)
+	r := gin.New()
+	wr.RegisterRoutes(r)
+	r.GET("/", func(c *gin.Context) { c.Status(http.StatusOK) })
+
+	// Hold both slots so concurrent arrivals enter the waiting queue.
+	for _, k := range []string{"l1", "l2"} {
+		if ok, _, err := wr.Acquire(k); err != nil || !ok {
+			t.Fatalf("Acquire(%s): ok=%v err=%v", k, ok, err)
+		}
+	}
+
+	var mu sync.Mutex
+	var issued []string
+	var wg sync.WaitGroup
+
+	// Concurrent arrivals.
+	for g := 0; g < 6; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 30; i++ {
+				if tok := arriveWith(r, nil); tok != "" {
+					mu.Lock()
+					issued = append(issued, tok)
+					mu.Unlock()
+				}
+			}
+		}()
+	}
+
+	// Concurrent status polls.
+	for g := 0; g < 4; g++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < 40; i++ {
+				mu.Lock()
+				var tok string
+				if len(issued) > 0 {
+					tok = issued[i%len(issued)]
+				}
+				mu.Unlock()
+				if tok != "" {
+					pollStatus(r, tok)
+				}
+				for _, ti := range wr.Queue(3) {
+					pollStatus(r, ti.Token)
+				}
+			}
+		}()
+	}
+
+	// Concurrent ClearStale and ClearQueue sweeps.
+	for g := 0; g < 3; g++ {
+		wg.Add(1)
+		go func(id int) {
+			defer wg.Done()
+			for i := 0; i < 25; i++ {
+				if (id+i)%3 == 0 {
+					wr.ClearQueue()
+				} else {
+					wr.ClearStale(time.Microsecond)
+				}
+			}
+		}(g)
+	}
+
+	wg.Wait()
+
+	wr.ClearQueue()
+	for _, k := range []string{"l1", "l2"} {
+		if err := wr.Release(k); err != nil {
+			t.Fatalf("Release(%s): %v", k, err)
+		}
+	}
+
+	if live := wr.LiveQueueDepth(); live != 0 {
+		t.Errorf("LiveQueueDepth = %d, want 0", live)
+	}
+	if depth := wr.QueueDepth(); depth != 0 {
+		t.Errorf("QueueDepth = %d, want 0", depth)
+	}
+	if active := wr.Len(); active != 0 {
+		t.Errorf("Len() = %d, want 0", active)
+	}
+	assertAccounting(t, wr)
+	assertIndexes(t, wr.tokens)
+}
+
 // Benchmarks
 
 func BenchmarkRemoveToken(b *testing.B) {

@@ -63,6 +63,15 @@ const (
 	firstPollGraceMin = 10 * time.Second
 	firstPollGraceMax = 24 * time.Hour
 
+	readyGraceMin         = 5 * time.Second
+	readyGraceMax         = 10 * time.Minute
+	readyGraceReaperFloor = 1 * time.Second
+
+	idlePollTTLMin = 10 * time.Second
+	idlePollTTLMax = 24 * time.Hour
+
+	forceReapMinInterval = 250 * time.Millisecond
+
 	statusPollMinInterval = 1 * time.Second
 
 	passMinDuration = 1 * time.Minute

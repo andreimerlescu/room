@@ -45,6 +45,7 @@ type TicketInfo struct {
 	IssuedAt  time.Time
 	LastSeen  time.Time
 	LastPoll  time.Time
+	ReadyAt   time.Time
 	ClientKey string
 	Seen      bool
 	Promoted  bool
@@ -63,6 +64,7 @@ func (wr *WaitingRoom) ticketInfo(token string, e ticketEntry) TicketInfo {
 		IssuedAt:  e.createdAt,
 		LastSeen:  e.issuedAt,
 		LastPoll:  e.lastPoll,
+		ReadyAt:   e.readyAt,
 		ClientKey: e.clientKey,
 		Seen:      e.seen,
 		Promoted:  e.promoted,

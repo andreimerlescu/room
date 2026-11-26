@@ -514,7 +514,7 @@ func TestReap_LazyRekeyOverBatchSize(t *testing.T) {
 	now := time.Now()
 	for i := range total {
 		tok := fmt.Sprintf("active-%04d", i)
-		res := wr.tokens.poll(tok, now, 1, statusPollMinInterval, time.Minute)
+		res := wr.tokens.poll(tok, now, 1, statusPollMinInterval, time.Minute, 0, 0)
 		if res.outcome != pollAccepted {
 			t.Fatalf("poll(%q): got outcome %v, want pollAccepted", tok, res.outcome)
 		}

@@ -186,8 +186,78 @@ func (ts *tokenStore) takeMany(tokens []string) []ticketEntry {
 	return out
 }
 
+// takeAll atomically drains and returns every live ticket entry under one
+// ts.mu.Lock. Backing maps and heap slices are reallocated when highWater
+// reached tokenStoreCompactFloor; highWater is reset to 0.
+func (ts *tokenStore) takeAll() []ticketEntry {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	var out []ticketEntry
+	if n := len(ts.entries); n > 0 {
+		out = make([]ticketEntry, 0, n)
+		ts.tree.walk(-1, func(node *tokenNode, effTicket int64) {
+			out = append(out, node.snapshotEntry(effTicket))
+		})
+	}
+
+	ts.tree.root = nil
+	ts.hasLazyShifts = false
+
+	if ts.highWater >= tokenStoreCompactFloor {
+		ts.entries = make(map[string]*tokenNode)
+		ts.byKey = make(map[string]string)
+		ts.byID = make(map[string]string)
+		ts.ttlHeap = nodeHeap{}
+		ts.unseenHeap = nodeHeap{unseen: true}
+	} else {
+		clear(ts.entries)
+		clear(ts.byKey)
+		clear(ts.byID)
+		clear(ts.ttlHeap.nodes)
+		ts.ttlHeap.nodes = ts.ttlHeap.nodes[:0]
+		clear(ts.unseenHeap.nodes)
+		ts.unseenHeap.nodes = ts.unseenHeap.nodes[:0]
+	}
+	ts.highWater = 0
+	return out
+}
+
+// takeStale atomically removes and returns all live nodes where
+// now.Sub(node.issuedAt) > maxIdle under one ts.mu.Lock.
+func (ts *tokenStore) takeStale(now time.Time, maxIdle time.Duration) []ticketEntry {
+	ts.mu.Lock()
+	defer ts.mu.Unlock()
+
+	var out []ticketEntry
+	for ts.ttlHeap.len() > 0 {
+		top := ts.ttlHeap.peek()
+		if now.Sub(top.ttlKey) <= maxIdle {
+			break
+		}
+		top.mu.Lock()
+		issuedAt := top.issuedAt
+		if now.Sub(issuedAt) <= maxIdle {
+			top.mu.Unlock()
+			top.ttlKey = issuedAt
+			ts.ttlHeap.fix(top)
+			continue
+		}
+		eff := effectiveTicket(top, ts.hasLazyShifts)
+		e := top.toEntryMuLocked(eff)
+		top.mu.Unlock()
+		ts.removeLocked(top.token, top)
+		out = append(out, e)
+	}
+	if len(ts.entries) == 0 {
+		ts.hasLazyShifts = false
+	}
+	return out
+}
+
 // markRendered records a waiting-page reload: restarts the sliding TTL, marks
-// seen, resets the cookie-refresh clock, and records current pass status.
+// seen, clears any stale readyAt timestamp, resets the cookie-refresh clock,
+// and records current pass status.
 func (ts *tokenStore) markRendered(token string, now time.Time, hasPass bool) {
 	ts.mu.RLock()
 	node, ok := ts.entries[token]
@@ -198,6 +268,7 @@ func (ts *tokenStore) markRendered(token string, now time.Time, hasPass bool) {
 	node.mu.Lock()
 	node.issuedAt = now
 	node.seen = true
+	node.readyAt = time.Time{}
 	node.cookieSetAt = now
 	node.hasPass = hasPass
 	node.mu.Unlock()
@@ -220,10 +291,26 @@ func (ts *tokenStore) promoteTicket(token string, newTicket int64) (ticketEntry,
 	return node.snapshotEntry(newTicket), true
 }
 
+func (ts *tokenStore) effectiveTTL(idlePollTTL time.Duration) time.Duration {
+	effTTL := ts.ttl()
+	if idlePollTTL > 0 && idlePollTTL < effTTL {
+		return idlePollTTL
+	}
+	return effTTL
+}
+
+func pollExpiredMuLocked(node *tokenNode, effTicket int64, now time.Time, edge int64, effTTL, readyGrace time.Duration) bool {
+	if now.Sub(node.issuedAt) > effTTL {
+		return true
+	}
+	return effTicket <= edge && !node.skipReadyGrace && readyGrace > 0 &&
+		!node.readyAt.IsZero() && now.Sub(node.readyAt) > readyGrace
+}
+
 // poll applies one /queue/status poll under ts.mu.RLock + node.mu, upgrading
 // to ts.mu.Lock only on the rare expired-token branch.
-func (ts *tokenStore) poll(token string, now time.Time, edge int64, minInterval, refreshEvery time.Duration) pollResult {
-	ttl := ts.ttl()
+func (ts *tokenStore) poll(token string, now time.Time, edge int64, minInterval, refreshEvery, idlePollTTL, readyGrace time.Duration) pollResult {
+	effTTL := ts.effectiveTTL(idlePollTTL)
 
 	ts.mu.RLock()
 	node, ok := ts.entries[token]
@@ -232,19 +319,21 @@ func (ts *tokenStore) poll(token string, now time.Time, edge int64, minInterval,
 		return pollResult{outcome: pollUnknown}
 	}
 	node.mu.Lock()
-	if now.Sub(node.issuedAt) > ttl {
+	eff := effectiveTicket(node, ts.hasLazyShifts)
+	if pollExpiredMuLocked(node, eff, now, edge, effTTL, readyGrace) {
 		node.mu.Unlock()
 		ts.mu.RUnlock()
-		return ts.pollExpiredSlow(token, now, edge, minInterval, refreshEvery, ttl)
+		return ts.pollExpiredSlow(token, now, edge, minInterval, refreshEvery, idlePollTTL, readyGrace)
 	}
-	eff := effectiveTicket(node, ts.hasLazyShifts)
 	res := applyPollMuLocked(node, eff, now, edge, minInterval, refreshEvery)
 	node.mu.Unlock()
 	ts.mu.RUnlock()
 	return res
 }
 
-func (ts *tokenStore) pollExpiredSlow(token string, now time.Time, edge int64, minInterval, refreshEvery, ttl time.Duration) pollResult {
+func (ts *tokenStore) pollExpiredSlow(token string, now time.Time, edge int64, minInterval, refreshEvery, idlePollTTL, readyGrace time.Duration) pollResult {
+	effTTL := ts.effectiveTTL(idlePollTTL)
+
 	ts.mu.Lock()
 	defer ts.mu.Unlock()
 
@@ -254,7 +343,7 @@ func (ts *tokenStore) pollExpiredSlow(token string, now time.Time, edge int64, m
 	}
 	node.mu.Lock()
 	eff := effectiveTicket(node, ts.hasLazyShifts)
-	if now.Sub(node.issuedAt) > ttl {
+	if pollExpiredMuLocked(node, eff, now, edge, effTTL, readyGrace) {
 		entry := node.toEntryMuLocked(eff)
 		node.mu.Unlock()
 		ts.removeLocked(token, node)
@@ -268,8 +357,17 @@ func (ts *tokenStore) pollExpiredSlow(token string, now time.Time, edge int64, m
 func applyPollMuLocked(node *tokenNode, effTicket int64, now time.Time, edge int64, minInterval, refreshEvery time.Duration) pollResult {
 	prev := node.lastPoll
 	node.lastPoll = now
-	node.issuedAt = now
 	node.seen = true
+	if effTicket <= edge {
+		if node.readyAt.IsZero() {
+			node.readyAt = now
+		}
+	} else {
+		node.issuedAt = now
+		if !node.readyAt.IsZero() {
+			node.readyAt = time.Time{}
+		}
+	}
 
 	res := pollResult{outcome: pollAccepted}
 	if !prev.IsZero() && now.Sub(prev) < minInterval {
@@ -305,9 +403,9 @@ func (ts *tokenStore) view(id string, now time.Time, minInterval time.Duration) 
 	return viewAccepted, place
 }
 
-// enterKey refreshes an existing key's TTL under ts.mu.RLock + node.mu and
-// returns its O(log N) place, or inserts a new key under ts.mu.Lock when
-// reserve is non-nil.
+// enterKey refreshes an existing key's TTL under ts.mu.RLock + node.mu (also
+// clearing any stale readyAt from before a SetCap shrink) and returns its
+// O(log N) place, or inserts a new key under ts.mu.Lock when reserve is non-nil.
 func (ts *tokenStore) enterKey(key, token string, fresh ticketEntry, reserve func() int64, now time.Time) keyedEntry {
 	ts.mu.RLock()
 	if t, ok := ts.byKey[key]; ok {
@@ -316,6 +414,9 @@ func (ts *tokenStore) enterKey(key, token string, fresh ticketEntry, reserve fun
 		node.mu.Lock()
 		node.issuedAt = now
 		node.seen = true
+		if !node.readyAt.IsZero() {
+			node.readyAt = time.Time{}
+		}
 		e := node.toEntryMuLocked(eff)
 		node.mu.Unlock()
 		place := ts.tree.place(node)
@@ -336,6 +437,9 @@ func (ts *tokenStore) enterKey(key, token string, fresh ticketEntry, reserve fun
 		node.mu.Lock()
 		node.issuedAt = now
 		node.seen = true
+		if !node.readyAt.IsZero() {
+			node.readyAt = time.Time{}
+		}
 		e := node.toEntryMuLocked(eff)
 		node.mu.Unlock()
 		return keyedEntry{token: t, entry: e, place: ts.tree.place(node)}

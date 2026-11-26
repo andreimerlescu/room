@@ -5,7 +5,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -43,7 +42,7 @@ func (wr *WaitingRoom) serveStatus(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	now := time.Now()
+	now := wr.now()
 	edge := wr.nowServing.Load() + int64(wr.cap.Load())
 	res := wr.tokens.poll(
 		cookie.Value,
@@ -51,6 +50,8 @@ func (wr *WaitingRoom) serveStatus(w http.ResponseWriter, r *http.Request) {
 		edge,
 		statusPollMinInterval,
 		wr.TokenTTL()/cookieRefreshDivisor,
+		wr.IdlePollTTL(),
+		wr.ReadyGrace(),
 	)
 
 	switch res.outcome {

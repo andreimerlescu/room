@@ -171,7 +171,7 @@ func BenchmarkTokenStore_PollSingleLock(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			tok := tokens[next.Add(1)%n]
-			ts.poll(tok, time.Now(), 0, statusPollMinInterval, time.Minute)
+			ts.poll(tok, time.Now(), 0, statusPollMinInterval, time.Minute, 0, 0)
 		}
 	})
 }
@@ -248,7 +248,7 @@ func BenchmarkStatusPoll_Parallel_100k(b *testing.B) {
 	b.RunParallel(func(pb *testing.PB) {
 		for pb.Next() {
 			tok := tokens[idx.Add(1)%n]
-			wr.tokens.poll(tok, time.Now(), 0, statusPollMinInterval, time.Minute)
+			wr.tokens.poll(tok, time.Now(), 0, statusPollMinInterval, time.Minute, 0, 0)
 		}
 	})
 }
