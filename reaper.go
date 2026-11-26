@@ -8,9 +8,9 @@ import (
 // SetReaperInterval changes the eviction cadence at runtime. Passing 0
 // restores [DefaultReaperInterval]; otherwise valid values are 5s–24h
 // (returns [ErrReaperInterval] outside that range). When
-// [WaitingRoom.SetFirstPollGrace] is enabled with a shorter duration, the
-// reaper ticks at that shorter cadence while ReaperInterval still reports the
-// value set here.
+// [WaitingRoom.SetFirstPollGrace], [WaitingRoom.SetIdlePollTTL], or
+// [WaitingRoom.SetReadyGrace] requires a shorter cadence, the reaper ticks at
+// that shorter cadence while ReaperInterval still reports the value set here.
 func (wr *WaitingRoom) SetReaperInterval(d time.Duration) error {
 	if d == 0 {
 		d = DefaultReaperInterval
@@ -47,10 +47,59 @@ func (wr *WaitingRoom) FirstPollGrace() time.Duration {
 	return time.Duration(wr.firstPollGrace.Load())
 }
 
+// SetReadyGrace sets how long a ticket inside the serving window may remain
+// unclaimed before being reclaimed. Passing 0 disables the check (default);
+// otherwise valid values are 5s–10m (returns [ErrReadyGrace] outside that
+// range). Applies to cookie tickets and Middleware-queued keyed tickets;
+// programmatic Enter/Acquire tickets are skipped. When enabled, the background
+// reaper clamps its cadence to max(1s, d/2). Safe to call at any time.
+func (wr *WaitingRoom) SetReadyGrace(d time.Duration) error {
+	if d != 0 && (d < readyGraceMin || d > readyGraceMax) {
+		return ErrReadyGrace{Given: d, Min: readyGraceMin, Max: readyGraceMax}
+	}
+	wr.readyGrace.Store(int64(d))
+	wr.signalReaperRestart()
+	return nil
+}
+
+// ReadyGrace returns the current ready-claim deadline (0 means disabled).
+func (wr *WaitingRoom) ReadyGrace() time.Duration {
+	return time.Duration(wr.readyGrace.Load())
+}
+
+// SetIdlePollTTL sets an independent cap on how long a queued ticket may go
+// without client contact before eviction, without shortening TokenTTL's cookie
+// MaxAge or refresh cadence. Passing 0 disables the cap (default); otherwise
+// valid values are 10s–24h (returns [ErrIdlePollTTL] outside that range). When
+// shorter than ReaperInterval, the background reaper clamps its cadence to d.
+// Safe to call at any time.
+func (wr *WaitingRoom) SetIdlePollTTL(d time.Duration) error {
+	if d != 0 && (d < idlePollTTLMin || d > idlePollTTLMax) {
+		return ErrIdlePollTTL{Given: d, Min: idlePollTTLMin, Max: idlePollTTLMax}
+	}
+	wr.idlePollTTL.Store(int64(d))
+	wr.signalReaperRestart()
+	return nil
+}
+
+// IdlePollTTL returns the current independent idle-poll TTL (0 means disabled).
+func (wr *WaitingRoom) IdlePollTTL() time.Duration {
+	return time.Duration(wr.idlePollTTL.Load())
+}
+
 func (wr *WaitingRoom) effectiveReaperInterval() time.Duration {
 	d := time.Duration(wr.reaperInterval.Load())
 	if g := time.Duration(wr.firstPollGrace.Load()); g > 0 && g < d {
 		d = g
+	}
+	if idle := time.Duration(wr.idlePollTTL.Load()); idle > 0 && idle < d {
+		d = idle
+	}
+	if rg := time.Duration(wr.readyGrace.Load()); rg > 0 {
+		half := max(readyGraceReaperFloor, rg/2)
+		if half < d {
+			d = half
+		}
 	}
 	return d
 }
@@ -108,12 +157,18 @@ func (wr *WaitingRoom) reap() {
 	wr.reapLeases(wr.now())
 }
 
-// reapBatch inspects up to reaperBatchSize due entries across unseenHeap and
-// ttlHeap (O(1) when nothing is due, O(k log N) otherwise).
+// reapBatch inspects up to reaperBatchSize due entries across unseenHeap,
+// ttlHeap, and (when ReadyGrace is enabled) the serving-window prefix of tree
+// (O(1) when nothing is due, O(k log N) otherwise).
 func (wr *WaitingRoom) reapBatch() int {
-	now := time.Now()
+	now := wr.now()
 	ttl := wr.tokens.ttl()
+	effTTL := ttl
+	if idleTTL := time.Duration(wr.idlePollTTL.Load()); idleTTL > 0 && idleTTL < effTTL {
+		effTTL = idleTTL
+	}
 	grace := time.Duration(wr.firstPollGrace.Load())
+	readyGrace := time.Duration(wr.readyGrace.Load())
 
 	ts := wr.tokens
 	ts.mu.Lock()
@@ -150,7 +205,7 @@ func (wr *WaitingRoom) reapBatch() int {
 
 	for ts.ttlHeap.len() > 0 && work < reaperBatchSize {
 		top := ts.ttlHeap.peek()
-		if now.Sub(top.ttlKey) <= ttl {
+		if now.Sub(top.ttlKey) <= effTTL {
 			break
 		}
 		work++
@@ -158,7 +213,7 @@ func (wr *WaitingRoom) reapBatch() int {
 		issuedAt := top.issuedAt
 		top.mu.Unlock()
 
-		if now.Sub(issuedAt) <= ttl {
+		if now.Sub(issuedAt) <= effTTL {
 			top.ttlKey = issuedAt
 			ts.ttlHeap.fix(top)
 			continue
@@ -168,6 +223,37 @@ func (wr *WaitingRoom) reapBatch() int {
 		retired = append(retired, eff)
 	}
 
+	if readyGrace > 0 && work < reaperBatchSize {
+		edge := wr.nowServing.Load() + int64(wr.cap.Load())
+		limit := reaperBatchSize - work
+		type evictCandidate struct {
+			node *tokenNode
+			eff  int64
+		}
+		var toEvict []evictCandidate
+		ts.tree.walkWhile(func(node *tokenNode, eff int64) bool {
+			if eff > edge || len(toEvict) >= limit {
+				return false
+			}
+			if node.skipReadyGrace {
+				return true
+			}
+			node.mu.Lock()
+			if node.readyAt.IsZero() {
+				node.readyAt = now
+			} else if now.Sub(node.readyAt) > readyGrace {
+				toEvict = append(toEvict, evictCandidate{node: node, eff: eff})
+			}
+			node.mu.Unlock()
+			return len(toEvict) < limit
+		})
+		for _, c := range toEvict {
+			ts.removeLocked(c.node.token, c.node)
+			retired = append(retired, c.eff)
+		}
+		work += len(toEvict)
+	}
+
 	ts.mu.Unlock()
 
 	if len(retired) > 0 {
@@ -175,4 +261,32 @@ func (wr *WaitingRoom) reapBatch() int {
 		wr.emit(EventEvict, wr.snapshot(EventEvict))
 	}
 	return work
+}
+
+// reapIfDue runs at most one bounded reapBatch per minInterval using a
+// single-flight CAS on lastForceReap. It intentionally never calls reapLeases
+// so callers holding leaseMu preserve the leaseMu -> tokens.mu lock order.
+func (wr *WaitingRoom) reapIfDue(now time.Time, minInterval time.Duration) bool {
+	nowNs := now.UnixNano()
+	last := wr.lastForceReap.Load()
+	if last != 0 && nowNs >= last && nowNs-last < int64(minInterval) {
+		return false
+	}
+	if !wr.lastForceReap.CompareAndSwap(last, nowNs) {
+		return false
+	}
+	wr.reapBatch()
+	return true
+}
+
+// queueFullWithReap checks whether maxQueueDepth is reached; if full, it runs
+// at most one rate-limited synchronous reapBatch and re-evaluates queueFull so
+// stale tickets cannot cause spurious rejections between background ticks.
+func (wr *WaitingRoom) queueFullWithReap(now time.Time) (int64, bool) {
+	maxDepth, full := wr.queueFull()
+	if !full {
+		return maxDepth, false
+	}
+	wr.reapIfDue(now, forceReapMinInterval)
+	return wr.queueFull()
 }

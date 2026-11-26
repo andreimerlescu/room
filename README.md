@@ -36,7 +36,7 @@ wr.RegisterRoutes(r)
 ## Installation
 
 ```sh
-go get github.com/andreimerlescu/room@v1.8.0
+go get github.com/andreimerlescu/room@v1.9.0
 ```
 
 Requires [gin](https://github.com/gin-gonic/gin) and the Go version declared in
@@ -112,26 +112,35 @@ polling if `cookies_required: true`.
 
 ```go
 wr.SetFirstPollGrace(30 * time.Second) // reclaim clients that never come back
+wr.SetIdlePollTTL(2 * time.Minute)     // cap silent time independently of TokenTTL
+wr.SetReadyGrace(30 * time.Second)     // evict unclaimed ready tickets in the window
 wr.SetReaperInterval(30 * time.Second) // eviction cadence
-wr.SetMaxQueueDepth(20000)             // 503 new arrivals beyond this
-wr.SetSecureCookie(true)               // behind TLS / TLS-terminating proxy
+wr.SetMaxQueueDepth(20000)             // 503 new arrivals beyond this (reaps stale first)
+wr.SetFullResponder(func(c *gin.Context, s room.Snapshot) {
+	c.JSON(http.StatusServiceUnavailable, gin.H{"error": "queue full", "queue_depth": s.QueueDepth})
+})
+wr.SetSecureCookie(true) // behind TLS / TLS-terminating proxy
 ```
 
 | Setting | Default | What it controls |
 |---|---|---|
-| `SetTokenTTL` | `5m` (`DefaultTokenTTL`) | Sliding-window lifetime for abandoned tokens (reset on every poll/reload). `0` restores default. |
+| `SetTokenTTL` | `5m` (`DefaultTokenTTL`) | Sliding-window lifetime for abandoned tokens (reset on queued polls/reloads) and cookie `MaxAge`/refresh cadence. `0` restores default. |
 | `SetFirstPollGrace` | off (`0`) | Reclaims tickets whose clients never return after issuance (cookieless clients, bots, instant abandons). |
-| `SetReaperInterval` | `5m` (`DefaultReaperInterval`) | Eviction pass cadence (shortened automatically while `FirstPollGrace` is smaller). `0` restores default. |
-| `SetMaxQueueDepth` | unlimited (`0`) | Circuit breaker for new arrivals; trips when either `QueueDepth` or `LiveQueueDepth` reaches the limit. |
+| `SetIdlePollTTL` | off (`0`) | Caps silent time for queued tickets independently from `TokenTTL` (`10s–24h`). `0` disables. |
+| `SetReadyGrace` | off (`0`) | Evicts ready cookie and middleware-keyed tickets not claimed within the deadline (`5s–10m`), preventing serving-window head-of-line deadlocks (skips `Enter`/`Acquire`). `0` disables. |
+| `SetReaperInterval` | `5m` (`DefaultReaperInterval`) | Eviction pass cadence (auto-clamped when `FirstPollGrace`, `IdlePollTTL`, or `ReadyGrace` requires a shorter interval). `0` restores default. |
+| `SetMaxQueueDepth` | unlimited (`0`) | Circuit breaker for new arrivals; runs a rate-limited synchronous stale-reap (at most once per `250ms`) before tripping on `QueueDepth` or `LiveQueueDepth`. |
+| `SetFullResponder` | `nil` (`503`) | Custom HTTP responder (`FullResponder`) invoked outside all locks on `maxQueueDepth` rejections (after `Cache-Control: no-store` and `Retry-After` are set). |
 
 Every setter (`SetCap`, `SetTokenTTL`, `SetReaperInterval`, `SetFirstPollGrace`,
-`SetMaxQueueDepth`, `SetPassDuration`, `SetHTML`, `SetSkipURL`, `SetRateFunc`,
-`SetClientKeyFunc`, `SetSecureCookie`, `SetCookiePath`, `SetCookieDomain`,
-`SetCookiePrefix`, `SetScope`, `SetService`, `SetSigner`, `SetVerifier`,
-`SetSigningKey`, `SetVerifyKeys`, `SetEd25519VerifyKeys`, `SetSignedMaxTTL`,
-`SetLeaseFraction`, `SetClockSkew`, `SetTicketKeyFunc`, `SetTokenExtractor`,
-`SetWaitJSON`, `SetWaitResponder`, `SetStatusBaseURL`, `SetLeaseTTL`) is safe to
-call concurrently while serving traffic. Functional options may also be passed
+`SetIdlePollTTL`, `SetReadyGrace`, `SetMaxQueueDepth`, `SetFullResponder`,
+`SetPassDuration`, `SetHTML`, `SetSkipURL`, `SetRateFunc`, `SetClientKeyFunc`,
+`SetSecureCookie`, `SetCookiePath`, `SetCookieDomain`, `SetCookiePrefix`,
+`SetScope`, `SetService`, `SetSigner`, `SetVerifier`, `SetSigningKey`,
+`SetVerifyKeys`, `SetEd25519VerifyKeys`, `SetSignedMaxTTL`, `SetLeaseFraction`,
+`SetClockSkew`, `SetTicketKeyFunc`, `SetTokenExtractor`, `SetWaitJSON`,
+`SetWaitResponder`, `SetStatusBaseURL`, `SetLeaseTTL`) is safe to call
+concurrently while serving traffic. Functional options may also be passed
 directly to `Init(cap, opts...)`. Call `wr.Validate()` (also run automatically
 by `RegisterRoutes`, which panics on misconfiguration) before serving. Only
 `Init` and `Import` must run before serving.
@@ -169,6 +178,10 @@ n := wr.RemoveTokensFunc(func(t room.TicketInfo) bool {
 	return bannedRange.Contains(net.ParseIP(t.ClientKey))
 })
 
+// Sweep idle tickets or drain the entire waiting line atomically.
+swept := wr.ClearStale(2 * time.Minute)
+cleared := wr.ClearQueue()
+
 // Move a waiting client forward without pricing, or insert strictly by priority rank.
 _ = wr.AdminPromote(token, 1)
 moved, _ := wr.SetTicketRank(token, 2)
@@ -179,6 +192,9 @@ moved, _ := wr.SetTicketRank(token, 2)
 - **Ranking (`SetTicketRank`)** inserts strictly ahead of all lower ranks in
   arrival order within each rank in `O(log N)`, shifting intervening tickets
   and pending ghosts cleanly; lowering a rank records it without moving back.
+- **Bulk clearing (`ClearQueue()`, `ClearStale(maxIdle)`)** atomically drains
+  all queued tickets or sweeps tickets idle longer than `maxIdle`, retiring
+  their positions and emitting `EventRemove` once when any tickets are removed.
 
 ---
 
@@ -325,23 +341,25 @@ wr.On(room.EventQueue, func(s room.Snapshot) { metrics.Inc("room.queue") })
 Events: `EventEnter`, `EventExit`, `EventFull` (edge), `EventDrain` (edge),
 `EventQueue`, `EventEvict`, `EventTimeout`, `EventPromote`, `EventRemove`,
 `EventRank`, `EventLease`, `EventRelease`, `EventLeaseExpire`,
-`EventTokenRejected`. Handlers run
-asynchronously in their own goroutines; keep high-frequency handlers
-non-blocking.
+`EventTokenRejected`, `EventReject`. Handlers run asynchronously in their own
+goroutines; keep high-frequency handlers non-blocking.
 
 ---
 
 ## Surviving restarts
 
 Stop accepting traffic (`srv.Shutdown`), `wr.Export(f)` to a `0600` file
-(contains bearer tokens), then on startup call `Init` + settings first,
+(contains bearer tokens), then on startup call `Init` + settings first
+(`SetTokenTTL`, `SetFirstPollGrace`, `SetIdlePollTTL`, `SetReadyGrace`),
 `wr.Import(f)`, delete the file, and finally call `RegisterRoutes`:
 
 ```go
-// Startup: apply TTL/grace before Import so staleness is judged accurately.
+// Startup: apply TTL/grace settings before Import so staleness is judged accurately.
 wr.Init(cap)
 wr.SetTokenTTL(ttl)
 wr.SetFirstPollGrace(30 * time.Second)
+wr.SetIdlePollTTL(2 * time.Minute)
+wr.SetReadyGrace(30 * time.Second)
 if f, err := os.Open(path); err == nil {
 	stats, err := wr.Import(f)
 	f.Close()
@@ -352,8 +370,11 @@ if f, err := os.Open(path); err == nil {
 wr.RegisterRoutes(r)
 ```
 
-Downtime is shifted forward so waiting clients and leases are not charged for
-restart time; VIP passes keep their real wall-clock expiry.
+Downtime is shifted forward (including ready deadlines) so waiting clients and
+leases are not charged for restart time; tickets already past `TokenTTL`,
+`FirstPollGrace`, `IdlePollTTL`, or `ReadyGrace` are dropped on import (counted
+in `ImportStats.DroppedStale`), while VIP passes keep their real wall-clock
+expiry.
 
 ---
 

@@ -250,7 +250,7 @@ func TestReapBatch_DoubleCheckPreventsRaceEviction(t *testing.T) {
 
 	// Client polls before TTL elapses, advancing issuedAt while ttlKey stays
 	// at almostExpired; then wait past the original ttlKey cutoff.
-	if res := wr.tokens.poll("borderline", time.Now(), 5, statusPollMinInterval, DefaultTokenTTL); res.outcome != pollAccepted {
+	if res := wr.tokens.poll("borderline", time.Now(), 5, statusPollMinInterval, DefaultTokenTTL, 0, 0); res.outcome != pollAccepted {
 		t.Fatalf("expected pollAccepted, got %v", res.outcome)
 	}
 	time.Sleep(115 * time.Millisecond)
@@ -629,4 +629,81 @@ func TestReap_PassSweepConcurrentWithTokenReap(t *testing.T) {
 			t.Errorf("pass-%d (live) should have survived", i)
 		}
 	}
+}
+
+func TestReadyGrace_EnterKeyClearsStaleReadyAtAfterSetCapShrink(t *testing.T) {
+	t.Parallel()
+	var clock atomic.Int64
+	t0 := time.Date(2026, 11, 26, 0, 0, 0, 0, time.UTC)
+	clock.Store(t0.UnixNano())
+
+	wr := &WaitingRoom{
+		nowFn: func() time.Time { return time.Unix(0, clock.Load()).UTC() },
+	}
+	if err := wr.Init(2, WithReadyGrace(10*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	defer wr.Stop()
+
+	// Middleware-queued keyed ticket (skipReadyGrace == false) inside serving window [1..2].
+	wr.nextTicket.Store(2)
+	wr.tokens.set("tok-keyed", ticketEntry{
+		ticket:    2,
+		createdAt: t0,
+		issuedAt:  t0,
+		seen:      true,
+		key:       "user-1",
+		id:        "id-1",
+	})
+
+	// First reap stamps readyAt = t0.
+	wr.reap()
+	info, ok := wr.TicketByKey("user-1")
+	if !ok || !info.ReadyAt.Equal(t0) {
+		t.Fatalf("after initial reap: ok=%v readyAt=%v, want %v", ok, info.ReadyAt, t0)
+	}
+
+	// SetCap shrink pushes ticket 2 outside window [1..1].
+	if err := wr.SetCap(1); err != nil {
+		t.Fatal(err)
+	}
+
+	// Client retries while outside window (decideKeyed -> enterKey refresh).
+	t1 := t0.Add(5 * time.Second)
+	clock.Store(t1.UnixNano())
+	act, _, k, _ := wr.decideKeyed("user-1", "", t1, capabilityState{})
+	if act != keyedWait {
+		t.Fatalf("decideKeyed action = %v, want keyedWait", act)
+	}
+	if !k.entry.readyAt.IsZero() {
+		t.Fatalf("enterKey refresh returned stale readyAt = %v, want zero", k.entry.readyAt)
+	}
+	if info, ok := wr.TicketByKey("user-1"); !ok || !info.ReadyAt.IsZero() || !info.LastSeen.Equal(t1) {
+		t.Fatalf("after shrink retry: ok=%v readyAt=%v lastSeen=%v", ok, info.ReadyAt, info.LastSeen)
+	}
+
+	// Advance past original t0+10s deadline, then expand cap so ticket 2 re-enters window [1..2].
+	t2 := t0.Add(15 * time.Second)
+	clock.Store(t2.UnixNano())
+	if err := wr.SetCap(2); err != nil {
+		t.Fatal(err)
+	}
+
+	// Reap must grant a fresh readyGrace starting at t2 rather than evicting on stale t0.
+	wr.reap()
+	info, ok = wr.TicketByKey("user-1")
+	if !ok {
+		t.Fatal("ticket was evicted immediately on re-entry using stale pre-shrink readyAt")
+	}
+	if !info.ReadyAt.Equal(t2) {
+		t.Fatalf("fresh readyAt = %v, want %v", info.ReadyAt, t2)
+	}
+
+	// Past the fresh readyGrace deadline (t2+11s), reap evicts the unclaimed ticket.
+	clock.Store(t2.Add(11 * time.Second).UnixNano())
+	wr.reap()
+	if _, ok := wr.TicketByKey("user-1"); ok {
+		t.Fatal("unclaimed ticket should be evicted after fresh readyGrace elapsed")
+	}
+	assertStoreInvariants(t, wr.tokens)
 }

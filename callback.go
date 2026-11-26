@@ -7,20 +7,21 @@ import "sync"
 type Event uint8
 
 const (
-	EventEnter       Event = iota // request or lease acquired a slot
-	EventExit                     // request or lease released a slot
-	EventFull                     // room crossed from below capacity to full (edge)
-	EventDrain                    // room crossed from full to having a free slot (edge)
-	EventQueue                    // client joined the waiting line
-	EventEvict                    // expired or unseen token reclaimed
-	EventTimeout                  // request context cancelled before acquiring a slot
-	EventPromote                  // paid, admin, or VIP-pass promotion moved a ticket
-	EventRemove                   // ticket removed via RemoveToken, RemoveTokensFunc, or Leave
-	EventRank                     // SetTicketRank moved a ticket ahead of lower ranks
-	EventLease         // Acquire or verified remote lease reserved a lease slot
-	EventRelease       // Release returned a lease slot
-	EventLeaseExpire   // reaper reclaimed a lease past LeaseTTL or signed expiry
-	EventTokenRejected // signed pass or lease failed verification
+	EventEnter         Event = iota // request or lease acquired a slot
+	EventExit                       // request or lease released a slot
+	EventFull                       // room crossed from below capacity to full (edge)
+	EventDrain                      // room crossed from full to having a free slot (edge)
+	EventQueue                      // client joined the waiting line
+	EventEvict                      // expired or unseen token reclaimed
+	EventTimeout                    // request context cancelled before acquiring a slot
+	EventPromote                    // paid, admin, or VIP-pass promotion moved a ticket
+	EventRemove                     // ticket removed via RemoveToken, RemoveTokensFunc, ClearQueue, ClearStale, or Leave
+	EventRank                       // SetTicketRank moved a ticket ahead of lower ranks
+	EventLease                      // Acquire or verified remote lease reserved a lease slot
+	EventRelease                    // Release returned a lease slot
+	EventLeaseExpire                // reaper reclaimed a lease past LeaseTTL or signed expiry
+	EventTokenRejected              // signed pass or lease failed verification
+	EventReject                     // request or key rejected because maxQueueDepth was reached
 )
 
 // String returns the canonical name of e.
@@ -54,6 +55,8 @@ func (e Event) String() string {
 		return "LeaseExpire"
 	case EventTokenRejected:
 		return "TokenRejected"
+	case EventReject:
+		return "Reject"
 	default:
 		return "Unknown"
 	}
@@ -69,7 +72,7 @@ type Snapshot struct {
 	Token          string // set on EventQueue (cookie) and EventRemove (RemoveToken)
 	ClientKey      string // ClientKeyFunc key for Token, if any
 	StaleTicket    bool   // EventQueue: arrival carried an unrecognised room_ticket cookie
-	Key            string // set for keyed tickets, leases, and EventTokenRejected
+	Key            string // set for keyed tickets, leases, EventTokenRejected, and keyed EventReject
 	Reason         string // EventTokenRejected: verification failure reason (never raw token)
 	TokenTransport string // EventTokenRejected: "cookie" or "header"
 }

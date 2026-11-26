@@ -38,17 +38,19 @@ type persistFile struct {
 }
 
 type persistedTicket struct {
-	Token     string    `json:"token"`
-	CreatedAt time.Time `json:"created_at"`
-	LastSeen  time.Time `json:"last_seen"`
-	LastPoll  time.Time `json:"last_poll"`
-	ClientKey string    `json:"client_key,omitempty"`
-	Seen      bool      `json:"seen,omitempty"`
-	Promoted  bool      `json:"promoted,omitempty"`
-	HasPass   bool      `json:"has_pass,omitempty"`
-	Rank      int       `json:"rank,omitempty"`
-	Key       string    `json:"key,omitempty"`
-	ID        string    `json:"id,omitempty"`
+	Token          string    `json:"token"`
+	CreatedAt      time.Time `json:"created_at"`
+	LastSeen       time.Time `json:"last_seen"`
+	LastPoll       time.Time `json:"last_poll"`
+	ReadyAt        time.Time `json:"ready_at,omitempty"`
+	ClientKey      string    `json:"client_key,omitempty"`
+	Seen           bool      `json:"seen,omitempty"`
+	Promoted       bool      `json:"promoted,omitempty"`
+	HasPass        bool      `json:"has_pass,omitempty"`
+	SkipReadyGrace bool      `json:"skip_ready_grace,omitempty"`
+	Rank           int       `json:"rank,omitempty"`
+	Key            string    `json:"key,omitempty"`
+	ID             string    `json:"id,omitempty"`
 }
 
 // persistedLease is one held lease. Leases are written in the order they
@@ -71,8 +73,9 @@ type ImportStats struct {
 	Restored int
 
 	// DroppedStale is the number of tickets discarded because they had
-	// already expired (TokenTTL), or had never been seen past the
-	// first-poll grace, at export time.
+	// already expired (TokenTTL or IdlePollTTL), had never been seen past
+	// the first-poll grace, or had remained ready past ReadyGrace, at
+	// export time.
 	DroppedStale int
 
 	// PassesRestored is the number of VIP passes restored.
@@ -127,7 +130,7 @@ func (wr *WaitingRoom) Export(w io.Writer) error {
 		return ErrNotInitialised{}
 	}
 
-	now := time.Now()
+	now := wr.now()
 
 	entries := wr.tokens.snapshotSorted()
 
@@ -143,17 +146,19 @@ func (wr *WaitingRoom) Export(w io.Writer) error {
 	}
 	for _, s := range entries {
 		f.Tickets = append(f.Tickets, persistedTicket{
-			Token:     s.token,
-			CreatedAt: s.entry.createdAt,
-			LastSeen:  s.entry.issuedAt,
-			LastPoll:  s.entry.lastPoll,
-			ClientKey: s.entry.clientKey,
-			Seen:      s.entry.seen,
-			Promoted:  s.entry.promoted,
-			HasPass:   s.entry.hasPass,
-			Rank:      s.entry.rank,
-			Key:       s.entry.key,
-			ID:        s.entry.id,
+			Token:          s.token,
+			CreatedAt:      s.entry.createdAt,
+			LastSeen:       s.entry.issuedAt,
+			LastPoll:       s.entry.lastPoll,
+			ReadyAt:        s.entry.readyAt,
+			ClientKey:      s.entry.clientKey,
+			Seen:           s.entry.seen,
+			Promoted:       s.entry.promoted,
+			HasPass:        s.entry.hasPass,
+			SkipReadyGrace: s.entry.skipReadyGrace,
+			Rank:           s.entry.rank,
+			Key:            s.entry.key,
+			ID:             s.entry.id,
 		})
 	}
 
@@ -168,9 +173,10 @@ func (wr *WaitingRoom) Export(w io.Writer) error {
 // # Preconditions
 //
 // Call Import after Init and after applying settings — in particular
-// SetTokenTTL and SetFirstPollGrace, which decide what counts as stale —
-// and before the WaitingRoom serves traffic. Import refuses a room that
-// has issued any ticket or holds any pass (ErrImportNotEmpty).
+// SetTokenTTL, SetFirstPollGrace, SetIdlePollTTL, and SetReadyGrace,
+// which decide what counts as stale — and before the WaitingRoom serves
+// traffic. Import refuses a room that has issued any ticket or holds any
+// pass (ErrImportNotEmpty).
 //
 // # What is restored
 //
@@ -181,10 +187,11 @@ func (wr *WaitingRoom) Export(w io.Writer) error {
 //     first Cap()-L restored clients are ready on their next poll; a
 //     capacity different from the exporting process's is handled
 //     naturally. Keyed tickets keep their key and public ID.
-//   - All ticket timestamps are shifted forward by the downtime (time
-//     between export and import), so a client's remaining TTL and
-//     first-poll grace are as they were at export. Downtime is not
-//     charged against waiting clients.
+//   - All ticket timestamps (including ReadyAt, when set) are shifted
+//     forward by the downtime (time between export and import), so a
+//     client's remaining TTL, IdlePollTTL, first-poll grace, and
+//     ReadyGrace are as they were at export. Downtime is not charged
+//     against waiting clients.
 //   - Each client's cookies are re-sent on its first poll after import.
 //   - VIP passes, with their absolute expiry. A pass is wall-clock time
 //     the client paid for, so downtime counts against it; passes that
@@ -193,9 +200,11 @@ func (wr *WaitingRoom) Export(w io.Writer) error {
 // # What is discarded
 //
 // Tickets that were already dead at export time: last seen longer ago
-// than this room's TokenTTL, or — when SetFirstPollGrace is enabled —
-// never seen and older than the grace. They are counted in
-// ImportStats.DroppedStale.
+// than this room's TokenTTL or (when SetIdlePollTTL is enabled)
+// IdlePollTTL, never seen and older than FirstPollGrace (when
+// SetFirstPollGrace is enabled), or ready (and subject to ReadyGrace)
+// for longer than ReadyGrace (when SetReadyGrace is enabled). They are
+// counted in ImportStats.DroppedStale.
 //
 // # Atomicity
 //
@@ -224,13 +233,15 @@ func (wr *WaitingRoom) Import(r io.Reader) (ImportStats, error) {
 		return stats, err
 	}
 
-	now := time.Now()
+	now := wr.now()
 	shift := now.Sub(f.ExportedAt)
 	if shift < 0 {
 		shift = 0 // clock moved backwards; charge nothing
 	}
 	ttl := wr.tokens.ttl()
 	grace := time.Duration(wr.firstPollGrace.Load())
+	idleTTL := time.Duration(wr.idlePollTTL.Load())
+	readyGrace := time.Duration(wr.readyGrace.Load())
 
 	// Decide what survives, judged at export time.
 	kept := make([]persistedTicket, 0, len(f.Tickets))
@@ -240,6 +251,14 @@ func (wr *WaitingRoom) Import(r io.Reader) (ImportStats, error) {
 			continue
 		}
 		if grace > 0 && !t.Seen && f.ExportedAt.Sub(t.CreatedAt) > grace {
+			stats.DroppedStale++
+			continue
+		}
+		if idleTTL > 0 && f.ExportedAt.Sub(t.LastSeen) > idleTTL {
+			stats.DroppedStale++
+			continue
+		}
+		if readyGrace > 0 && !t.SkipReadyGrace && !t.ReadyAt.IsZero() && f.ExportedAt.Sub(t.ReadyAt) > readyGrace {
 			stats.DroppedStale++
 			continue
 		}
@@ -299,21 +318,27 @@ func (wr *WaitingRoom) Import(r io.Reader) (ImportStats, error) {
 		if !t.LastPoll.IsZero() {
 			lastPoll = t.LastPoll.Add(shift)
 		}
+		var readyAt time.Time
+		if !t.ReadyAt.IsZero() {
+			readyAt = t.ReadyAt.Add(shift)
+		}
 		entries[t.Token] = ticketEntry{
 			ticket:    leaseCount + int64(i+1),
 			createdAt: t.CreatedAt.Add(shift),
 			issuedAt:  t.LastSeen.Add(shift),
 			lastPoll:  lastPoll,
+			readyAt:   readyAt,
 			// Zero cookieSetAt makes the first accepted poll re-send the
 			// cookies with a fresh MaxAge.
-			cookieSetAt: time.Time{},
-			clientKey:   key,
-			seen:        t.Seen,
-			promoted:    t.Promoted,
-			hasPass:     t.HasPass,
-			rank:        t.Rank,
-			key:         t.Key,
-			id:          ids[i],
+			cookieSetAt:    time.Time{},
+			clientKey:      key,
+			seen:           t.Seen,
+			promoted:       t.Promoted,
+			hasPass:        t.HasPass,
+			skipReadyGrace: t.SkipReadyGrace,
+			rank:           t.Rank,
+			key:            t.Key,
+			id:             ids[i],
 		}
 	}
 	wr.tokens.setMany(entries)

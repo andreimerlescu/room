@@ -54,12 +54,16 @@ type WaitingRoom struct {
 	passes         *passStore
 	passDuration   atomic.Int64 // nanoseconds; 0 disables passes
 	firstPollGrace atomic.Int64 // nanoseconds; 0 disables grace
+	readyGrace     atomic.Int64 // nanoseconds; 0 disables ready-claim deadline
+	idlePollTTL    atomic.Int64 // nanoseconds; 0 disables independent idle-poll cap
+	lastForceReap  atomic.Int64 // UnixNano of last rate-limited synchronous reapBatch
 	occupancy      atomic.Int32 // mirrors active slots for edge-triggered EventFull/EventDrain
 	ledger         *ghostLedger
 
 	// Not reset by Init.
 	ticketKeyFunc  atomic.Pointer[TicketKeyFunc]
 	waitResponder  atomic.Pointer[WaitResponder]
+	fullResponder  atomic.Pointer[FullResponder]
 	tokenExtractor atomic.Pointer[TokenExtractor]
 
 	waitJSON      atomic.Bool
@@ -98,19 +102,21 @@ type leaseEntry struct {
 
 // ticketEntry is a point-in-time snapshot of a queued client's state.
 type ticketEntry struct {
-	ticket      int64
-	createdAt   time.Time
-	issuedAt    time.Time // sliding TTL anchor (last client contact)
-	lastPoll    time.Time
-	cookieSetAt time.Time
-	clientKey   string
-	seen        bool
-	promoted    bool
-	hasPass     bool
-	rank        int
-	key         string
-	id          string
-	viewedAt    time.Time
+	ticket         int64
+	createdAt      time.Time
+	issuedAt       time.Time // sliding TTL anchor (last client contact)
+	lastPoll       time.Time
+	readyAt        time.Time
+	cookieSetAt    time.Time
+	clientKey      string
+	seen           bool
+	promoted       bool
+	hasPass        bool
+	skipReadyGrace bool
+	rank           int
+	key            string
+	id             string
+	viewedAt       time.Time
 }
 
 // statusResponse is the JSON payload served by StatusHandler.

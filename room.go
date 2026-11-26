@@ -6,7 +6,6 @@ import (
 	"html"
 	"net/http"
 	"strconv"
-	"time"
 
 	"github.com/gin-gonic/gin"
 )
@@ -81,7 +80,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 						}
 					}
 
-					wr.tokens.markRendered(cookie.Value, time.Now(), hasPass)
+					wr.tokens.markRendered(cookie.Value, wr.now(), hasPass)
 
 					position := wr.positionOf(entry.ticket)
 					if position < 1 {
@@ -104,10 +103,8 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 
 		// Pessimistic circuit breaker: trips when either ticket-counter depth
 		// or live token count reaches maxQueueDepth.
-		maxDepth := wr.maxQueueDepth.Load()
-		if maxDepth > 0 &&
-			(wr.QueueDepth() >= maxDepth || int64(wr.tokens.len()) >= maxDepth) {
-			c.AbortWithStatus(http.StatusServiceUnavailable)
+		if _, full := wr.queueFullWithReap(wr.now()); full {
+			wr.rejectFull(c, "")
 			return
 		}
 
@@ -126,7 +123,7 @@ func (wr *WaitingRoom) Middleware() gin.HandlerFunc {
 		}
 
 		key := wr.clientKey(c)
-		now := time.Now()
+		now := wr.now()
 		wr.tokens.set(token, ticketEntry{
 			ticket:      ticket,
 			createdAt:   now,

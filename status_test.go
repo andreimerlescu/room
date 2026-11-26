@@ -279,12 +279,12 @@ func TestTokenStorePoll_Outcomes(t *testing.T) {
 	ts := newTokenStore()
 	now := time.Now()
 
-	if res := ts.poll("missing", now, 0, time.Second, time.Minute); res.outcome != pollUnknown {
+	if res := ts.poll("missing", now, 0, time.Second, time.Minute, 0, 0); res.outcome != pollUnknown {
 		t.Errorf("missing token: outcome %d, want pollUnknown", res.outcome)
 	}
 
 	ts.set("old", ticketEntry{ticket: 7, issuedAt: now.Add(-(ts.ttl() + time.Second))})
-	res := ts.poll("old", now, 0, time.Second, time.Minute)
+	res := ts.poll("old", now, 0, time.Second, time.Minute, 0, 0)
 	if res.outcome != pollExpired || res.entry.ticket != 7 {
 		t.Errorf("expired token: got %+v", res)
 	}
@@ -293,18 +293,18 @@ func TestTokenStorePoll_Outcomes(t *testing.T) {
 	}
 
 	ts.set("live", ticketEntry{ticket: 9, issuedAt: now, cookieSetAt: now.Add(-2 * time.Minute)})
-	res = ts.poll("live", now, 0, time.Second, time.Minute)
+	res = ts.poll("live", now, 0, time.Second, time.Minute, 0, 0)
 	if res.outcome != pollAccepted || !res.refreshCookie || !res.entry.seen {
 		t.Errorf("first live poll: got %+v", res)
 	}
-	res = ts.poll("live", now.Add(100*time.Millisecond), 0, time.Second, time.Minute)
+	res = ts.poll("live", now.Add(100*time.Millisecond), 0, time.Second, time.Minute, 0, 0)
 	if res.outcome != pollRateLimited || res.refreshCookie {
 		t.Errorf("fast second poll: got %+v", res)
 	}
 
 	// A ticket inside the window (ticket <= edge) never gets a refresh.
 	ts.set("ready", ticketEntry{ticket: 3, issuedAt: now})
-	res = ts.poll("ready", now, 5, time.Second, 0)
+	res = ts.poll("ready", now, 5, time.Second, 0, 0, 0)
 	if res.refreshCookie {
 		t.Error("in-window ticket must not be scheduled for a cookie refresh")
 	}

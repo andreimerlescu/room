@@ -16,6 +16,11 @@ import (
 // is empty. Runs outside all room locks; the middleware aborts after fn returns.
 type WaitResponder func(c *gin.Context, t TicketInfo)
 
+// FullResponder writes the response when maxQueueDepth rejects an HTTP arrival
+// in place of the default 503 Service Unavailable response. Runs outside all
+// room locks; the middleware aborts after fn returns.
+type FullResponder func(c *gin.Context, snap Snapshot)
+
 // TokenExtractor extracts signed capability tokens (VIP pass and/or lease)
 // from an incoming request. Identity remains the job of [TicketKeyFunc];
 // TokenExtractor answers what capability the client has already been granted.
@@ -54,6 +59,25 @@ func (wr *WaitingRoom) SetWaitResponder(fn WaitResponder) {
 
 func (wr *WaitingRoom) waitResponderLoad() WaitResponder {
 	if p := wr.waitResponder.Load(); p != nil {
+		return *p
+	}
+	return nil
+}
+
+// SetFullResponder overrides the rejection response written when maxQueueDepth
+// rejects an HTTP arrival (cookie or keyed). Pass nil to restore the default
+// 503 Service Unavailable response. Not reset by [WaitingRoom.Init]. Safe at
+// any time.
+func (wr *WaitingRoom) SetFullResponder(fn FullResponder) {
+	if fn == nil {
+		wr.fullResponder.Store(nil)
+		return
+	}
+	wr.fullResponder.Store(&fn)
+}
+
+func (wr *WaitingRoom) fullResponderLoad() FullResponder {
+	if p := wr.fullResponder.Load(); p != nil {
 		return *p
 	}
 	return nil
@@ -165,6 +189,26 @@ func (wr *WaitingRoom) respondKeyedWait(c *gin.Context, token string, e ticketEn
 	}
 	wr.writeWaitJSON(c.Writer, place, wr.StatusBaseURL()+e.id)
 	c.Abort()
+}
+
+func (wr *WaitingRoom) rejectFull(c *gin.Context, key string) {
+	c.Header("Cache-Control", "no-store")
+	if c.Writer.Header().Get("Retry-After") == "" {
+		c.Header("Retry-After", strconv.Itoa(int(waitRetryAfter/time.Second)))
+	}
+	var snap Snapshot
+	if key != "" {
+		snap = wr.snapshotForKey(EventReject, key)
+	} else {
+		snap = wr.snapshotFor(EventReject, "", wr.clientKey(c), false)
+	}
+	wr.emit(EventReject, snap)
+	if fn := wr.fullResponderLoad(); fn != nil {
+		fn(c, snap)
+		c.Abort()
+		return
+	}
+	c.AbortWithStatus(http.StatusServiceUnavailable)
 }
 
 type capabilityState struct {
@@ -284,7 +328,7 @@ func (wr *WaitingRoom) serveKeyed(c *gin.Context, key string, capState capabilit
 		wr.admit(c, ticket)
 		return
 	case keyedFull:
-		c.AbortWithStatus(http.StatusServiceUnavailable)
+		wr.rejectFull(c, key)
 		return
 	case keyedError:
 		c.AbortWithStatus(http.StatusInternalServerError)
@@ -366,7 +410,7 @@ func (wr *WaitingRoom) decideKeyed(key, clientKey string, now time.Time, capStat
 		}
 	}
 
-	if _, full := wr.queueFull(); full {
+	if _, full := wr.queueFullWithReap(now); full {
 		return keyedFull, 0, keyedEntry{}, false
 	}
 
@@ -459,7 +503,7 @@ func (wr *WaitingRoom) decideSignedLease(key, clientKey string, now time.Time, t
 		return keyedWait, 0, k, false
 	}
 
-	if _, full := wr.queueFull(); full {
+	if _, full := wr.queueFullWithReap(now); full {
 		return keyedFull, 0, keyedEntry{}, false
 	}
 

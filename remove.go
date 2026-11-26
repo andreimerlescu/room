@@ -1,5 +1,7 @@
 package room
 
+import "time"
+
 // RemoveToken removes a queued ticket immediately and retires its ticket
 // number so clients behind it move up at once without admitting anyone early.
 //
@@ -47,6 +49,52 @@ func (wr *WaitingRoom) RemoveTokensFunc(match func(TicketInfo) bool) int {
 		return 0
 	}
 
+	tickets := make([]int64, len(taken))
+	for i, e := range taken {
+		tickets[i] = e.ticket
+	}
+	wr.retireMany(tickets)
+	wr.emit(EventRemove, wr.snapshot(EventRemove))
+	return len(taken)
+}
+
+// ClearQueue removes every queued ticket atomically and retires their ticket
+// numbers so the waiting line is emptied at once. Operates only on waiting
+// tickets — active requests, held leases, and VIP passes are untouched.
+//
+// Fires [EventRemove] once (with empty Token) if at least one ticket was
+// removed. Returns 0 if the room is uninitialised or empty.
+func (wr *WaitingRoom) ClearQueue() int {
+	if !wr.initialised.Load() {
+		return 0
+	}
+	taken := wr.tokens.takeAll()
+	if len(taken) == 0 {
+		return 0
+	}
+	tickets := make([]int64, len(taken))
+	for i, e := range taken {
+		tickets[i] = e.ticket
+	}
+	wr.retireMany(tickets)
+	wr.emit(EventRemove, wr.snapshot(EventRemove))
+	return len(taken)
+}
+
+// ClearStale removes every queued ticket that has had no client contact for
+// longer than maxIdle and retires their ticket numbers together.
+//
+// Fires [EventRemove] once (with empty Token) if at least one ticket was
+// removed. Returns 0 if the room is uninitialised, maxIdle <= 0, or no ticket
+// is stale.
+func (wr *WaitingRoom) ClearStale(maxIdle time.Duration) int {
+	if !wr.initialised.Load() || maxIdle <= 0 {
+		return 0
+	}
+	taken := wr.tokens.takeStale(wr.now(), maxIdle)
+	if len(taken) == 0 {
+		return 0
+	}
 	tickets := make([]int64, len(taken))
 	for i, e := range taken {
 		tickets[i] = e.ticket

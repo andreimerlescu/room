@@ -4,6 +4,39 @@ All notable changes to `github.com/andreimerlescu/room` are documented here.
 This project follows semantic versioning; `v1.x` releases maintain full
 exported API, cookie, HTTP endpoint, and callback backward compatibility.
 
+## v1.9.0
+
+- **Ready-claim deadline:** Added `SetReadyGrace` / `WithReadyGrace` /
+  `ReadyGrace` (`5s–10m`, `0` disabled by default, `ErrReadyGrace`,
+  `TicketInfo.ReadyAt`) to prevent serving-window head-of-line deadlocks by
+  evicting unclaimed ready tickets. Applies to cookie tickets and
+  `Middleware()`-queued keyed tickets while skipping programmatic
+  `Enter()`/`Acquire()` tickets, and clamps background reaper cadence to
+  `max(1s, readyGrace/2)`. Unconditionally freezes `issuedAt` once a ticket
+  enters the serving window so continuous `/queue/status` polling without
+  reloading can never pin a slot forever (even when `ReadyGrace` is disabled).
+- **Idle-poll TTL:** Added `SetIdlePollTTL` / `WithIdlePollTTL` /
+  `IdlePollTTL` (`10s–24h`, `0` disabled by default, `ErrIdlePollTTL`) to cap
+  silent time for queued tickets independently from `TokenTTL` using the
+  existing `O(k log N)` `ttlHeap` with automatic reaper cadence clamping, while
+  `TokenTTL` continues governing cookie `MaxAge` and refresh cadence.
+- **Rate-limited synchronous stale-reap before `503` / `ErrQueueFull`:** Before
+  tripping `maxQueueDepth` in cookie `Middleware()`, keyed `Middleware()`,
+  `Enter()`, and `Acquire()`, runs at most one bounded `reapBatch()` per
+  `250ms` (single-flight CAS) and re-evaluates depth so stale/expired tickets
+  cannot cause spurious `503` lockouts between reaper ticks.
+- **Queue-full responder & rejection observability:** Added `SetFullResponder`
+  / `WithFullResponder`, `FullResponder`, and `EventReject`. HTTP
+  `maxQueueDepth` refusals set `Cache-Control: no-store` and `Retry-After`
+  (default `3`s if unset), fire `EventReject` (also fired on `Enter`/`Acquire`
+  `ErrQueueFull`), and invoke `FullResponder(c, snap)` outside all locks (or
+  fall back to `503`).
+- **Queue clearing & safe snapshot import:** Added `ClearQueue` and
+  `ClearStale` for atomic bulk queue clearing and idle-ticket sweeping
+  (emitting `EventRemove` once when tickets are removed). `Export`/`Import` now
+  persist and downtime-shift `ready_at` and drop imported tickets exceeding
+  `IdlePollTTL` or `ReadyGrace` (counted in `ImportStats.DroppedStale`).
+
 ## v1.8.0
 
 **Ed25519 split mode for multi-replica deployments:** `room` stays single-process

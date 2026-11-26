@@ -30,6 +30,7 @@ func TestEvent_String(t *testing.T) {
 		{EventRelease, "Release"},
 		{EventLeaseExpire, "LeaseExpire"},
 		{EventTokenRejected, "TokenRejected"},
+		{EventReject, "Reject"},
 		{Event(255), "Unknown"},
 	}
 	for _, tc := range cases {
@@ -253,7 +254,11 @@ func TestConcurrent_OnOffEmit_AllEvents(t *testing.T) {
 	t.Parallel()
 	wr := newTestWR(t, 5)
 
-	events := []Event{EventEnter, EventExit, EventFull, EventDrain, EventQueue, EventEvict, EventTimeout, EventPromote, EventRemove}
+	events := []Event{
+		EventEnter, EventExit, EventFull, EventDrain, EventQueue, EventEvict,
+		EventTimeout, EventPromote, EventRemove, EventRank, EventLease,
+		EventRelease, EventLeaseExpire, EventTokenRejected, EventReject,
+	}
 	var wg sync.WaitGroup
 	for _, ev := range events {
 		ev := ev
